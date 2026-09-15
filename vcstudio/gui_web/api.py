@@ -8,9 +8,208 @@ submitter)延迟导入,测试注入假件即可全离线跑,不碰网络/keyring
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import copy
+import hashlib
+import inspect
+import json
+import math
 import os
+import re
 import sys
+import tempfile
+import threading
+import time
+import types
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, fields as dc_fields
+
+# 合法计算类型(决定 KPOINTS 网格);前端下拉与后端都以此为准
+_CALC_TYPES = ('slab', 'bulk', 'molecule')
+
+# 主题白名单(设置页三选);自动驾驶管线阶段序(pipeline_status 的 stage_index 取此序)
+_THEMES = ('classic', 'paper', 'deep')
+_STAGES = ('generate', 'submit', 'monitor', 'recover', 'analysis', 'report_done')
+# 活跃(在队/在跑)状态与可续算终态:pipeline_tick/status 复用
+_ACTIVE_STATES = ('UPLOADED', 'SUBMITTED', 'QUEUED', 'RUNNING')
+_TERMINAL_FAIL = ('FAILED', 'UNCONVERGED')
+
+# SAC 矩阵机时粗估系数(核时·原子⁻¹·作业⁻¹,数量级参考,可解释:Σ原子数 × 系数)
+_SAC_EST_COEF = 0.8
+
+# MPI/调度器中“进程数/核数”的常见写法。既用于自动轨的 vasp_cmd，也用于
+# 模板轨渲染后的最终脚本；覆盖无空格、等号和长参数三种常见形式。
+_CORE_COUNT_RE = re.compile(
+    r'(?<![\w-])(?:--?np|-n|--ntasks(?:-per-node)?|ppn|ncpus|mpiprocs)'
+    r'(?:\s*=\s*|\s+)?(\d+)\b')
+_CORE_PLACEHOLDER_RE = re.compile(
+    r'(?<![\w-])(?:--?np|-n|--ntasks(?:-per-node)?|ppn|ncpus|mpiprocs)'
+    r'(?:\s*=\s*|\s+)?\{(?:cores|ppn)\}')
+_NODE_COUNT_RE = re.compile(
+    r'(?<![\w-])(?:--nodes|-N|nodes)(?:\s*=\s*|\s+)(\d+)\b')
+_WALLTIME_RE = re.compile(
+    r'(?<![\w-])(?:--time|-t|walltime)(?:\s*=\s*|\s+)'
+    r'((?:\d+-)?\d{1,4}(?::[0-5]\d){0,2})\b'
+    r'|#BSUB\s+-W\s+((?:\d+-)?\d{1,4}(?::[0-5]\d){0,2})\b')
+_WALLTIME_PLACEHOLDER_RE = re.compile(
+    r'(?<![\w-])(?:--time|-t|walltime)(?:\s*=\s*|\s+)\{walltime\}'
+    r'|#BSUB\s+-W\s+\{walltime\}')
+
+
+def _parallel_counts(text) -> list[int]:
+    """提取命令/脚本中可确认的 MPI 或调度器核数。"""
+    return [int(match.group(1)) for match in _CORE_COUNT_RE.finditer(str(text or ''))]
+
+
+def _walltimes(text) -> list[str]:
+    """提取 Slurm/PBS/LSF 常见墙时指令中的值。"""
+    values = []
+    for match in _WALLTIME_RE.finditer(str(text or '')):
+        values.append(match.group(1) or match.group(2))
+    return values
+
+
+def _sha256_file(path) -> str:
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _formula_composition(formula: str) -> dict[str, int] | None:
+    value = str(formula or '').strip()
+    parts = re.findall(r'([A-Z][a-z]?)(\d*)', value)
+    if not parts or ''.join(element + count for element, count in parts) != value:
+        return None
+    result = {}
+    for element, count in parts:
+        result[element] = result.get(element, 0) + int(count or 1)
+    return result
+
+
+def _poscar_composition_cell(path):
+    from vcstudio.generate.poscar import (parse_poscar_species, read_cell_vectors,
+                                          read_poscar)
+    text = read_poscar(path)
+    elements, counts = parse_poscar_species(text)
+    return dict(zip(elements, counts)), read_cell_vectors(text)
+
+
+def _method_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    token = str(value).strip().upper()
+    if token in {'T', '.T.', 'TRUE', '.TRUE.'}:
+        return True
+    if token in {'F', '.F.', 'FALSE', '.FALSE.'}:
+        return False
+    return None
+
+
+def _method_number(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _method_integer(value):
+    number = _method_number(value)
+    return int(number) if number is not None and number == int(number) else None
+
+
+def _method_choice(value, default='F'):
+    raw = default if value is None else value
+    logical = _method_bool(raw)
+    if logical is not None:
+        return 'T' if logical else 'F'
+    return str(raw).strip().upper()
+
+
+def _method_vector(value, *, integer=False):
+    """Return a finite expanded VASP vector or ``None`` when it is ambiguous."""
+    if isinstance(value, (list, tuple)):
+        tokens = list(value)
+    elif value is None or isinstance(value, bool):
+        return None
+    else:
+        tokens = str(value).replace(',', ' ').split()
+    result = []
+    for token in tokens:
+        repeated = re.fullmatch(r'(\d+)\*([^*]+)', str(token).strip())
+        count, raw = (int(repeated.group(1)), repeated.group(2)) if repeated else (1, token)
+        number = _method_number(raw)
+        if number is None or (integer and number != int(number)):
+            return None
+        result.extend([int(number) if integer else number] * count)
+    return result or None
+
+
+def _titel_element(titel):
+    """Extract the element from a normal VASP TITEL without guessing variants."""
+    for token in str(titel or '').split()[1:]:
+        base = token.split('_', 1)[0]
+        if re.fullmatch(r'[A-Z][a-z]?', base):
+            return base
+    return None
+
+
+def _method_vector_map(value, element_orders, *, integer=False):
+    """Map a vector by POSCAR/POTCAR order only when every viable map agrees."""
+    vector = _method_vector(value, integer=integer)
+    if vector is None:
+        return None
+    candidates = []
+    for raw_order in element_orders or []:
+        order = [str(element) for element in (raw_order or [])]
+        if len(order) != len(vector) or len(set(order)) != len(order):
+            continue
+        mapped = dict(zip(order, vector))
+        if mapped not in candidates:
+            candidates.append(mapped)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _method_u_by_element(plan):
+    """Return effective Hubbard settings keyed by element when unambiguous.
+
+    ``LDAU`` is a global switch, but its physical effect is element-local:
+    ``LDAUL=-1`` disables the correction for one species.  Comparing only the
+    global switch would therefore reject a perfectly valid molecule/slab pair
+    when the catalyst alone uses +U.  Unknown vector order remains fail-closed
+    for the later energy-comparability gate.
+    """
+    from vcstudio.project.method_policy import effective_u_by_element
+    return effective_u_by_element(plan)
+
+# 图表预设 → 数据装配路线(render_figure_preset 据此从项目数据组装或降级 skipped):
+#   _FIG_FROM_DELTA  能量学:柱状图/矩阵表/热图,取 delta_e_rows 的已完成 ΔE
+#   _FIG_LADDER      电池/电化学:自由能台阶,取 freeenergy/reactions 路径
+#   _FIG_MULTI       标度/火山:单项目无法出(需多催化剂对比),降级 skipped
+#   _FIG_NEEDS_PARSE 电子结构/NEB/差分电荷/收敛测试:需对应解析产物,项目层无从组装 → skipped
+_FIG_FROM_DELTA = ('adsorption_bar', 'energy_matrix_table', 'delta_e_heatmap')
+_FIG_LADDER = ('free_energy_ladder', 'free_energy_ladder_multi')
+_FIG_MULTI = ('scaling_relation', 'volcano')
+_FIG_NEEDS_PARSE = {
+    'pdos': 'PDOS 需电子结构静态计算的投影态密度解析产物;请在④页对 DONE 作业派生 PDOS 后单独出图。',
+    'cohp': 'COHP 键强图需 LOBSTER 的 COHPCAR 解析产物;项目层暂无从组装。',
+    'neb_profile': 'NEB 剖面需 CI-NEB 各像能量(过渡态搜索产物);项目层暂无从组装。',
+    'charge_profile': '差分电荷面平均需 CHGDIFF 的面平均序列;请先派生差分电荷计算。',
+    'convergence_curve': '收敛测试曲线需真实的截断能/K 点收敛历史值,该图型将在后续版本提供。',
+}
+
+
+def _norm_calc_type(x) -> str:
+    """归一化前端传入的计算类型:非法/缺省一律回落 'slab'(保守且向后兼容)。"""
+    s = str(x or '').strip().lower()
+    return s if s in _CALC_TYPES else 'slab'
 
 
 class Api:
@@ -20,7 +219,27 @@ class Api:
                  batch_ops_mod=None, ledger_mod=None, manifest_mod=None,
                  submitter_mod=None, config_mod=None, job_builder_mod=None,
                  logic_mod=None, adsorption_mod=None, report_full_mod=None,
-                 conv_mod=None, sview_mod=None, methods_mod=None, dialog_fn=None):
+                 conv_mod=None, sview_mod=None, methods_mod=None, dialog_fn=None,
+                 native_charts_mod=None, freeenergy_mod=None, ai_analysis_mod=None,
+                 freq_builder_mod=None, estatic_mod=None, sac_mods=None,
+                 spin_mod=None, reactions_mod=None, campaign_mods=None,
+                 scenarios_mod=None, i18n_mod=None, figure_presets_mod=None,
+                 draftpack_mod=None, ai_paper_mod=None, engines_mod=None,
+                 slab_builder_mod=None, molbuild_mods=None, gaussian_mod=None,
+                 quick_submit_mod=None, local_runner_mod=None, connection_mod=None,
+                 multiwfn_mod=None, vmd_mod=None, aimd_mod=None,
+                 task_catalog_mod=None, u_library_mod=None, conv_scan_mod=None,
+                 bands_mod=None, cell_opt_mod=None, eos_mod=None,
+                 workfunction_mod=None, surface_energy_mod=None, dimer_mod=None,
+                 auto_figures_mod=None, campaign_templates_mod=None,
+                 solvation_mod=None, paper_data_mod=None, variant_advisor_mod=None,
+                 manuscript_draft_mod=None, bands_parse_mod=None, deps_runner=None,
+                 neb_builder_mod=None, references_mod=None, chgdiff_mod=None,
+                 incar_builder_mod=None, metal_slab_mod=None, usage_mod=None,
+                 result_import_mod=None, task_analysis_mod=None,
+                 pipeline_supervisor_cls=None, assistant_chat_mod=None,
+                 comparison_mod=None, candidate_evaluation_mod=None,
+                 paper_report_mod=None):
         from vcstudio.cluster import profiles as _p
         from vcstudio.shared import secrets as _s
         from vcstudio.cluster import ledger as _l
@@ -32,6 +251,10 @@ class Api:
         from vcstudio.cluster import convergence as _conv
         from vcstudio.generate import structure_view as _sview
         from vcstudio.generate import methods_text as _methods
+        from vcstudio.shared import scenarios as _scen
+        from vcstudio.shared import i18n as _i18n_m
+        from vcstudio.project import figure_presets as _figp
+        from vcstudio.generate import slab_builder as _slabb
         self._profiles = profiles_mod or _p
         self._secrets = secrets_mod or _s
         self._ledger = ledger_mod or _l
@@ -52,10 +275,152 @@ class Api:
         self._batch_ops = batch_ops_mod
         self._submitter = submitter_mod
         self._report_full = report_full_mod
+        # 原生出图引擎(matplotlib 可选依赖)与自由能:延迟导入,测试注入假件
+        self._native_charts = native_charts_mod
+        self._freeenergy = freeenergy_mod
+        # LLM 分析层(设置页/自动报告用):纯 stdlib 模块,延迟导入,测试注入假件
+        self._ai_analysis = ai_analysis_mod
+        # Phase A 新引擎(派生计算/SAC 矩阵/多自旋/通用反应/campaign):一律延迟导入,
+        # 测试注入假件即全离线可测。sac_mods/campaign_mods 为"模块束"(SimpleNamespace/包)。
+        self._freq_builder = freq_builder_mod
+        self._estatic = estatic_mod
+        self._sac_mods = sac_mods
+        self._spin = spin_mod
+        self._reactions = reactions_mod
+        self._campaign = campaign_mods
+        # v3.1 GUI 总集成:研究场景 / i18n / 图表预设 / slab_builder 为纯或轻模块,即时导入
+        # (测试注入假件);draftpack/ai_paper/engines 牵扯较重依赖,延迟到用时 import。
+        self._scenarios = scenarios_mod or _scen
+        self._i18n = i18n_mod or _i18n_m
+        self._figpresets = figure_presets_mod or _figp
+        self._slab_builder = slab_builder_mod or _slabb
+        self._draftpack = draftpack_mod
+        self._ai_paper = ai_paper_mod
+        self._engines = engines_mod
+        # 分子计算全流程总装(结构建模页分子建模区 / ②Gaussian 分子面板 / ③本机运行·文件管理 /
+        # ⑤波函数分析 / ④AIMD 派生):全部重/可选依赖(rdkit/decimer/paramiko/Multiwfn/VMD)延迟
+        # 导入,测试注入假件即全离线可测。
+        self._molbuild = molbuild_mods            # {ocsr,smiles3d,molinfo,external_editor} 束
+        self._gaussian = gaussian_mod             # engines.gaussian(任务表/周期表/preview)
+        self._quick_submit = quick_submit_mod
+        self._local_runner = local_runner_mod
+        self._connection = connection_mod
+        self._multiwfn = multiwfn_mod
+        self._vmd = vmd_mod
+        self._aimd = aimd_mod
+        # v3.1 GUI 总装(全 DFT 任务目录 / 一键出图管线 / AI 三能力 / starpivot 对齐):
+        # 全部只读引擎,一律延迟导入,测试注入假件即全离线可测(不碰 numpy/matplotlib/网络)。
+        self._task_catalog = task_catalog_mod       # generate.task_catalog(计算类型目录)
+        self._u_library = u_library_mod             # project.u_library(DFT+U 建议表)
+        self._conv_scan = conv_scan_mod             # generate.conv_scan(收敛扫描系列)
+        self._bands = bands_mod                     # generate.bands_builder(能带派生)
+        self._cell_opt = cell_opt_mod               # generate.cell_opt(变胞弛豫派生)
+        self._eos = eos_mod                         # project.eos(EOS 系列 + BM 拟合)
+        self._workfunction = workfunction_mod       # project.workfunction(功函数派生/解析)
+        self._surface_energy = surface_energy_mod   # project.surface_energy(表面能计算器)
+        self._dimer = dimer_mod                     # generate.dimer_builder(Dimer 派生)
+        self._auto_figures = auto_figures_mod       # project.auto_figures(场景感知一键出图)
+        self._campaign_tpl = campaign_templates_mod  # project.campaign_templates(活动模板)
+        self._solvation = solvation_mod             # generate.solvation(溶剂化复合物)
+        self._paper_data = paper_data_mod           # project.paper_data(数据表提取/文献对照)
+        self._variant_advisor = variant_advisor_mod  # project.variant_advisor(材料变体)
+        self._manuscript = manuscript_draft_mod     # project.manuscript_draft(论文骨架)
+        self._bands_parse = bands_parse_mod         # project.bands(EIGENVAL/带隙解析)
+        self._deps_runner = deps_runner             # 依赖安装后台执行器(subprocess 注入)
+        self._deps_job = None                       # deps_install 后台任务句柄(轮询用)
+        # QA 接线修复(NEB/形成能·结合能/差分电荷/VASPsol):全只读引擎,延迟导入,注入式可测。
+        self._neb_builder = neb_builder_mod         # generate.neb_builder(NEB 目录树)
+        self._references = references_mod            # project.references(结合能/形成能/σ)
+        self._chgdiff = chgdiff_mod                 # project.chgdiff(差分电荷三静态 + Δρ 合成)
+        self._incar_builder = incar_builder_mod     # generate.incar_builder(VASPsol 键)
+        self._metal_slab = metal_slab_mod           # generate.metal_slab(金属 slab + 层厚配方)
+        self._usage_mod = usage_mod                 # cluster.usage(实际核时统计,纯函数)
+        # 本地已算结果的递归预检/导入：延迟加载，便于 API 单测注入假件。
+        self._result_import = result_import_mod
+        # 23 类任务共用的能力矩阵/证据报告；未接解析器的任务必须显式标记。
+        self._task_analysis = task_analysis_mod
+        # MatClaw 式对话入口仅复用会话/附件/状态设计；Python 原生实现延迟加载，
+        # 不把 Node、Docker 或任意 shell 执行面带进桌面程序。
+        self._assistant_chat = assistant_chat_mod
+        # 多项目比较、确定性候选评价与 DOCX/PDF 同源报告。三个模块均延迟加载，
+        # 使基础提交/监控路径不会因可选文档或绘图库缺失而无法启动。
+        self._comparison = comparison_mod
+        self._candidate_evaluation = candidate_evaluation_mod
+        self._paper_report = paper_report_mod
+        # pywebview 可并发调用同一个 js_api；后端锁才是自动托管的正确性边界。
+        # 前端的 running 标志只负责交互，不能阻止两条线程同时续算/出报告。
+        self._pipeline_lock = threading.Lock()
+        self._pipeline_supervisor_cls = pipeline_supervisor_cls
+        self._pipeline_supervisor = None
+        self._pipeline_runtime_lock = threading.RLock()
+        self._pipeline_runtime = {
+            'running': False, 'paused': False, 'tick_running': False,
+            'enabled': None, 'interval_seconds': None, 'last_started': None,
+            'last_finished': None, 'next_check': None, 'outcome_seq': 0,
+            'outcome_history': [],
+            'last_outcome': None, 'last_error': None,
+        }
 
     # ── 桥活性探测(前端用来确认 js_api 已就绪) ──
     def ping(self) -> str:
         return 'pong'
+
+    # ── 进程级自动托管调度器 ────────────────────────────────────────────────
+    def _publish_pipeline_runtime(self, state):
+        """保存调度线程的只读快照；前端只轮询该快照，不再自己驱动计算。"""
+        with self._pipeline_runtime_lock:
+            self._pipeline_runtime = copy.deepcopy(state)
+
+    def start_background_services(self):
+        """启动唯一后台调度线程；由桌面入口调用，重复调用安全。"""
+        try:
+            if self._pipeline_supervisor is None:
+                cls = self._pipeline_supervisor_cls
+                if cls is None:
+                    from vcstudio.gui_web.pipeline_supervisor import PipelineSupervisor
+                    cls = PipelineSupervisor
+                self._pipeline_supervisor = cls(
+                    self._autopilot_cfg, self.pipeline_tick,
+                    self._publish_pipeline_runtime)
+            started = bool(self._pipeline_supervisor.start())
+            return {'ok': True, 'started': started,
+                    'state': self._pipeline_supervisor.snapshot(), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'started': False, 'state': None, 'error': str(e)}
+
+    def stop_background_services(self):
+        """关闭后台线程；已在执行的一拍不会被暴力终止。"""
+        try:
+            if self._pipeline_supervisor is None:
+                return {'ok': True, 'stopped': True, 'error': None}
+            stopped = bool(self._pipeline_supervisor.stop(timeout=2.0))
+            return {'ok': stopped, 'stopped': stopped,
+                    'error': None if stopped else '后台任务仍在收尾，将在本拍结束后退出'}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'stopped': False, 'error': str(e)}
+
+    def pipeline_runtime_status(self):
+        """返回调度器状态与最近一拍结果，供 UI 展示下一次检查和阻塞原因。"""
+        try:
+            if self._pipeline_supervisor is not None:
+                state = self._pipeline_supervisor.snapshot()
+            else:
+                with self._pipeline_runtime_lock:
+                    state = copy.deepcopy(self._pipeline_runtime)
+            return {'ok': True, 'state': state, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'state': None, 'error': str(e)}
+
+    def pipeline_wake(self):
+        """要求后台线程立即补跑一拍；不会创建第二个并发调度器。"""
+        started = self.start_background_services()
+        if not started.get('ok'):
+            return {'ok': False, 'queued': False, 'error': started.get('error')}
+        try:
+            queued = bool(self._pipeline_supervisor.wake())
+            return {'ok': True, 'queued': queued, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'queued': False, 'error': str(e)}
 
     # ── 内部:重模块延迟加载 ──
     def _bo(self):
@@ -83,6 +448,365 @@ class Api:
             self._report_full = report_full
         return self._report_full
 
+    def _comparison_model(self):
+        if self._comparison is None:
+            from vcstudio.project import comparison
+            self._comparison = comparison
+        return self._comparison
+
+    def _candidate_eval(self):
+        if self._candidate_evaluation is None:
+            from vcstudio.project import candidate_evaluation
+            self._candidate_evaluation = candidate_evaluation
+        return self._candidate_evaluation
+
+    def _paper(self):
+        if self._paper_report is None:
+            from vcstudio.project import paper_report
+            self._paper_report = paper_report
+        return self._paper_report
+
+    def _ri(self):
+        """本地结果文件夹扫描/导入引擎（纯本地 I/O）。"""
+        if self._result_import is None:
+            from vcstudio.project import result_import
+            self._result_import = result_import
+        return self._result_import
+
+    def _nc(self):
+        """原生出图引擎延迟加载(matplotlib/numpy 为可选依赖 charts)。"""
+        if self._native_charts is None:
+            from vcstudio.external import native_charts
+            self._native_charts = native_charts
+        return self._native_charts
+
+    def _fe(self):
+        if self._freeenergy is None:
+            from vcstudio.project import freeenergy
+            self._freeenergy = freeenergy
+        return self._freeenergy
+
+    def _ai(self):
+        """LLM 分析层延迟加载(keyring/urllib 在其内部再延迟);测试注入假件即免真依赖。"""
+        if self._ai_analysis is None:
+            from vcstudio.project import ai_analysis
+            self._ai_analysis = ai_analysis
+        return self._ai_analysis
+
+    def _chat(self):
+        """Python 原生对话服务；会话/附件落用户配置目录，不进入项目源文件。"""
+        service = self._assistant_chat
+        if service is not None and hasattr(service, 'list_sessions'):
+            return service
+        if service is None:
+            from vcstudio.project import assistant_chat as service
+        root_fn = getattr(self._config, 'user_config_dir', None)
+        root = (root_fn() if callable(root_fn)
+                else os.path.join(os.path.expanduser('~'), '.config', 'vcstudio'))
+        cls = getattr(service, 'AssistantChat')
+        self._assistant_chat = cls(
+            os.path.join(str(root), 'assistant'),
+            config_loader=self._config.load_config,
+            key_loader=self._ai().load_api_key,
+        )
+        return self._assistant_chat
+
+    def _fb(self):
+        """频率作业生成端(F14)延迟加载。"""
+        if self._freq_builder is None:
+            from vcstudio.generate import freq_builder
+            self._freq_builder = freq_builder
+        return self._freq_builder
+
+    def _es(self):
+        """电子结构静态派生延迟加载。"""
+        if self._estatic is None:
+            from vcstudio.generate import estatic
+            self._estatic = estatic
+        return self._estatic
+
+    def _sac(self):
+        """SAC 建模束(sac_builder + molecules + sites)延迟加载(numpy 相邻,重)。"""
+        if self._sac_mods is None:
+            from vcstudio.generate import molecules, sac_builder, sites
+            self._sac_mods = types.SimpleNamespace(
+                sac_builder=sac_builder, molecules=molecules, sites=sites)
+        return self._sac_mods
+
+    def _sp(self):
+        """多自旋并跑引擎(F3/F10)延迟加载。"""
+        if self._spin is None:
+            from vcstudio.project import spin_scan
+            self._spin = spin_scan
+        return self._spin
+
+    def _rx(self):
+        """通用反应预设库延迟加载。"""
+        if self._reactions is None:
+            from vcstudio.project import reactions
+            self._reactions = reactions
+        return self._reactions
+
+    def _cmp(self):
+        """campaign 文件式控制面延迟加载(不可用/未安装 → ImportError,调用方降级)。"""
+        if self._campaign is None:
+            import vcstudio.campaign as campaign
+            self._campaign = campaign
+        return self._campaign
+
+    def _dp(self):
+        """收尾流水线 Draft-Ready 延迟加载(牵扯 adsorption/methods_text/incar_builder)。"""
+        if self._draftpack is None:
+            from vcstudio.project import draftpack
+            self._draftpack = draftpack
+        return self._draftpack
+
+    def _aip(self):
+        """AI 论文智能体延迟加载(牵扯 campaign 全套 + ai_analysis)。"""
+        if self._ai_paper is None:
+            from vcstudio.project import ai_paper
+            self._ai_paper = ai_paper
+        return self._ai_paper
+
+    def _eng(self):
+        """多引擎适配层延迟加载(4 个 Backend + poscar/structure_view)。"""
+        if self._engines is None:
+            import vcstudio.engines as engines
+            self._engines = engines
+        return self._engines
+
+    def _mb(self):
+        """分子建模引擎束(ocsr/smiles3d/molinfo/external_editor)延迟加载(rdkit/decimer 可选)。"""
+        if self._molbuild is None:
+            from vcstudio.molbuild import external_editor, molinfo, ocsr, smiles3d
+            self._molbuild = types.SimpleNamespace(
+                ocsr=ocsr, smiles3d=smiles3d, molinfo=molinfo,
+                external_editor=external_editor)
+        return self._molbuild
+
+    def _gauss(self):
+        """engines.gaussian 子模块延迟加载(GAUSSIAN_TASKS/PERIODIC_TABLE_GROUPS/preview)。"""
+        if self._gaussian is None:
+            from vcstudio.engines import gaussian
+            self._gaussian = gaussian
+        return self._gaussian
+
+    def _qs(self):
+        """任意输入批量提交建作业延迟加载。"""
+        if self._quick_submit is None:
+            from vcstudio.cluster import quick_submit
+            self._quick_submit = quick_submit
+        return self._quick_submit
+
+    def _lr(self):
+        """本机作业运行器延迟加载。"""
+        if self._local_runner is None:
+            from vcstudio.cluster import local_runner
+            self._local_runner = local_runner
+        return self._local_runner
+
+    def _conn(self):
+        """可复用 SSH 连接延迟加载(paramiko 在其内部再延迟;文件管理/远程波函数用)。"""
+        if self._connection is None:
+            from vcstudio.cluster import connection
+            self._connection = connection
+        return self._connection
+
+    def _mw(self):
+        """Multiwfn 波函数分析驱动延迟加载。"""
+        if self._multiwfn is None:
+            from vcstudio.external import multiwfn_driver
+            self._multiwfn = multiwfn_driver
+        return self._multiwfn
+
+    def _vmd_(self):
+        """VMD 批渲染驱动延迟加载。"""
+        if self._vmd is None:
+            from vcstudio.external import vmd_driver
+            self._vmd = vmd_driver
+        return self._vmd
+
+    def _aimd_(self):
+        """AIMD 作业派生端延迟加载。"""
+        if self._aimd is None:
+            from vcstudio.generate import aimd_builder
+            self._aimd = aimd_builder
+        return self._aimd
+
+    def _tc(self):
+        """计算类型目录(task_catalog)延迟加载。"""
+        if self._task_catalog is None:
+            from vcstudio.generate import task_catalog
+            self._task_catalog = task_catalog
+        return self._task_catalog
+
+    def _ta(self):
+        """任务分析能力矩阵与可追溯报告（纯本地 I/O）。"""
+        if self._task_analysis is None:
+            from vcstudio.project import task_analysis
+            self._task_analysis = task_analysis
+        return self._task_analysis
+
+    def _ul(self):
+        """DFT+U 建议库延迟加载。"""
+        if self._u_library is None:
+            from vcstudio.project import u_library
+            self._u_library = u_library
+        return self._u_library
+
+    def _cs(self):
+        """收敛扫描系列引擎延迟加载。"""
+        if self._conv_scan is None:
+            from vcstudio.generate import conv_scan
+            self._conv_scan = conv_scan
+        return self._conv_scan
+
+    def _msl(self):
+        """金属 slab 建模引擎(numpy 相邻,重)延迟加载。"""
+        if self._metal_slab is None:
+            from vcstudio.generate import metal_slab
+            self._metal_slab = metal_slab
+        return self._metal_slab
+
+    def _usage(self):
+        """实际核时统计引擎(纯函数)延迟加载。"""
+        if self._usage_mod is None:
+            from vcstudio.cluster import usage
+            self._usage_mod = usage
+        return self._usage_mod
+
+    def _profile_cores(self):
+        """集群名 → 当前配置核数(nodes×ppn;ppn 未配则不入表)——usage 的回退口径。"""
+        out = {}
+        try:
+            for nm, prof in (self._profiles.load_profiles() or {}).items():
+                ppn = int(getattr(prof, 'ppn', 0) or 0)
+                nodes = int(getattr(prof, 'nodes', 1) or 1)
+                if ppn:
+                    out[nm] = nodes * ppn
+        except Exception:                                 # noqa: BLE001 配置坏不挡统计
+            pass
+        return out
+
+    def _bd(self):
+        """能带派生端延迟加载。"""
+        if self._bands is None:
+            from vcstudio.generate import bands_builder
+            self._bands = bands_builder
+        return self._bands
+
+    def _co(self):
+        """变胞弛豫派生端延迟加载。"""
+        if self._cell_opt is None:
+            from vcstudio.generate import cell_opt
+            self._cell_opt = cell_opt
+        return self._cell_opt
+
+    def _eos_(self):
+        """EOS 系列 + BM 拟合引擎延迟加载(numpy 相邻,重)。"""
+        if self._eos is None:
+            from vcstudio.project import eos
+            self._eos = eos
+        return self._eos
+
+    def _wf(self):
+        """功函数派生/解析引擎延迟加载。"""
+        if self._workfunction is None:
+            from vcstudio.project import workfunction
+            self._workfunction = workfunction
+        return self._workfunction
+
+    def _se(self):
+        """表面能计算器延迟加载(纯函数)。"""
+        if self._surface_energy is None:
+            from vcstudio.project import surface_energy
+            self._surface_energy = surface_energy
+        return self._surface_energy
+
+    def _dm(self):
+        """Dimer 过渡态派生端延迟加载。"""
+        if self._dimer is None:
+            from vcstudio.generate import dimer_builder
+            self._dimer = dimer_builder
+        return self._dimer
+
+    def _af(self):
+        """场景感知一键出图引擎延迟加载(matplotlib 相邻,重)。"""
+        if self._auto_figures is None:
+            from vcstudio.project import auto_figures
+            self._auto_figures = auto_figures
+        return self._auto_figures
+
+    def _ct(self):
+        """计算活动模板引擎延迟加载。"""
+        if self._campaign_tpl is None:
+            from vcstudio.project import campaign_templates
+            self._campaign_tpl = campaign_templates
+        return self._campaign_tpl
+
+    def _sv(self):
+        """溶剂化复合物建模引擎延迟加载(numpy 相邻,重)。"""
+        if self._solvation is None:
+            from vcstudio.generate import solvation
+            self._solvation = solvation
+        return self._solvation
+
+    def _pd(self):
+        """文献数据表提取 / 对照引擎延迟加载。"""
+        if self._paper_data is None:
+            from vcstudio.project import paper_data
+            self._paper_data = paper_data
+        return self._paper_data
+
+    def _va(self):
+        """材料变体推荐引擎延迟加载。"""
+        if self._variant_advisor is None:
+            from vcstudio.project import variant_advisor
+            self._variant_advisor = variant_advisor
+        return self._variant_advisor
+
+    def _md(self):
+        """论文骨架生成引擎延迟加载(python-docx 可选)。"""
+        if self._manuscript is None:
+            from vcstudio.project import manuscript_draft
+            self._manuscript = manuscript_draft
+        return self._manuscript
+
+    def _bp(self):
+        """能带/带隙解析引擎延迟加载。"""
+        if self._bands_parse is None:
+            from vcstudio.project import bands as bands_parse
+            self._bands_parse = bands_parse
+        return self._bands_parse
+
+    def _neb(self):
+        """NEB 过渡态目录生成端延迟加载(纯 python)。"""
+        if self._neb_builder is None:
+            from vcstudio.generate import neb_builder
+            self._neb_builder = neb_builder
+        return self._neb_builder
+
+    def _refs(self):
+        """参考态/稳定性判据引擎(结合能/形成能/σ)延迟加载。"""
+        if self._references is None:
+            from vcstudio.project import references
+            self._references = references
+        return self._references
+
+    def _chg(self):
+        """差分电荷工作流引擎(三静态派生 + Δρ 网格代数)延迟加载。"""
+        if self._chgdiff is None:
+            from vcstudio.project import chgdiff
+            self._chgdiff = chgdiff
+        return self._chgdiff
+
+    def _ib(self):
+        """INCAR 顾问引擎(VASPsol 键等)延迟加载(纯 python)。"""
+        if self._incar_builder is None:
+            from vcstudio.generate import incar_builder
+            self._incar_builder = incar_builder
+        return self._incar_builder
+
     def _resolve(self, name, password):
         """名字 → (profile, 密码, err_dict|None)。
 
@@ -96,6 +820,14 @@ class Api:
         if prof.auth == 'password' and not pw:
             return None, None, {'error': 'NEED_PASSWORD'}
         return prof, pw, None
+
+    def _save_password_verified(self, name, password):
+        """写入 keyring 后立刻回读；setter 未报错不代表凭据真的可用。"""
+        stored = self._secrets.set_password(name, password)
+        if stored is False:
+            raise RuntimeError('系统凭据库拒绝保存')
+        if self._secrets.get_password(name) != password:
+            raise RuntimeError('系统凭据库写入后回读不一致')
 
     # ── 集群 ─────────────────────────────────────────────────────────────────
     def list_profiles(self):
@@ -112,7 +844,26 @@ class Api:
                 return {'ok': False, 'error': '集群名称不能为空'}
             known = {f.name for f in dc_fields(self._profiles.ClusterProfile)}
             fields = {k: v for k, v in data.items() if k in known and k != 'name'}
+            scheduler = str(fields.get('scheduler') or 'Slurm').strip()
+            if scheduler not in ('Slurm', 'PBS'):
+                return {'ok': False,
+                        'error': f'当前只支持 Slurm / PBS 自动提交，不能保存 {scheduler} 为可提交调度器'}
+            fields['scheduler'] = scheduler
+            if 'engine_commands' in fields:
+                raw_commands = fields['engine_commands']
+                if not isinstance(raw_commands, dict):
+                    return {'ok': False,
+                            'error': 'engine_commands 必须是「引擎: 执行命令」对照表'}
+                fields['engine_commands'] = {
+                    str(key).strip().lower(): str(value or '').strip()
+                    for key, value in raw_commands.items() if str(key).strip()
+                }
             allp = self._profiles.load_profiles()
+            # 旧前端还不认识该字段时不会随表单回传；保存其它
+            # 集群参数不应悄悄清空已配置的多引擎命令。
+            if 'engine_commands' not in fields and name in allp:
+                fields['engine_commands'] = dict(
+                    getattr(allp[name], 'engine_commands', {}) or {})
             allp[name] = self._profiles.ClusterProfile(name=name, **fields)
             self._profiles.save_profiles(allp)
             return {'ok': True, 'error': None}
@@ -140,12 +891,17 @@ class Api:
             # 否则 password=None 恒认证失败(存过密码后 retest 永远挂)。
             if prof.auth == 'password' and not password:
                 password = self._secrets.get_password(name)
-            res = self._ssh().check_connection(prof, password, trust_new=bool(trust_new))
+            res = self._ssh().check_connection(prof, password, trust_new=trust_new)
             # 成功 + 显式给了密码 + 该 profile 走密码认证 → 顺手存 keyring
             if res.ok and password and prof.auth == 'password':
-                self._secrets.set_password(name, password)
+                try:
+                    self._save_password_verified(name, password)
+                except Exception as e:                    # noqa: BLE001
+                    return {'ok': False, 'message': f'{res.message}；密码保存失败：{e}',
+                            'scheduler': res.scheduler, 'needs_trust': False}
             return {'ok': bool(res.ok), 'message': res.message,
-                    'scheduler': res.scheduler, 'needs_trust': bool(res.needs_trust)}
+                    'scheduler': res.scheduler, 'needs_trust': bool(res.needs_trust),
+                    **self._host_key_evidence(res)}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'message': str(e), 'scheduler': '', 'needs_trust': False}
 
@@ -165,9 +921,74 @@ class Api:
             return {'ok': False, 'error': str(e)}
 
     # ── 任务:台账列表(取数逻辑照抄 jobs_tab.reload) ──────────────────────
+    @staticmethod
+    def _project_member_dirs(project):
+        """Return every managed project member once, including molecule refs."""
+        members = (project or {}).get('members') or {}
+        dirs = [members.get('clean_slab'), members.get('gas_ref')]
+        dirs.extend(members.get('configs') or [])
+        for refs in (members.get('molecules'),
+                     (project or {}).get('species_ref_jobs')):
+            if isinstance(refs, dict):
+                dirs.extend(refs.values())
+            elif isinstance(refs, (list, tuple)):
+                dirs.extend(refs)
+        result, seen = [], set()
+        for directory in dirs:
+            if not directory:
+                continue
+            key = os.path.normcase(os.path.normpath(str(directory)))
+            if key not in seen:
+                seen.add(key)
+                result.append(directory)
+        return result
+
+    def _project_role_map(self):
+        """Map managed directories to a path-stable project and scientific role.
+
+        供 list_jobs 给作业行注入所属吸附能项目组;任何异常(注册表坏/单个
+        project.yaml 畸形)兜成空映射或跳过该项目,绝不拖垮 list_jobs。
+        """
+        def norm(d):
+            return os.path.normcase(os.path.normpath(str(d)))
+
+        mapping = {}
+        try:
+            for pp in self._adsorption.list_projects():
+                try:
+                    proj = self._adsorption.load_project(pp)
+                    if proj is None:
+                        continue
+                    pname = proj.get('name', '') or os.path.basename(
+                        os.path.dirname(str(pp)))
+                    group = {'project': pname, 'project_path': str(pp)}
+                    mem = proj.get('members') or {}
+                    if mem.get('clean_slab'):
+                        mapping[norm(mem['clean_slab'])] = {**group, 'role': 'clean'}
+                    if mem.get('gas_ref'):
+                        mapping[norm(mem['gas_ref'])] = {**group, 'role': 'gas'}
+                    for d in (mem.get('configs') or []):
+                        if d:
+                            mapping[norm(d)] = {**group, 'role': 'config'}
+                    molecule_dirs = []
+                    for refs in (mem.get('molecules'), proj.get('species_ref_jobs')):
+                        if isinstance(refs, dict):
+                            molecule_dirs.extend(refs.values())
+                        elif isinstance(refs, (list, tuple)):
+                            molecule_dirs.extend(refs)
+                    for d in molecule_dirs:
+                        if d:
+                            mapping.setdefault(norm(d), {**group, 'role': 'molecule'})
+                except Exception:                         # noqa: BLE001 单个坏项目跳过
+                    continue
+        except Exception:                                 # noqa: BLE001 注册表坏 → 全部不分组
+            return {}
+        return mapping
+
     def list_jobs(self):
         try:
             jobs, stale = [], []
+            pmap = self._project_role_map()
             for job_dir, m in self._ledger.load_all():
                 if m is None:
                     stale.append(job_dir)
@@ -188,9 +1009,13 @@ class Api:
                     elif live.get('ionic_steps') is not None:
                         diag = f"{live['ionic_steps']}步" + (
                             f" |F|max={live['fmax']}" if live.get('fmax') else '')
+                grp = pmap.get(os.path.normcase(os.path.normpath(job_dir)))
                 jobs.append({
                     'dir': job_dir,
                     'name': os.path.basename(os.path.normpath(job_dir)),
+                    'project': grp['project'] if grp else None,
+                    'project_path': grp['project_path'] if grp else None,
+                    'role': grp['role'] if grp else None,
                     'state': state,
                     'task': f"{m.get('task_type', '')}/{m.get('calc_type', '')}",
                     'cluster': m.get('cluster') or '',
@@ -220,24 +1045,46 @@ class Api:
         except Exception as e:                            # noqa: BLE001 异常绝不穿透到 JS
             return {'error': str(e)}
 
+    @staticmethod
+    def _host_key_evidence(value):
+        """从连接异常/结果对象或 dict 透传可核对的 SSH 主机证据。"""
+        def _get(key):
+            if isinstance(value, dict):
+                return value.get(key, '')
+            return getattr(value, key, '')
+        return {key: str(_get(key) or '')
+                for key in ('fingerprint', 'algorithm', 'host')}
+
     def submit_jobs(self, dirs, name, password, trust_new=False):
         return self._delegate(name, password,
                               lambda prof, pw: self._bo().submit_batch(
-                                  prof, pw, list(dirs), bool(trust_new)))
+                                  prof, pw, list(dirs), trust_new))
 
     def fetch_jobs(self, dirs, name, password, trust_new=False, files=None):
         def _fetch(prof, pw):
             if files is None:
-                return self._bo().fetch_batch(prof, pw, list(dirs), bool(trust_new))
-            return self._bo().fetch_batch(prof, pw, list(dirs), bool(trust_new), files)
+                return self._bo().fetch_batch(prof, pw, list(dirs), trust_new)
+            return self._bo().fetch_batch(prof, pw, list(dirs), trust_new, files)
         return self._delegate(name, password, _fetch)
 
     def continue_jobs(self, dirs, name, password, trust_new=False):
         return self._delegate(name, password,
                               lambda prof, pw: self._bo().continue_batch(
-                                  prof, pw, list(dirs), bool(trust_new)))
+                                  prof, pw, list(dirs), trust_new))
 
     def refresh_status(self, name, password, trust_new=False):
+        """Refresh one profile without racing the background supervisor."""
+        if not self._pipeline_lock.acquire(blocking=False):
+            return {
+                'needs_trust': False, 'results': [], 'busy': True,
+                'error': '后台自动托管正在同步，请等待本轮完成后再手动查询',
+            }
+        try:
+            return self._refresh_status_once(name, password, trust_new)
+        finally:
+            self._pipeline_lock.release()
+
+    def _refresh_status_once(self, name, password, trust_new=False):
         def _refresh(prof, pw):
             # 目标 dirs 逻辑照抄 jobs_tab._on_refresh_status:
             # 台账里该集群 + 有作业号 + 状态 SUBMITTED/QUEUED/RUNNING
@@ -246,19 +1093,182 @@ class Api:
                        and m.get('state') in ('SUBMITTED', 'QUEUED', 'RUNNING')]
             if not targets:
                 return {'needs_trust': False, 'results': []}
-            return self._bo().refresh_batch(prof, pw, targets, bool(trust_new))
+            return self._bo().refresh_batch(prof, pw, targets, trust_new)
         return self._delegate(name, password, _refresh)
+
+    def refresh_all_status(self):
+        """并行刷新所有服务器上的活跃作业；单台失败、缺密码或待确认指纹不拖累其它服务器。"""
+        if not self._pipeline_lock.acquire(blocking=False):
+            return {
+                'ok': True, 'profiles': [], 'results': [], 'errors': [],
+                'needs_trust': False, 'busy': True,
+                'error': '后台自动托管正在同步，本次独立刷新已跳过',
+            }
+        try:
+            return self._refresh_all_status_once()
+        finally:
+            self._pipeline_lock.release()
+
+    def _refresh_all_status_once(self):
+        try:
+            profiles = self._profiles.load_profiles()
+            active = set()
+            for _d, manifest in self._ledger.load_all():
+                if (manifest and manifest.get('scheduler_job_id')
+                        and manifest.get('state') in ('SUBMITTED', 'QUEUED', 'RUNNING')
+                        and manifest.get('cluster')):
+                    active.add(str(manifest.get('cluster')))
+            names = [name for name in profiles if name in active]
+            missing_names = sorted(active.difference(profiles))
+            if not names and not missing_names:
+                return {'ok': True, 'profiles': [], 'results': [], 'errors': [],
+                        'needs_trust': False, 'error': None}
+
+            rows, errors, flattened = [], [], []
+            if names:
+                workers = min(8, len(names))
+                with ThreadPoolExecutor(max_workers=workers,
+                                        thread_name_prefix='vcs-refresh') as pool:
+                    futures = {pool.submit(
+                        self._refresh_status_once, name, None, False): name
+                               for name in names}
+                    for future in as_completed(futures):
+                        name = futures[future]
+                        try:
+                            result = future.result() or {}
+                        except Exception as exc:          # noqa: BLE001 单台隔离
+                            result = {'error': str(exc)}
+                        needs_trust = bool(result.get('needs_trust'))
+                        # 缺主机信任时 batch 层没有普通 error；若仍标 ok，前端会把它
+                        # 当成“该服务器无活跃作业”而静默吞掉安全提示。
+                        error = result.get('error')
+                        if needs_trust and not error:
+                            error = 'HOST_KEY_CONFIRMATION_REQUIRED'
+                        entry = {'name': name,
+                                 'ok': not bool(error),
+                                 'results': list(result.get('results') or []),
+                                 'error': error,
+                                 'needs_trust': needs_trust,
+                                 **self._host_key_evidence(result)}
+                        rows.append(entry)
+                        for item in entry['results']:
+                            flattened.append({'cluster': name, 'result': item})
+                        if entry['error']:
+                            errors.append(f'[{name}] {entry["error"]}')
+            # 台账仍引用已删除的 profile 时必须显式暴露；否则这些活跃作业会永远
+            # 消失在“全部服务器监控”之外，用户误以为没有任务。
+            for name in missing_names:
+                msg = '集群配置已删除或改名；请恢复同名配置后再监控该服务器上的作业'
+                rows.append({'name': name, 'ok': False, 'results': [],
+                             'error': msg, 'needs_trust': False,
+                             'fingerprint': '', 'algorithm': '', 'host': ''})
+                errors.append(f'[{name}] {msg}')
+            order = names + missing_names
+            rows.sort(key=lambda row: order.index(row['name']))
+            return {'ok': not errors, 'profiles': rows, 'results': flattened,
+                    'errors': errors,
+                    'needs_trust': any(row['needs_trust'] for row in rows),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'profiles': [], 'results': [], 'errors': [],
+                    'needs_trust': False, 'error': str(e)}
 
     def queue_detail(self, name, password, trust_new=False):
         return self._delegate(name, password,
                               lambda prof, pw: self._bo().queue_detail(
-                                  prof, pw, bool(trust_new)))
+                                  prof, pw, trust_new))
+
+    def job_live_energy(self, job_dir, name=None, password=None, trust_new=False,
+                        max_points=400):
+        """运行中作业实时能量曲线:本地 OSZICAR 优先,无则经 SSH 读远端(manifest.remote_dir)。
+
+        返回 {'ok','source'('local'|'remote'),'steps':[{'n','e0','de','scf'}],'natoms',
+        'state','needs_trust','error'}。远端尚无 OSZICAR(排队中)/未提交 → 中文说明;
+        需要密码 → error='NEED_PASSWORD'(前端弹框口径同其余集群操作)。绝不抛。
+        """
+        empty = {'ok': False, 'source': None, 'steps': [], 'natoms': None,
+                 'state': None, 'needs_trust': False}
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {**empty, 'error': '作业目录不存在'}
+            m = self._manifest.load_manifest(d) or {}
+            state = m.get('state')
+            text, source = None, None
+            local = os.path.join(d, 'OSZICAR')
+            if os.path.isfile(local):
+                with open(local, encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                source = 'local'
+            else:
+                rdir = (m.get('remote_dir') or '').strip()
+                requested = str(name or '').strip()
+                bound = str(m.get('cluster') or '').strip()
+                if rdir and not bound:
+                    return {**empty, 'state': state,
+                            'error': ('该旧作业虽有远端目录，但未记录所属服务器。为防止从'
+                                      '错误服务器读取同名路径，请先通过“认领外部作业”'
+                                      '明确绑定服务器后再查看实时能量。')}
+                if requested and bound and requested != bound:
+                    return {**empty, 'state': state,
+                            'error': (f'实时能量拒绝跨服务器读取：作业属于「{bound}」，'
+                                      f'当前选择「{requested}」')}
+                cl = bound
+                if not rdir or not cl:
+                    return {**empty, 'state': state,
+                            'error': ('本地无 OSZICAR,且该作业没有远端目录/集群记录'
+                                      '(尚未提交?);提交后才有实时能量可看。')}
+                prof, pw, err = self._resolve(cl, password)
+                if err:
+                    return {**empty, 'state': state, 'error': err.get('error') or str(err)}
+                try:
+                    self._sub().assert_profile_binding(
+                        prof, d, '读取实时能量', manifest=m)
+                except Exception as e:                    # noqa: BLE001 连网前失败即停
+                    return {**empty, 'state': state, 'error': str(e)}
+                conn = self._conn()
+                try:
+                    client, jump = conn.open_client(prof, pw, trust_new=trust_new)
+                except conn.ConnectError as e:
+                    return {**empty, 'state': state,
+                            'needs_trust': bool(getattr(e, 'needs_trust', False)),
+                            **self._host_key_evidence(e),
+                            'error': str(e)}
+                try:
+                    sftp = client.open_sftp()
+                    try:
+                        with sftp.file(rdir.rstrip('/') + '/OSZICAR', 'r') as f:
+                            raw = f.read()
+                    finally:
+                        sftp.close()
+                    text = (raw.decode('utf-8', errors='replace')
+                            if isinstance(raw, bytes) else str(raw))
+                    source = 'remote'
+                except FileNotFoundError:
+                    return {**empty, 'state': state,
+                            'error': '远端尚无 OSZICAR(排队中或刚启动),稍后再试。'}
+                except Exception as e:                    # noqa: BLE001
+                    return {**empty, 'state': state, 'error': f'读取远端 OSZICAR 失败:{e}'}
+                finally:
+                    conn.close_quiet(client, jump)
+            steps = self._conv.parse_oszicar(text or '')
+            pts = [{'n': i + 1, 'e0': s.get('E0'), 'de': s.get('dE'),
+                    'scf': s.get('scf_iters')}
+                   for i, s in enumerate(steps)][-int(max_points or 400):]
+            natoms = None
+            ptxt = self._read_named_text(d, 'POSCAR')
+            if ptxt:
+                natoms = self._poscar_natoms(ptxt) or None
+            return {'ok': True, 'source': source, 'steps': pts, 'natoms': natoms,
+                    'state': state, 'needs_trust': False, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {**empty, 'error': str(e)}
 
     def query_workdir(self, job_id, name, password, trust_new=False):
         """认领辅助:按作业号查远程工作目录(PBS qstat -f;查不到 workdir='')。"""
         return self._delegate(name, password,
                               lambda prof, pw: self._bo().workdir_lookup(
-                                  prof, pw, str(job_id), bool(trust_new)))
+                                  prof, pw, str(job_id), trust_new))
 
     # ── 任务:认领外部作业 ──
     def _adopt_root_default(self):
@@ -292,17 +1302,22 @@ class Api:
         def _scan(prof, pw):
             known_ids = {str(m['scheduler_job_id'])
                          for _d, m in self._ledger.load_all()
-                         if m and m.get('scheduler_job_id')}
+                         if (m and m.get('scheduler_job_id')
+                             and str(m.get('cluster') or '') == str(prof.name))}
             root = self.adopt_root_get().get('root')
-            return self._bo().adopt_scan(prof, pw, bool(trust_new), known_ids, root)
+            return self._bo().adopt_scan(prof, pw, trust_new, known_ids, root)
         return self._delegate(name, password, _scan)
 
-    def adopt_job(self, local_dir, name, job_id, remote_dir, job_name=''):
+    def adopt_job(self, local_dir, name, job_id, remote_dir, job_name='', task_type=None):
         try:
             prof = self._profiles.load_profiles().get(name)
             if prof is None:
                 return {'error': f'集群「{name}」不存在,请先在集群页保存'}
-            self._sub().adopt_external_job(local_dir, prof, job_id, remote_dir, name=job_name)
+            kwargs = {'name': job_name}
+            if task_type is not None and str(task_type).strip():
+                # 严格规范化在 submitter 单一入口完成；这里只透传显式选择。
+                kwargs['task_type'] = task_type
+            self._sub().adopt_external_job(local_dir, prof, job_id, remote_dir, **kwargs)
             return {'ok': True}
         except Exception as e:                            # noqa: BLE001
             return {'error': str(e)}
@@ -326,18 +1341,20 @@ class Api:
             return {'ok': False, 'error': str(e)}
 
     # ── 生成页(镜像 gui/generate_tab 的调用面:预览/回填/一键生成/文件选择) ─────
-    def gen_preview(self, poscar_path, incar_path):
+    def gen_preview(self, poscar_path, incar_path, calc_type='slab'):
         """即时解析预览(镜像 generate_tab._refresh_preview):纯读、不写任何文件。
 
         summary = {'poscar','incar'} 两段中文摘要(logic.poscar_preview/incar_preview
-        自身已把解析问题降级为友好文案);calc_type/validate 取生成默认(slab/开)。
+        自身已把解析问题降级为友好文案);calc_type 由前端「计算类型」下拉传入
+        (slab/bulk/molecule,非法值归 slab),影响 KPOINTS 预览;validate 取生成默认(开)。
         """
         try:
             poscar = (poscar_path or '').strip()
             incar = (incar_path or '').strip()
+            calc = _norm_calc_type(calc_type)
             cfg = self._config.load_config()
             lib = cfg.get('potcar_lib_root', '') or ''
-            pos_txt = self._logic.poscar_preview(poscar, 'slab')
+            pos_txt = self._logic.poscar_preview(poscar, calc)
             inc_txt = self._logic.incar_preview(incar, poscar, lib, True)
             return {'ok': True, 'summary': {'poscar': pos_txt, 'incar': inc_txt},
                     'error': None}
@@ -485,10 +1502,18 @@ class Api:
             return {'ok': False, 'zh': None, 'en': None, 'bibtex': None,
                     'warnings': [], 'error': str(e)}
 
-    def gen_run(self, poscar_path, incar_path, out_dir, lib_root):
+    def gen_run(self, poscar_path, incar_path, out_dir, lib_root, calc_type='slab',
+                extra_keywords=None, solvation=None):
         """一键生成(镜像 generate_tab._on_run→build_job_dir→_write_manifest→ledger.register)。
 
-        web 无 KPOINTS/计算类型/校验开关字段 → 取生成默认(自动 K 网格 / slab / 开校验)。
+        calc_type 由前端「计算类型」下拉传入(slab/bulk/molecule,非法值归 slab):决定
+        KPOINTS 网格(slab 法向仅 1 个 k 点、molecule 为 Gamma 单点、bulk 三维网格)。
+        此前 web 硬编码 slab,生成 bulk/molecule 会拿到错误 KPOINTS(缺口分析已指出)。
+        校验开关取默认(开)、KPOINTS 仍自动推荐。extra_keywords(每行一条 ``KEY = VALUE``)
+        生成后追加到 INCAR 末(自定义关键词,如 LREAL/NCORE);解析不出的行原样保留。
+        solvation(可选,默认关,向后兼容):真值/{'enabled':True,'eb_k':78.4}→ 调
+        incar_builder.vaspsol_keys 把 LSOL/EB_K 追加进 INCAR,并把「需 VASPsol 补丁编译、
+        否则标准 VASP 静默给真空结果」的 advisory 一并进 warnings(绝不假装已溶剂化)。
         job.yaml 与台账写入失败只追加警告,绝不撤销已生成的四件套(同 _write_manifest 口径)。
         """
         try:
@@ -506,7 +1531,7 @@ class Api:
             if errs:
                 return {'ok': False, 'job_dir': None, 'warnings': [],
                         'error': ';'.join(errs)}
-            validate, calc_type, kpts = True, 'slab', None
+            validate, calc_type, kpts = True, _norm_calc_type(calc_type), None
             # 路径记忆:下次启动自动回填(失败静默,同 _on_run)
             try:
                 self._config.set_ui_state(last_poscar=poscar, last_incar=incar,
@@ -517,6 +1542,36 @@ class Api:
                 poscar, incar, out, calc_type=calc_type, kpoints=kpts,
                 validate=validate, lib_root=lib)
             warnings = list(payload.get('warnings') or [])
+            # 自定义关键词:追加到生成的 INCAR 末(失败只告警,不撤销四件套)
+            extra_lines = [ln.strip() for ln in str(extra_keywords or '').splitlines()
+                           if ln.strip()]
+            if extra_lines:
+                try:
+                    incar_out = os.path.join(payload['out_dir'], 'INCAR')
+                    with open(incar_out, 'a', encoding='utf-8') as f:
+                        f.write('\n# === vcstudio 自定义关键词 ===\n')
+                        f.write('\n'.join(extra_lines) + '\n')
+                    warnings.append(f'已追加 {len(extra_lines)} 条自定义关键词到 INCAR')
+                except Exception as e:                    # noqa: BLE001
+                    warnings.append(f'自定义关键词追加失败(不影响四件套):{e}')
+            # VASPsol 隐式溶剂化(默认关):勾选则把 LSOL/EB_K 追加进 INCAR + advisory 进 warnings
+            sol = solvation if isinstance(solvation, dict) else (
+                {'enabled': True} if solvation else {})
+            if sol.get('enabled'):
+                try:
+                    ib = self._ib()
+                    eb_k = float(sol.get('eb_k', 78.4) or 78.4)
+                    keys = ib.vaspsol_keys(True, eb_k=eb_k)
+                    incar_out = os.path.join(payload['out_dir'], 'INCAR')
+                    with open(incar_out, 'a', encoding='utf-8') as f:
+                        f.write('\n# === VASPsol 隐式溶剂化(需 VASPsol 补丁编译的 VASP)===\n')
+                        f.write('\n'.join(self._incar_lines_from(keys)) + '\n')
+                    warnings.append(f'已启用 VASPsol 隐式溶剂化(EB_K={eb_k:g}),追加 LSOL/EB_K 到 INCAR')
+                    adv = getattr(ib, 'VASPSOL_ADVISORY', '')
+                    if adv:
+                        warnings.append(adv)
+                except Exception as e:                    # noqa: BLE001
+                    warnings.append(f'VASPsol 键追加失败(不影响四件套):{e}')
             # 落 job.yaml + 登记台账(_write_manifest:失败只告警)
             try:
                 self._manifest.create_from_build(
@@ -531,10 +1586,1575 @@ class Api:
             return {'ok': False, 'job_dir': None, 'warnings': [], 'error': str(e)}
 
     # ── 吸附能项目页(镜像 gui/project_tab 调用面:列表/创建/ΔE/CSV/报告) ─────────
-    def proj_list(self):
-        """项目注册表 → [{path,name,n_members}](镜像 project_tab._reload_projects)。
+    def proj_scan_structures(self, root, clean_slab=None, reference_species=None):
+        """递归发现可用于 slab/adsorption 的普通结构文件（严格只读）。"""
+        try:
+            source = str(root or '').strip()
+            if not source:
+                raise ValueError('请先选择结构根目录')
+            items = self._adsorption.scan_structure_files(source)
+            for item in items:
+                resolution = self._resolve_lis_member_incar(item.get('path'))
+                item.update({
+                    'incar_path': resolution['path'],
+                    'incar_sha256': resolution['sha256'],
+                    'incar_status': resolution['status'],
+                    'incar_issues': resolution['issues'],
+                    'incar_source': resolution['source'],
+                })
+            grouped = {'items': items, 'species_groups': [], 'warnings': []}
+            clean = str(clean_slab or '').strip()
+            if clean:
+                if reference_species:
+                    grouped = self._adsorption.identify_config_species(
+                        clean, items, reference_species=reference_species)
+                else:
+                    grouped = self._adsorption.identify_config_species(clean, items)
+            return {'ok': True, 'root': os.path.abspath(source),
+                    'items': grouped.get('items') or [],
+                    'species_groups': grouped.get('species_groups') or [],
+                    'warnings': grouped.get('warnings') or [], 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'root': str(root or ''), 'items': [],
+                    'species_groups': [], 'warnings': [], 'error': str(e)}
 
-        n_members 内联算(清洁表面 + 气相参考 + 组态族,镜像 project_tab._member_dirs):
+    def proj_scan_lis_inputs(self, root, reference_species=None):
+        """一次只读识别逐目录 INCAR、clean slab 与 adsorption 结构族。"""
+        empty = {
+            'ok': False, 'root': str(root or ''), 'incar': '',
+            'incar_candidates': [], 'clean_slab': '', 'clean_candidates': [],
+            'clean_incar': '', 'clean_incar_sha256': '',
+            'clean_incar_status': 'missing', 'clean_incar_issues': [],
+            'clean_incar_source': '',
+            'configs': [], 'structures': [], 'warnings': [],
+            'species_groups': [], 'unresolved_species': 0,
+            'source_read_only': True,
+        }
+        try:
+            source = str(root or '').strip()
+            if not source:
+                raise ValueError('请先选择本次计算文件夹')
+            if reference_species:
+                scanned = self._adsorption.scan_lis_input_bundle(
+                    source, reference_species=reference_species)
+            else:
+                scanned = self._adsorption.scan_lis_input_bundle(source)
+            result = dict(scanned or {})
+            return {**empty, **result, 'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {**empty, 'error': str(e)}
+
+    def proj_resolve_member_incar(self, structure_path, fallback_incar=''):
+        """只读解析一个结构实际会使用的 INCAR，供逐项选择后的界面即时复核。"""
+        try:
+            result = self._resolve_lis_member_incar(
+                structure_path, fallback_incar=fallback_incar)
+            return {'ok': result.get('status') == 'ready', **result,
+                    'error': None if result.get('status') == 'ready'
+                    else '；'.join(result.get('issues') or ['没有可用的 INCAR'])}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': '', 'sha256': '', 'status': 'invalid',
+                    'source': '', 'issues': [str(e)], 'error': str(e)}
+
+    def _resolve_lis_member_incar(self, structure_path, *, fallback_incar='',
+                                  expected_path='', expected_sha256=''):
+        """后端重新绑定结构同目录 INCAR；本地文件优先，显式备用只补缺失。"""
+        structure = os.path.abspath(os.path.expanduser(str(structure_path or '').strip()))
+        if not os.path.isfile(structure):
+            raise ValueError(f'结构文件不存在：{structure}')
+        resolver = getattr(self._adsorption, 'resolve_structure_incar', None)
+        if callable(resolver):
+            resolved = dict(resolver(structure, fallback=str(fallback_incar or '').strip()) or {})
+        else:
+            parent = os.path.dirname(structure)
+            candidates = []
+            try:
+                names = os.listdir(parent)
+            except OSError as exc:
+                raise ValueError(f'无法读取结构目录：{parent}：{exc}') from exc
+            for name in names:
+                path = os.path.join(parent, name)
+                if name.casefold() == 'incar' and os.path.isfile(path) and not os.path.islink(path):
+                    candidates.append(os.path.abspath(path))
+            if len(candidates) > 1:
+                resolved = {'path': '', 'status': 'ambiguous', 'source': 'same_directory',
+                            'issues': ['同目录存在多个大小写不同的 INCAR，无法安全选择']}
+            else:
+                fallback = os.path.abspath(os.path.expanduser(str(fallback_incar).strip())) \
+                    if str(fallback_incar or '').strip() else ''
+                selected = candidates[0] if candidates else fallback
+                source = 'same_directory' if candidates else ('explicit_fallback' if selected else '')
+                resolved = {'path': selected, 'status': 'ready' if selected else 'missing',
+                            'source': source, 'issues': [] if selected else ['同目录缺少 INCAR']}
+        path = os.path.abspath(os.path.expanduser(str(
+            resolved.get('path') or resolved.get('incar_path') or '').strip())) \
+            if str(resolved.get('path') or resolved.get('incar_path') or '').strip() else ''
+        issues = [str(item) for item in (resolved.get('issues') or []) if str(item).strip()]
+        status = str(resolved.get('status') or ('ready' if path else 'missing'))
+        if path:
+            if not os.path.isfile(path):
+                status = 'missing'
+                issues.append(f'INCAR 不存在：{path}')
+            elif os.path.islink(path):
+                status = 'invalid'
+                issues.append('INCAR 不能是符号链接')
+            else:
+                from vcstudio.generate.incar_builder import parse_incar
+                try:
+                    with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+                        parsed = parse_incar(handle.read())
+                except (OSError, ValueError) as exc:
+                    parsed = {}
+                    issues.append(f'INCAR 无法读取/解析：{exc}')
+                if not parsed:
+                    status = 'invalid'
+                    issues.append('INCAR 未解析到任何 KEY=VALUE 参数')
+                ispin = _method_integer(parsed.get('ISPIN')) if parsed else None
+                if parsed and 'ISPIN' in parsed and ispin not in {1, 2}:
+                    status = 'invalid'
+                    issues.append(f'ISPIN={parsed.get("ISPIN")!r} 无效（仅允许 1 或 2）')
+                if parsed and 'ENCUT' in parsed:
+                    encut = _method_number(parsed.get('ENCUT'))
+                    if encut is None or encut <= 0:
+                        status = 'invalid'
+                        issues.append(f'ENCUT={parsed.get("ENCUT")!r} 不是正数')
+                for key in ('AEXX', 'HFSCREEN'):
+                    if parsed and key in parsed and _method_number(parsed.get(key)) is None:
+                        status = 'invalid'
+                        issues.append(f'{key}={parsed.get(key)!r} 必须是有限数值')
+                if (parsed and 'LDAUTYPE' in parsed
+                        and _method_integer(parsed.get('LDAUTYPE')) is None):
+                    status = 'invalid'
+                    issues.append(f'LDAUTYPE={parsed.get("LDAUTYPE")!r} 必须是整数')
+                for key in ('NSW', 'IBRION', 'NELM', 'ISIF'):
+                    if parsed and key in parsed and _method_integer(parsed.get(key)) is None:
+                        status = 'invalid'
+                        issues.append(f'{key}={parsed.get(key)!r} 必须是整数')
+        digest = _sha256_file(path) if path and os.path.isfile(path) and not os.path.islink(path) else ''
+        expected = os.path.abspath(os.path.expanduser(str(expected_path or '').strip())) \
+            if str(expected_path or '').strip() else ''
+        if expected and path and os.path.normcase(expected) != os.path.normcase(path):
+            status = 'changed'
+            issues.append(f'扫描时绑定的 INCAR 已变化：原 {expected}，现 {path}；请重新扫描')
+        if expected_sha256 and digest and str(expected_sha256).lower() != digest.lower():
+            status = 'changed'
+            issues.append('INCAR 在扫描后内容已变化；请重新扫描并确认后再生成')
+        if issues and status == 'ready':
+            status = 'invalid'
+        return {
+            'path': path, 'incar_path': path, 'sha256': digest,
+            'incar_sha256': digest, 'status': status,
+            'incar_status': status, 'source': str(resolved.get('source') or ''),
+            'issues': issues, 'incar_issues': issues,
+        }
+
+    @staticmethod
+    def _reasonable_reference_energy(value) -> bool:
+        """Li-S 参考态能量硬门：有限、负值且避免明显解析污染。"""
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(float(value)) and -10000.0 <= float(value) < 0.0)
+
+    def _validated_reference_project(self, reference_project_path, required_species=None):
+        """加载并验证本批实际使用的参考物种，返回受审计的能量与目录。
+
+        参考项目可以包含尚未完成的其它 Li-S 物种；那些作业与本批没有直接
+        能量关系，不能阻止当前构型提交。调用方传入 ``required_species`` 后只
+        对这些标签执行 DONE/能量/方法签名硬门，同时仍明确拒绝缺失标签。
+        """
+        raw_path = str(reference_project_path or '').strip()
+        if not raw_path:
+            raise ValueError('请选择已导入并收敛的 Li-S 参考结果项目')
+        project = self._adsorption.load_project(raw_path)
+        if project is None:
+            raise ValueError('Li-S 参考项目不存在或 project.yaml 无法读取')
+        jobs = dict(project.get('species_ref_jobs') or {})
+        if not jobs:
+            raise ValueError('参考项目没有 species_ref_jobs；请先把 Li-S 结果导入为分子参考')
+        filter_requested = required_species is not None
+        requested = {
+            str(species or '').strip() for species in (required_species or [])
+            if str(species or '').strip()
+        }
+        missing = sorted(requested - set(jobs))
+        if missing:
+            raise ValueError('参考项目缺少本批物种：' + '、'.join(missing))
+        selected_jobs = ({species: jobs[species] for species in sorted(requested)}
+                         if filter_requested else jobs)
+        energies, resolved_jobs, signatures = {}, {}, {}
+        composition_labels = {}
+        reference_root = str(project.get('root') or os.path.dirname(raw_path))
+        for raw_species, raw_job_dir in sorted(selected_jobs.items()):
+            species = str(raw_species or '').strip()
+            if not species:
+                raise ValueError('参考项目包含空物种名')
+            composition = _formula_composition(species)
+            if composition:
+                composition_key = tuple(sorted(composition.items()))
+                previous = composition_labels.get(composition_key)
+                if previous and previous != species:
+                    raise ValueError(
+                        f'参考标签 {previous} 与 {species} 具有相同原子组成；'
+                        'POSCAR 无法区分别名/异构体/电荷或自旋态，请先保留唯一明确参考')
+                composition_labels[composition_key] = species
+            job_dir = os.path.expanduser(str(raw_job_dir or '').strip())
+            if not os.path.isabs(job_dir):
+                job_dir = os.path.join(reference_root, job_dir)
+            job_dir = os.path.abspath(os.path.normpath(job_dir))
+            manifest = self._manifest.load_manifest(job_dir)
+            if manifest is None:
+                raise ValueError(f'参考物种 {species} 缺少可读 job.yaml')
+            if manifest.get('state') != 'DONE':
+                raise ValueError(
+                    f'参考物种 {species} 尚未通过 DONE 门（当前 {manifest.get("state") or "未知"}）')
+            from vcstudio.project import energy_gate
+            energy, manifest, _completion = energy_gate.validate_done_energy(
+                job_dir, f'参考物种 {species}', self._manifest, require_oszicar=True)
+            if not self._reasonable_reference_energy(energy):
+                raise ValueError(f'参考物种 {species} 的 DONE 能量缺失或不合理')
+            energies[species] = float(energy)
+            resolved_jobs[species] = job_dir
+            signatures[species] = dict(
+                (manifest.get('results') or {}).get('reference_method_signature')
+                or (manifest.get('inputs') or {}).get('reference_method_signature') or {})
+        return project, energies, resolved_jobs, signatures
+
+    @staticmethod
+    def _reference_method_check(signatures, incar_path, planned_potcar=None,
+                                effective_encut=None, encut_source=None,
+                                planned_element_orders=None, effective_ispin=None,
+                                planned_kpoints=None):
+        """Compare hard method invariants that are knowable before generation."""
+        from vcstudio.generate.incar_builder import parse_incar
+        from vcstudio.campaign import fingerprint as fingerprint_mod
+
+        with open(incar_path, 'r', encoding='utf-8', errors='replace') as handle:
+            incar = {str(key).upper(): value for key, value in parse_incar(handle.read()).items()}
+        gga = str(incar.get('GGA') or '').strip().upper()
+        functional = {'RP': 'RPBE', 'PE': 'PBE', 'PS': 'PBEsol', '91': 'PW91'}.get(
+            gga, gga or None)
+        if functional is None and planned_potcar:
+            flavors = {str(titel).split()[0].upper()
+                       for titel in planned_potcar if str(titel).split()}
+            # In normal VASP workflows a PAW_PBE POTCAR with no explicit GGA
+            # uses the PBE semilocal base.  Treating this as "unknown" would let
+            # an explicit RPBE reference slip through a human override.
+            if flavors == {'PAW_PBE'}:
+                functional = 'PBE'
+        has_explicit_encut = incar.get('ENCUT') is not None
+        explicit_encut = _method_number(incar.get('ENCUT'))
+        planned_encut = explicit_encut if has_explicit_encut else _method_number(effective_encut)
+        planned_ldau = _method_bool(incar.get('LDAU', False))
+        explicit_ispin = _method_integer(incar.get('ISPIN')) \
+            if 'ISPIN' in incar else None
+        local_method_issues = []
+        planned_hybrid_value = (_method_bool(incar.get('LHFCALC'))
+                                if 'LHFCALC' in incar else False)
+        if 'LHFCALC' in incar and planned_hybrid_value is None:
+            local_method_issues.append(
+                f'新任务 LHFCALC={incar.get("LHFCALC")!r} 不是合法布尔值')
+        planned_hybrid = planned_hybrid_value is True
+        planned_aexx = (0.25 if planned_hybrid and 'AEXX' not in incar
+                        else _method_number(incar.get('AEXX')))
+        planned_hfscreen = (0.0 if planned_hybrid and 'HFSCREEN' not in incar
+                            else _method_number(incar.get('HFSCREEN')))
+        for key, value in (('AEXX', planned_aexx), ('HFSCREEN', planned_hfscreen)):
+            if key in incar and value is None:
+                local_method_issues.append(
+                    f'新任务 {key}={incar.get(key)!r} 不是有限数值')
+        effective_functional = (
+            None if local_method_issues else fingerprint_mod.canonical_functional(
+                base=functional, metagga=incar.get('METAGGA'),
+                lhfcalc=planned_hybrid, aexx=planned_aexx,
+                hfscreen=planned_hfscreen))
+        planned = {
+            'functional': effective_functional,
+            'base_functional': functional,
+            'ivdw': _method_integer(incar.get('IVDW', 0)),
+            'ispin': (explicit_ispin if 'ISPIN' in incar
+                      else (_method_integer(effective_ispin) or 1)),
+            'ispin_source': ('member_incar' if 'ISPIN' in incar
+                             else ('generated_completion' if effective_ispin is not None
+                                   else 'vasp_default')),
+            'ldau': planned_ldau,
+            'ldautype': _method_integer(incar.get('LDAUTYPE')),
+            'ldaul': _method_vector(incar.get('LDAUL'), integer=True),
+            'ldauu': _method_vector(incar.get('LDAUU')),
+            'ldauj': _method_vector(incar.get('LDAUJ')),
+            'encut': planned_encut,
+            'encut_source': encut_source or (
+                'shared_incar' if explicit_encut is not None else 'unavailable'),
+            'metagga': _method_choice(incar.get('METAGGA')),
+            'lhfcalc': planned_hybrid,
+            'aexx': planned_aexx,
+            'hfscreen': planned_hfscreen,
+            'potcar_titel': list(planned_potcar or []),
+            'element_orders': [list(order) for order in (planned_element_orders or [])],
+            'kpoints_scheme': planned_kpoints,
+        }
+        issues, warnings, advisories = list(local_method_issues), [], []
+        checked = 0
+        for species, signature in sorted((signatures or {}).items()):
+            if not signature:
+                warnings.append(f'{species}: 导入结果缺方法签名')
+                continue
+            reference_base = (signature.get('base_functional')
+                              or signature.get('gga') or signature.get('functional'))
+            legacy_hybrid_label = str(reference_base or '').strip().upper() in {
+                'HSE03', 'HSE06', 'PBE0'}
+            reference_hybrid_value = (
+                _method_bool(signature.get('lhfcalc'))
+                if 'lhfcalc' in signature else
+                (None if legacy_hybrid_label else False))
+            reference_hybrid = reference_hybrid_value is True
+            reference_aexx = (
+                0.25 if reference_hybrid and 'aexx' not in signature
+                else _method_number(signature.get('aexx')))
+            reference_hfscreen = (
+                0.0 if reference_hybrid and 'hfscreen' not in signature
+                else _method_number(signature.get('hfscreen')))
+            reference_method_invalid = (
+                ('lhfcalc' in signature and reference_hybrid_value is None)
+                or ('aexx' in signature and reference_aexx is None)
+                or ('hfscreen' in signature and reference_hfscreen is None))
+            reference = {
+                'functional': (
+                    None if reference_method_invalid
+                    else fingerprint_mod.canonical_functional(
+                        base=reference_base, metagga=signature.get('metagga'),
+                        lhfcalc=(reference_hybrid
+                                 if 'lhfcalc' in signature else None),
+                        aexx=reference_aexx,
+                        hfscreen=reference_hfscreen)),
+                'base_functional': reference_base,
+                'ivdw': _method_integer(signature.get('ivdw')),
+                'ispin': _method_integer(signature.get('ispin')),
+                'ldau': _method_bool(signature.get('ldau')),
+                'ldautype': _method_integer(signature.get('ldautype')),
+                'ldaul': signature.get('ldaul'),
+                'ldauu': signature.get('ldauu'),
+                'ldauj': signature.get('ldauj'),
+                'encut': _method_number(signature.get('encut')),
+                'metagga': _method_choice(signature.get('metagga')),
+                'lhfcalc': (None if reference_hybrid_value is None
+                            else reference_hybrid),
+                'aexx': reference_aexx,
+                'hfscreen': reference_hfscreen,
+            }
+            reference_elements = list(signature.get('potcar_elements') or [])
+            if not reference_elements:
+                reference_elements = [
+                    _titel_element(titel) for titel in signature.get('potcar_titel') or []]
+            reference['element_orders'] = (
+                [reference_elements]
+                if reference_elements and all(reference_elements) else [])
+            for key in ('functional', 'ivdw', 'metagga', 'lhfcalc'):
+                if reference.get(key) is None or planned.get(key) is None:
+                    warnings.append(f'{species}: 无法核对 {key}')
+                elif reference[key] != planned[key]:
+                    issues.append(
+                        f'{species}: {key} 参考={reference[key]!r}，新任务={planned[key]!r}')
+                else:
+                    checked += 1
+            reference_spin = reference.get('ispin')
+            planned_spin = planned.get('ispin')
+            if reference_spin is None or planned_spin is None:
+                warnings.append(f'{species}: 无法核对 ISPIN')
+            elif reference_spin not in {1, 2}:
+                issues.append(f'{species}: 参考分子 ISPIN={reference_spin!r} 无效（仅允许 1 或 2）')
+            elif planned_spin not in {1, 2}:
+                issues.append(f'{species}: 新任务 ISPIN={planned_spin!r} 无效（仅允许 1 或 2）')
+            elif reference_spin == planned_spin:
+                checked += 1
+            elif reference_spin == 1 and planned_spin == 2:
+                advisories.append(
+                    f'{species}: 参考分子 ISPIN=1，新建 clean slab/adsorption 作业 '
+                    'ISPIN=2；不同体系可按各自基态磁性设置，这不是自动不兼容。'
+                    '参考分子的自旋设置不参与周期体系 INCAR 绑定；建议保留其基态验证记录')
+            else:
+                advisories.append(
+                    f'{species}: 参考分子 ISPIN={reference_spin}，新建 clean slab/adsorption '
+                    f'作业 ISPIN={planned_spin}；不同体系可按各自基态磁性设置，这不是自动'
+                    '不兼容。新任务将使用自己的局部自旋设置')
+            reference_u = _method_u_by_element(reference)
+            planned_u = _method_u_by_element(planned)
+            if reference_u is None or planned_u is None:
+                warnings.append(f'{species}: 无法按 POTCAR/POSCAR 元素顺序可靠核对 DFT+U')
+            else:
+                missing_elements = sorted(set(reference_u) - set(planned_u))
+                if missing_elements:
+                    warnings.append(
+                        f'{species}: 新任务缺参考元素 '
+                        f'{", ".join(missing_elements)} 的可靠 DFT+U 映射')
+                for element in sorted(set(reference_u) & set(planned_u)):
+                    if reference_u[element] != planned_u[element]:
+                        issues.append(
+                            f'{species}: {element} DFT+U 参考={reference_u[element]!r}，'
+                            f'新任务={planned_u[element]!r}')
+                    else:
+                        checked += 1
+            if reference.get('encut') is None or planned.get('encut') is None:
+                warnings.append(f'{species}: ENCUT 证据不完整')
+            elif abs(float(reference['encut']) - planned['encut']) > 1e-8:
+                issues.append(
+                    f'{species}: ENCUT 参考={reference["encut"]} eV，'
+                    f'新任务={planned["encut"]} eV')
+            else:
+                checked += 1
+            if not signature.get('potcar_titel'):
+                warnings.append(f'{species}: 参考结果缺 POTCAR TITEL')
+            elif not planned['potcar_titel']:
+                warnings.append(f'{species}: 无法在提交前核对计划 POTCAR TITEL')
+            else:
+                planned_set = set(planned['potcar_titel'])
+                missing = [titel for titel in signature['potcar_titel']
+                           if titel not in planned_set]
+                if missing:
+                    issues.append(f'{species}: POTCAR TITEL 不一致：{missing}')
+                else:
+                    checked += len(signature['potcar_titel'])
+            if reference['lhfcalc'] and planned['lhfcalc']:
+                if reference['aexx'] is None or planned['aexx'] is None:
+                    warnings.append(f'{species}: 杂化泛函 AEXX 证据不完整')
+                elif abs(reference['aexx'] - planned['aexx']) > 1e-12:
+                    issues.append(
+                        f'{species}: AEXX 参考={reference["aexx"]}，'
+                        f'新任务={planned["aexx"]}')
+                else:
+                    checked += 1
+                if reference['hfscreen'] is None or planned['hfscreen'] is None:
+                    warnings.append(f'{species}: 杂化泛函 HFSCREEN 证据不完整')
+                elif abs(float(reference['hfscreen']) - planned['hfscreen']) > 1e-12:
+                    issues.append(
+                        f'{species}: HFSCREEN 参考={reference["hfscreen"]}，'
+                        f'新任务={planned["hfscreen"]}')
+                else:
+                    checked += 1
+        status = 'incompatible' if issues else ('verified' if not warnings else 'unverified')
+        return {'status': status, 'issues': issues, 'warnings': warnings,
+                'advisories': advisories,
+                'checked_fields': checked, 'planned': planned,
+                'reference_signatures': signatures}
+
+    @staticmethod
+    def _periodic_method_check(clean_plan, member_plans):
+        """核对 clean slab 与各 adsorption 的能量可比方法；运行控制键允许不同。"""
+        from vcstudio.project.method_policy import compare_plans
+
+        issues, warnings, advisories, checked = [], [], [], 0
+        for member_name, plan in member_plans.items():
+            result = compare_plans(
+                clean_plan, plan, left_label='clean slab',
+                right_label=member_name, relation='periodic_delta')
+            issues.extend(result['issues'])
+            warnings.extend(result['warnings'])
+            advisories.extend(result['notes'])
+            checked += int(result.get('checked_fields') or 0)
+        return {'issues': issues, 'warnings': warnings, 'advisories': advisories,
+                'checked_fields': checked}
+
+    @staticmethod
+    def _lis_repair_plan(structure_paths, plans, parsed_incars,
+                         structure_compositions, incar_records,
+                         member_source_evidence=None):
+        """Build a read-only, hash-bound repair preview for managed copies.
+
+        Only mechanically safe fixes are proposed here: aligning periodic
+        ``ENCUT`` upward to the largest effective value, and supplying a local
+        MAGMOM candidate when a collinear ``ISPIN=2`` member has none (or the
+        vector length cannot match its own POSCAR).  Functional, dispersion,
+        POTCAR, DFT+U and the magnetic state itself are scientific choices and
+        are deliberately never auto-selected.
+        """
+        actions, suggestions = [], []
+
+        def _label(path):
+            name = os.path.basename(path)
+            if name.casefold() in {'poscar', 'contcar'}:
+                name = os.path.basename(os.path.dirname(path))
+            return name or path
+
+        effective = {
+            path: _method_number((plans.get(path) or {}).get('encut'))
+            for path in structure_paths
+        }
+        finite = [value for value in effective.values() if value is not None and value > 0]
+        if finite and len({round(value, 10) for value in finite}) > 1:
+            target = max(finite)
+            target = int(target) if target == int(target) else target
+            for path in structure_paths:
+                parsed = parsed_incars.get(path) or {}
+                old = _method_number(parsed.get('ENCUT')) if 'ENCUT' in parsed else None
+                if old is not None and abs(old - float(target)) <= 1e-10:
+                    continue
+                record = incar_records.get(path) or {}
+                actions.append({
+                    'member': _label(path), 'structure_path': path,
+                    'incar_path': record.get('path') or '',
+                    'before_sha256': record.get('sha256') or '',
+                    'key': 'ENCUT', 'old': old, 'new': target,
+                    'reason': ('将周期成员 ENCUT 统一提高到当前组的安全最大值；'
+                               '只修改受管项目副本，不改源目录'),
+                    'risk': 'low',
+                })
+
+        try:
+            from vcstudio.generate.incar_builder import build_magmom, has_magnetic
+        except Exception:                                # noqa: BLE001
+            build_magmom = has_magnetic = None
+        if build_magmom and has_magnetic:
+            for path in structure_paths:
+                parsed = parsed_incars.get(path) or {}
+                plan = plans.get(path) or {}
+                composition = structure_compositions.get(path) or {}
+                elements, counts = list(composition), list(composition.values())
+                if plan.get('ispin_source') == 'generated_completion':
+                    # build_job_dir will add its audited MAGMOM/ISPIN
+                    # completion to this managed member; no manual suggestion.
+                    continue
+                if plan.get('ispin') != 2 or not elements or not has_magnetic(elements):
+                    continue
+                noncollinear = _method_bool(parsed.get('LNONCOLLINEAR')) is True
+                if noncollinear:
+                    continue
+                raw = parsed.get('MAGMOM')
+                vector = _method_vector(raw)
+                if vector is not None and len(vector) == sum(counts):
+                    continue
+                candidate = build_magmom(elements, counts)
+                if not candidate:
+                    continue
+                record = incar_records.get(path) or {}
+                suggestions.append({
+                    'member': _label(path), 'structure_path': path,
+                    'incar_path': record.get('path') or '',
+                    'before_sha256': record.get('sha256') or '',
+                    'key': 'MAGMOM', 'old': raw, 'new': candidate,
+                    'reason': ('ISPIN=2 的 MAGMOM 应按本目录 POSCAR 的 NIONS 顺序给出；'
+                               '磁矩初态属于科学选择，只给候选，不自动写入'),
+                    'risk': 'scientific_choice',
+                })
+
+        if not actions and not suggestions:
+            return None
+        evidence = {}
+        for path in structure_paths:
+            supplied = dict((member_source_evidence or {}).get(path) or {})
+            files = {}
+            for raw_name, record in supplied.items():
+                if not isinstance(record, dict):
+                    continue
+                name = str(raw_name or '').upper()
+                file_path = str(record.get('path') or '').strip()
+                digest = str(record.get('sha256') or '').strip().lower()
+                if file_path or digest:
+                    files[name] = {'path': file_path, 'sha256': digest}
+            if 'INCAR' not in files:
+                record = incar_records.get(path) or {}
+                files['INCAR'] = {
+                    'path': record.get('path') or '',
+                    'sha256': record.get('sha256') or '',
+                }
+            evidence[path] = {'files': files}
+        payload = {
+            'schema': 1, 'actions': actions, 'suggestions': suggestions,
+            'evidence': evidence,
+        }
+        plan_id = hashlib.sha256(json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(',', ':')).encode('utf-8')).hexdigest()
+        return {**payload, 'plan_id': plan_id,
+                'source_unchanged': True, 'target': 'managed_project_copy'}
+
+    def proj_prepare_lis(self, name, slab_path, config_items, incar_path,
+                         out_root, reference_project_path, method_confirmation=None,
+                         member_incars=None, repair_request=None):
+        """用既有参考能与每个结构同目录的 INCAR 建立可直接提交的 Li-S 项目。"""
+        empty = {'ok': False, 'project_path': None, 'job_dirs': [],
+                 'reference_species': [], 'advisories': [], 'warnings': [],
+                 'method_check': None, 'needs_method_confirmation': False,
+                 'repair_plan': None, 'needs_repair_decision': False}
+        try:
+            project_name = str(name or '').strip()
+            slab = os.path.abspath(os.path.expanduser(str(slab_path or '').strip()))
+            fallback_incar = os.path.abspath(os.path.expanduser(
+                str(incar_path or '').strip())) if str(incar_path or '').strip() else ''
+            output = os.path.abspath(os.path.expanduser(str(out_root or '').strip()))
+            if (not project_name or project_name in ('.', '..')
+                    or os.path.basename(project_name) != project_name):
+                raise ValueError('项目名不能为空，且不能包含路径分隔符')
+            if not os.path.isfile(slab):
+                raise ValueError('清洁表面结构文件不存在')
+            if fallback_incar and not os.path.isfile(fallback_incar):
+                raise ValueError('显式备用 INCAR 不存在')
+            if not str(out_root or '').strip():
+                raise ValueError('请选择项目输出根目录')
+            target = os.path.join(output, project_name)
+
+            requested_species = {
+                str(item.get('species') or '').strip()
+                for item in (config_items or []) if isinstance(item, dict)
+                and str(item.get('species') or '').strip()
+            }
+            reference, refs, ref_jobs, ref_signatures = self._validated_reference_project(
+                reference_project_path, required_species=requested_species)
+            configs, source_species, source_species_evidence = [], {}, {}
+            source_incar_evidence = {}
+            seen_paths, seen_members = set(), set()
+            for raw_item in (config_items or []):
+                if not isinstance(raw_item, dict):
+                    raise ValueError('吸附构型列表格式无效')
+                path = os.path.abspath(os.path.expanduser(
+                    str(raw_item.get('path') or '').strip()))
+                species = str(raw_item.get('species') or '').strip()
+                if not os.path.isfile(path):
+                    raise ValueError(f'吸附构型结构文件不存在：{path}')
+                if not species:
+                    raise ValueError(f'请为构型 {os.path.basename(path)} 选择 Li-S 物种')
+                if species not in refs:
+                    raise ValueError(f'构型物种 {species} 在已验证参考结果中不存在')
+                key = os.path.normcase(path)
+                if key in seen_paths:
+                    raise ValueError(f'吸附构型重复：{path}')
+                member_stem = os.path.splitext(os.path.basename(path))[0]
+                if member_stem.casefold() in ('poscar', 'contcar'):
+                    member_stem = os.path.basename(os.path.dirname(path))
+                member_stem = re.sub(r'[^A-Za-z0-9_.-]', '_',
+                                     member_stem) or 'config'
+                member_key = member_stem.casefold()
+                if member_key in seen_members:
+                    raise ValueError('多个构型会生成同名作业目录；请先给结构文件使用不同文件名')
+                seen_paths.add(key)
+                seen_members.add(member_key)
+                configs.append(path)
+                source_species[path] = species
+                source_incar_evidence[path] = {
+                    'path': str(raw_item.get('incar_path') or raw_item.get('incar') or '').strip(),
+                    'sha256': str(raw_item.get('incar_sha256') or '').strip(),
+                }
+            if not configs:
+                raise ValueError('至少选择一个 adsorption 构型结构')
+
+            # Resolve the actual same-directory quartet at prepare time.  A
+            # complete valid quartet is an atomic member input and will later
+            # be copied byte-for-byte; a partial folder may still use the
+            # established generator/fallback path.  Re-resolution in
+            # create_project binds these hashes across the staging copy.
+            member_input_bundles = {}
+            quartet_resolver = getattr(
+                self._adsorption, 'resolve_structure_quartet', None)
+            if callable(quartet_resolver):
+                for structure_path in [slab, *configs]:
+                    bundle = dict(quartet_resolver(structure_path) or {})
+                    if (bundle.get('status') == 'invalid'
+                            or bundle.get('mode') == 'blocked'):
+                        label = (os.path.basename(os.path.dirname(structure_path))
+                                 if os.path.basename(structure_path).casefold()
+                                 in {'poscar', 'contcar'}
+                                 else os.path.basename(structure_path))
+                        raise ValueError(
+                            f'{label} 的同目录四件套不可用：'
+                            + '；'.join(bundle.get('issues') or ['输入校验失败']))
+                    member_input_bundles[structure_path] = bundle
+
+            supplied_incars = dict(member_incars or {}) \
+                if isinstance(member_incars, dict) else {}
+            clean_expected = supplied_incars.get('clean_slab') or {}
+            if isinstance(clean_expected, str):
+                clean_expected = {'path': clean_expected}
+
+            config_expected_map = supplied_incars.get('configs') or {}
+            if isinstance(config_expected_map, list):
+                config_expected_map = {
+                    os.path.normcase(os.path.abspath(str(item.get('path') or ''))): item
+                    for item in config_expected_map
+                    if isinstance(item, dict) and item.get('path')
+                }
+            elif isinstance(config_expected_map, dict):
+                config_expected_map = {
+                    os.path.normcase(os.path.abspath(str(key))): value
+                    for key, value in config_expected_map.items()
+                }
+            else:
+                config_expected_map = {}
+
+            def _assert_scanned_quartet_unchanged(structure_path, expected):
+                """Bind prepare-time inputs to the quartet the user reviewed."""
+                if not isinstance(expected, dict):
+                    return
+                scanned = expected.get('quartet')
+                if not isinstance(scanned, dict) or not scanned:
+                    return
+                current = member_input_bundles.get(structure_path) or {}
+                scanned_mode = str(
+                    scanned.get('mode') or expected.get('input_mode') or '').lower()
+                current_mode = str(current.get('mode') or '').lower()
+                if scanned_mode and scanned_mode != current_mode:
+                    raise ValueError(
+                        f'{structure_path} 的四件套模式在扫描后已变化'
+                        f'（{scanned_mode} → {current_mode or "unknown"}）；请重新扫描')
+                scanned_files = scanned.get('files') or {}
+                current_files = current.get('files') or {}
+                if not isinstance(scanned_files, dict):
+                    raise ValueError(f'{structure_path} 的扫描四件套证据格式无效')
+                scanned_names = {str(name).upper() for name in scanned_files}
+                current_names = {str(name).upper() for name in current_files}
+                if scanned_names != current_names:
+                    raise ValueError(
+                        f'{structure_path} 的四件套文件集在扫描后已变化；请重新扫描')
+                for raw_name, record in scanned_files.items():
+                    name = str(raw_name).upper()
+                    if not isinstance(record, dict):
+                        raise ValueError(
+                            f'{structure_path} 的 {name} 扫描证据格式无效')
+                    actual = current_files.get(name) or current_files.get(raw_name) or {}
+                    expected_path = str(record.get('path') or '').strip()
+                    actual_path = str(actual.get('path') or '').strip()
+                    if (expected_path and actual_path
+                            and os.path.normcase(os.path.realpath(expected_path))
+                            != os.path.normcase(os.path.realpath(actual_path))):
+                        raise ValueError(
+                            f'{structure_path} 的 {name} 路径在扫描后已变化；请重新扫描')
+                    expected_hash = str(record.get('sha256') or '').strip().lower()
+                    actual_hash = str(actual.get('sha256') or '').strip().lower()
+                    if (not re.fullmatch(r'[0-9a-f]{64}', expected_hash)
+                            or expected_hash != actual_hash):
+                        raise ValueError(
+                            f'{structure_path} 的 {name} 内容在扫描后已变化；请重新扫描')
+
+            _assert_scanned_quartet_unchanged(slab, clean_expected)
+            for config_path in configs:
+                _assert_scanned_quartet_unchanged(
+                    config_path,
+                    config_expected_map.get(os.path.normcase(config_path)) or {})
+
+            clean_incar_result = self._resolve_lis_member_incar(
+                slab, fallback_incar=fallback_incar,
+                expected_path=str(clean_expected.get('path') or clean_expected.get('incar_path') or ''),
+                expected_sha256=str(clean_expected.get('sha256') or
+                                    clean_expected.get('incar_sha256') or ''))
+            if clean_incar_result['status'] != 'ready':
+                raise ValueError(
+                    'clean slab 的 INCAR 不可用：'
+                    + '；'.join(clean_incar_result['issues'] or ['同目录缺少 INCAR']))
+            member_incar_paths = {slab: clean_incar_result['path']}
+            member_incar_records = {slab: clean_incar_result}
+            for config_path in configs:
+                expected = source_incar_evidence.get(config_path) or {}
+                supplied = config_expected_map.get(os.path.normcase(config_path)) or {}
+                if isinstance(supplied, str):
+                    supplied = {'path': supplied}
+                expected_path = str(supplied.get('incar_path') or supplied.get('path')
+                                    or expected.get('path') or '')
+                expected_sha = str(supplied.get('incar_sha256') or supplied.get('sha256')
+                                   or expected.get('sha256') or '')
+                resolved = self._resolve_lis_member_incar(
+                    config_path, fallback_incar=fallback_incar,
+                    expected_path=expected_path, expected_sha256=expected_sha)
+                if resolved['status'] != 'ready':
+                    label = os.path.basename(os.path.dirname(config_path)) or os.path.basename(config_path)
+                    raise ValueError(
+                        f'构型 {label} 的 INCAR 不可用：'
+                        + '；'.join(resolved['issues'] or ['同目录缺少 INCAR']))
+                member_incar_paths[config_path] = resolved['path']
+                member_incar_records[config_path] = resolved
+
+            for structure_path, bundle in member_input_bundles.items():
+                if bundle.get('mode') != 'copy':
+                    continue
+                quartet_incar = str(
+                    ((bundle.get('files') or {}).get('INCAR') or {}).get('path') or '')
+                if (not quartet_incar
+                        or os.path.normcase(os.path.realpath(quartet_incar))
+                        != os.path.normcase(os.path.realpath(
+                            member_incar_paths[structure_path]))):
+                    raise ValueError(
+                        f'{structure_path} 的 INCAR 与同目录四件套绑定不一致；请重新扫描')
+
+            # Capture the source structures before parsing/method planning.  These
+            # digests, together with the INCAR digests captured by the resolver,
+            # are passed into create_project and checked around every copy.
+            member_poscar_hashes = {
+                path: _sha256_file(path) for path in [slab, *configs]
+            }
+            member_source_evidence = {
+                path: {
+                    'poscar': {'path': path, 'sha256': member_poscar_hashes[path]},
+                    'incar': {'path': member_incar_paths[path],
+                              'sha256': member_incar_records[path]['sha256']},
+                }
+                for path in [slab, *configs]
+            }
+            for path, bundle in member_input_bundles.items():
+                if bundle.get('mode') != 'copy':
+                    continue
+                for filename, record in (bundle.get('files') or {}).items():
+                    member_source_evidence[path][filename.lower()] = {
+                        'path': str(record.get('path') or ''),
+                        'sha256': str(record.get('sha256') or ''),
+                    }
+
+            slab_composition, slab_cell = _poscar_composition_cell(slab)
+            structure_compositions = {slab: slab_composition}
+            for config_path in configs:
+                config_composition, config_cell = _poscar_composition_cell(config_path)
+                structure_compositions[config_path] = config_composition
+                if any(abs(float(config_cell[i][j]) - float(slab_cell[i][j])) > 1e-6
+                       for i in range(3) for j in range(3)):
+                    raise ValueError(
+                        f'构型 {os.path.basename(config_path)} 与 clean slab 晶格不一致；'
+                        '不能将不同周期模型的总能直接相减')
+                delta_composition = {}
+                for element in set(slab_composition) | set(config_composition):
+                    difference = config_composition.get(element, 0) - slab_composition.get(element, 0)
+                    if difference < 0:
+                        raise ValueError(
+                            f'构型 {os.path.basename(config_path)} 比 clean slab 少 {element} 原子，'
+                            '无法识别为“slab + 吸附物”')
+                    if difference:
+                        delta_composition[element] = difference
+                declared = _formula_composition(source_species[config_path])
+                if declared != delta_composition:
+                    actual = ''.join(element + (str(count) if count != 1 else '')
+                                     for element, count in sorted(delta_composition.items())) or '无'
+                    raise ValueError(
+                        f'构型 {os.path.basename(config_path)} 选择了 '
+                        f'{source_species[config_path]}，但 config−slab 实际组成为 {actual}；'
+                        '请更正物种或结构')
+                source_species_evidence[config_path] = {
+                    'status': 'exact', 'source': 'poscar_minus_clean_slab',
+                    'species': source_species[config_path],
+                    'adsorbate_composition': delta_composition,
+                    'clean_source': slab,
+                }
+
+            lib_root = ''
+            try:
+                lib_root = self._config.load_config().get('potcar_lib_root', '') or ''
+            except Exception:                             # noqa: BLE001
+                pass
+            all_elements = sorted({
+                element for composition in structure_compositions.values()
+                for element in composition
+            })
+            from vcstudio.generate.incar_builder import parse_incar
+            parsed_incars = {}
+            explicit_encuts = {}
+            for structure_path, member_incar in member_incar_paths.items():
+                with open(member_incar, 'r', encoding='utf-8', errors='replace') as handle:
+                    parsed = {str(key).upper(): value
+                              for key, value in parse_incar(handle.read()).items()}
+                parsed_incars[structure_path] = parsed
+                if 'ENCUT' in parsed:
+                    value = _method_number(parsed.get('ENCUT'))
+                    if value is None or value <= 0:
+                        raise ValueError(
+                            f'{member_incar} 的 ENCUT={parsed.get("ENCUT")!r} 无效')
+                    explicit_encuts[structure_path] = value
+
+            distinct_encuts = sorted({round(value, 10) for value in explicit_encuts.values()})
+            encut_issues = []
+            if len(distinct_encuts) > 1:
+                encut_issues.append(
+                    '周期成员显式 ENCUT 不一致：' + '；'.join(
+                        f'{os.path.basename(os.path.dirname(path)) or os.path.basename(path)}='
+                        f'{value:g} eV' for path, value in explicit_encuts.items()))
+            group_encut = distinct_encuts[0] if len(distinct_encuts) == 1 else None
+            auto_encut = None
+            if not explicit_encuts and lib_root:
+                try:
+                    from vcstudio.generate import potcar as _potcar
+                    max_enmax = _potcar.max_enmax(all_elements, lib_root)
+                    auto_encut = int(math.ceil(1.3 * max_enmax / 50.0) * 50)
+                except Exception:                         # noqa: BLE001 精确错误由生成阶段返回
+                    auto_encut = None
+
+            plans = {}
+            # 跨目录差异属于“最终能量可比性”证据，不属于“作业能否运行”硬门。
+            # 本目录 INCAR/POSCAR/KPOINTS/POTCAR 的合法性在前面的成员输入门处理。
+            reference_issues, reference_warnings, method_advisories = [], [], []
+            reference_warnings.extend(encut_issues)
+            checked_fields = 0
+            for structure_path in [slab, *configs]:
+                elements = list(structure_compositions[structure_path])
+                planned_titels = []
+                bundle = member_input_bundles.get(structure_path) or {}
+                local_potcar = ((bundle.get('files') or {}).get('POTCAR') or {}).get('path')
+                local_kpoints = ((bundle.get('files') or {}).get('KPOINTS') or {}).get('path')
+                local_default_encut = None
+                try:
+                    from vcstudio.generate.kpoints import recommend_kpoints
+                    planned_kpoints = {
+                        'scheme': 'Gamma',
+                        'grid': recommend_kpoints(slab_cell, 'slab'),
+                        'shift': [0.0, 0.0, 0.0],
+                    }
+                except Exception:                         # noqa: BLE001 仅降级方法证据
+                    planned_kpoints = None
+                if bundle.get('mode') == 'copy' and local_potcar:
+                    try:
+                        from vcstudio.generate import methods_text as _methods_text
+                        with open(local_potcar, 'r', encoding='utf-8',
+                                  errors='replace') as handle:
+                            potcar_text = handle.read()
+                            planned_titels = [
+                                row.get('titel') or ''
+                                for row in _methods_text.parse_potcar_titels(potcar_text)]
+                        enmax_values = [float(value) for value in re.findall(
+                            r'\bENMAX\s*=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)',
+                            potcar_text, re.I)]
+                        if enmax_values and all(math.isfinite(value)
+                                                for value in enmax_values):
+                            # VASP's effective default when ENCUT is omitted.
+                            local_default_encut = max(enmax_values)
+                        if local_kpoints:
+                            with open(local_kpoints, 'r', encoding='utf-8',
+                                      errors='replace') as handle:
+                                planned_kpoints = _methods_text.parse_kpoints_scheme(
+                                    handle.read())
+                    except Exception:                     # noqa: BLE001 四件套硬门已给精确错误
+                        planned_titels, local_default_encut, planned_kpoints = [], None, None
+                elif lib_root:
+                    try:
+                        from vcstudio.generate import potcar as _potcar
+                        planned_titels = [row.get('titel') or '' for row in
+                                          _potcar.potcar_provenance(elements, lib_root)]
+                    except Exception:                     # noqa: BLE001 方法检查降级为证据缺项
+                        planned_titels = []
+                if structure_path in explicit_encuts:
+                    effective_encut = explicit_encuts[structure_path]
+                    encut_source = 'member_incar'
+                elif bundle.get('mode') == 'copy':
+                    effective_encut = local_default_encut
+                    encut_source = 'source_quartet_vasp_default_max_enmax'
+                elif group_encut is not None:
+                    effective_encut = group_encut
+                    encut_source = 'project_member_incar'
+                elif auto_encut is not None:
+                    effective_encut = auto_encut
+                    encut_source = 'potcar_enmax_1.3_round_up_50'
+                else:
+                    effective_encut = None
+                    encut_source = ('unavailable:no_potcar_lib_root' if not lib_root
+                                    else 'unavailable:potcar_enmax')
+                signatures = ({source_species[structure_path]:
+                               ref_signatures[source_species[structure_path]]}
+                              if structure_path in configs else {})
+                effective_ispin = None
+                if (bundle.get('mode') != 'copy'
+                        and 'ISPIN' not in parsed_incars[structure_path]
+                        and 'MAGMOM' not in parsed_incars[structure_path]):
+                    try:
+                        from vcstudio.generate.incar_builder import has_magnetic
+                        if has_magnetic(elements):
+                            effective_ispin = 2
+                    except Exception:                     # noqa: BLE001 仅影响预览证据
+                        effective_ispin = None
+                check = self._reference_method_check(
+                    signatures, member_incar_paths[structure_path],
+                    planned_potcar=planned_titels,
+                    effective_encut=effective_encut, encut_source=encut_source,
+                    planned_element_orders=[elements],
+                    effective_ispin=effective_ispin,
+                    planned_kpoints=planned_kpoints)
+                check['planned']['element_orders'] = [elements]
+                plans[structure_path] = check['planned']
+                if structure_path in configs:
+                    label = os.path.basename(os.path.dirname(structure_path)) \
+                        if os.path.basename(structure_path).casefold() in ('poscar', 'contcar') \
+                        else os.path.basename(structure_path)
+                    reference_issues.extend(f'{label}: {item}' for item in check['issues'])
+                    reference_warnings.extend(f'{label}: {item}' for item in check['warnings'])
+                    method_advisories.extend(
+                        f'{label}: {item}' for item in check.get('advisories') or [])
+                    checked_fields += int(check.get('checked_fields') or 0)
+
+            periodic = self._periodic_method_check(
+                plans[slab], {
+                    (os.path.basename(os.path.dirname(path))
+                     if os.path.basename(path).casefold() in ('poscar', 'contcar')
+                     else os.path.basename(path)): plans[path]
+                    for path in configs
+                })
+            reference_issues.extend(periodic['issues'])
+            reference_warnings.extend(periodic['warnings'])
+            method_advisories.extend(periodic.get('advisories') or [])
+            checked_fields += periodic['checked_fields']
+            planned_members = {
+                ('clean_slab' if path == slab else
+                 (os.path.basename(os.path.dirname(path))
+                  if os.path.basename(path).casefold() in ('poscar', 'contcar')
+                  else os.path.basename(path))): plan
+                for path, plan in plans.items()
+            }
+            method_check = {
+                # analysis_blocked 只表示这些能量当前不能直接进入最终 ΔE/报告；
+                # 作业本身仍可按各目录四件套生成并提交。
+                'status': ('analysis_blocked' if reference_issues else
+                           ('review' if reference_warnings else
+                            ('advisory' if method_advisories else 'verified'))),
+                'execution_status': 'ready',
+                'comparability_status': (
+                    'incompatible' if reference_issues else
+                    ('unverified' if reference_warnings else 'verified')),
+                'issues': reference_issues, 'warnings': reference_warnings,
+                'advisories': list(dict.fromkeys(method_advisories)),
+                'notes': list(dict.fromkeys(method_advisories)),
+                'submission_allowed': True,
+                'analysis_ready': not reference_issues and not reference_warnings,
+                'checked_fields': checked_fields,
+                # 兼容旧消费者：代表性 planned 取首个 adsorption；完整矩阵另存。
+                'planned': plans[configs[0]], 'planned_members': planned_members,
+                'reference_signatures': ref_signatures,
+            }
+            repair_plan = self._lis_repair_plan(
+                [slab, *configs], plans, parsed_incars,
+                structure_compositions, member_incar_records,
+                member_source_evidence)
+            if repair_plan:
+                repair_plan['manual_review'] = list(dict.fromkeys([
+                    *reference_issues, *reference_warnings,
+                ]))
+                method_check['repair_plan'] = repair_plan
+                repair_notes = [
+                    f'{action["member"]}: {action["key"]} 可在受管副本中智能修复；'
+                    '源目录不会修改'
+                    for action in repair_plan['actions']
+                ]
+                repair_notes.extend(
+                    f'{item["member"]}: {item["key"]} 仅提供候选建议；不会自动修改'
+                    for item in repair_plan.get('suggestions') or [])
+                method_check['advisories'] = list(dict.fromkeys([
+                    *method_check.get('advisories', []), *repair_notes,
+                ]))
+                method_check['notes'] = list(method_check['advisories'])
+                if method_check['status'] == 'verified':
+                    method_check['status'] = 'advisory'
+            decision = dict(repair_request or {}) \
+                if isinstance(repair_request, dict) else {}
+            member_incar_patches = {}
+            if repair_plan and repair_plan.get('actions'):
+                mode = str(decision.get('mode') or '').strip().lower()
+                supplied_plan = str(decision.get('plan_id') or '').strip().lower()
+                if mode and supplied_plan != repair_plan['plan_id']:
+                    return {**empty, 'reference_species': sorted(refs),
+                            'method_check': method_check, 'repair_plan': repair_plan,
+                            'error': '智能修复预览已过期；输入文件可能变化，请重新预览'}
+                if mode not in {'keep', 'apply'}:
+                    return {**empty, 'reference_species': sorted(refs),
+                            'method_check': method_check, 'repair_plan': repair_plan,
+                            'needs_repair_decision': True, 'error': None}
+                if mode == 'apply':
+                    for action in repair_plan['actions']:
+                        member_incar_patches.setdefault(
+                            action['structure_path'], {})[action['key']] = action['new']
+                        if action['key'] == 'ENCUT':
+                            plans[action['structure_path']]['encut'] = float(action['new'])
+                            plans[action['structure_path']]['encut_source'] = \
+                                'managed_copy_low_risk_repair'
+
+                    # ENCUT is the only auto-repairable field.  Re-evaluate its
+                    # comparability after the previewed patches so the stored
+                    # plan and UI describe the bytes that will actually run.
+                    reference_issues[:] = [
+                        item for item in reference_issues if 'ENCUT' not in item]
+                    reference_warnings[:] = [
+                        item for item in reference_warnings if 'ENCUT' not in item]
+                    for path in configs:
+                        species = source_species[path]
+                        label = (os.path.basename(os.path.dirname(path))
+                                 if os.path.basename(path).casefold()
+                                 in ('poscar', 'contcar') else os.path.basename(path))
+                        reference_encut = _method_number(
+                            (ref_signatures.get(species) or {}).get('encut'))
+                        planned_encut = _method_number(plans[path].get('encut'))
+                        if reference_encut is None or planned_encut is None:
+                            reference_warnings.append(
+                                f'{label}: {species}: ENCUT 证据不完整')
+                        elif abs(reference_encut - planned_encut) > 1e-8:
+                            reference_issues.append(
+                                f'{label}: {species}: ENCUT 参考={reference_encut} eV，'
+                                f'新任务={planned_encut} eV')
+                    clean_encut = _method_number(plans[slab].get('encut'))
+                    for path in configs:
+                        member_encut = _method_number(plans[path].get('encut'))
+                        label = (os.path.basename(os.path.dirname(path))
+                                 if os.path.basename(path).casefold()
+                                 in ('poscar', 'contcar') else os.path.basename(path))
+                        if clean_encut is None or member_encut is None:
+                            reference_warnings.append(
+                                f'clean slab ↔ {label}: ENCUT 证据不完整')
+                        elif abs(clean_encut - member_encut) > 1e-8:
+                            reference_issues.append(
+                                f'clean slab ↔ {label}: ENCUT 不一致'
+                                f'（{clean_encut!r} vs {member_encut!r}）')
+                    method_check['issues'] = list(dict.fromkeys(reference_issues))
+                    method_check['warnings'] = list(dict.fromkeys(reference_warnings))
+                    method_check['comparability_status'] = (
+                        'incompatible' if method_check['issues'] else
+                        ('unverified' if method_check['warnings'] else 'verified'))
+                    method_check['analysis_ready'] = (
+                        not method_check['issues'] and not method_check['warnings'])
+                    method_check['status'] = (
+                        'analysis_blocked' if method_check['issues'] else
+                        ('review' if method_check['warnings'] else 'advisory'))
+                    method_check['repairs'] = [
+                        {**action, 'applied': True, 'source_unchanged': True}
+                        for action in repair_plan['actions']]
+                method_check['repair_decision'] = {
+                    'mode': mode, 'plan_id': repair_plan['plan_id'],
+                    'source_unchanged': True,
+                }
+            confirmation = dict(method_confirmation or {}) \
+                if isinstance(method_confirmation, dict) else {}
+            if confirmation.get('confirmed') and str(confirmation.get('reason') or '').strip():
+                method_check['confirmation'] = {
+                    'confirmed': True,
+                    'reason': str(confirmation.get('reason') or '').strip(),
+                    'confirmed_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                }
+
+            molecules_dir = str(reference.get('molecules_dir') or '').strip()
+            if molecules_dir and not os.path.isabs(molecules_dir):
+                molecules_dir = os.path.join(
+                    str(reference.get('root') or os.path.dirname(reference_project_path)),
+                    molecules_dir)
+            if not molecules_dir:
+                parents = [os.path.dirname(path) for path in ref_jobs.values()]
+                molecules_dir = os.path.commonpath(parents) if parents else reference.get('root')
+            reference_path = os.path.abspath(str(reference_project_path))
+            if os.path.isdir(reference_path):
+                reference_path = os.path.join(reference_path, 'project.yaml')
+            member_inputs = [{
+                'role': 'clean_slab',
+                'poscar': {'path': slab, 'sha256': member_poscar_hashes[slab]},
+                'incar': {'path': member_incar_paths[slab],
+                          'sha256': member_incar_records[slab]['sha256'],
+                          'source': member_incar_records[slab]['source']},
+                'input_bundle': member_input_bundles.get(slab),
+            }]
+            member_inputs.extend({
+                'role': 'config', 'species': source_species[path],
+                'poscar': {'path': path, 'sha256': member_poscar_hashes[path]},
+                'incar': {'path': member_incar_paths[path],
+                          'sha256': member_incar_records[path]['sha256'],
+                          'source': member_incar_records[path]['source']},
+                'input_bundle': member_input_bundles.get(path),
+                'species_evidence': source_species_evidence[path],
+            } for path in configs)
+            request_inputs = {
+                'name': project_name,
+                'slab': {'path': slab, 'sha256': member_poscar_hashes[slab]},
+                # 代表性旧字段保留；真实逐成员绑定以 members 为准。
+                'incar': {'path': member_incar_paths[slab],
+                          'sha256': member_incar_records[slab]['sha256']},
+                'configs': [
+                    {'path': path, 'sha256': member_poscar_hashes[path],
+                     'incar_path': member_incar_paths[path],
+                     'incar_sha256': member_incar_records[path]['sha256'],
+                     'input_bundle': member_input_bundles.get(path),
+                     'species': source_species[path],
+                     'species_evidence': source_species_evidence[path]}
+                    for path in configs
+                ],
+                'members': member_inputs,
+                'reference_project': reference_path,
+                'species_refs': refs,
+                'species_ref_jobs': ref_jobs,
+                'planned_method': method_check['planned'],
+                'planned_methods': method_check['planned_members'],
+                'repair_decision': method_check.get('repair_decision'),
+            }
+            request_sha256 = hashlib.sha256(json.dumps(
+                request_inputs, ensure_ascii=False, sort_keys=True,
+                separators=(',', ':')).encode('utf-8')).hexdigest()
+            preparation = {
+                'schema': 2, 'request_sha256': request_sha256,
+                'inputs': request_inputs,
+                'prepared_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                'method_check': method_check,
+            }
+            if os.path.exists(target):
+                existing = self._adsorption.load_project(target)
+                old_hash = ((existing or {}).get('preparation') or {}).get('request_sha256')
+                if existing is not None and old_hash == request_sha256:
+                    members = existing.get('members') or {}
+                    job_dirs = [path for path in (
+                        [members.get('clean_slab'), members.get('gas_ref')]
+                        + list(members.get('configs') or [])) if path]
+                    return {'ok': True, 'project_path': os.path.join(target, 'project.yaml'),
+                            'job_dirs': job_dirs, 'reference_species': sorted(refs),
+                            'advisories': [], 'warnings': ['输入指纹一致，已复用现有项目'],
+                            'reused': True, 'preparation': existing.get('preparation'),
+                            'method_check': method_check,
+                            'needs_method_confirmation': False,
+                            'error': None}
+                raise FileExistsError(
+                    f'目标项目已存在且输入指纹不同，不会覆盖：{target}；'
+                    '请更换项目名')
+            result = self._adsorption.create_project(
+                target, project_name, clean_poscar=slab,
+                config_poscars=configs,
+                incar_path=(fallback_incar or member_incar_paths[slab]),
+                member_incars=member_incar_paths,
+                member_source_evidence=member_source_evidence,
+                member_input_bundles=member_input_bundles,
+                lib_root=(lib_root or None),
+                config_species=source_species, species_refs=refs,
+                config_species_evidence=source_species_evidence,
+                species_ref_jobs=ref_jobs, molecules_dir=molecules_dir,
+                reference_project=reference_path, preparation=preparation,
+                fail_if_exists=True,
+                member_incar_patches=member_incar_patches)
+            warnings = []
+            for member, _job_dir, item_warnings in (result.get('generated') or []):
+                warnings.extend(f'{member}:{warning}' for warning in (item_warnings or []))
+            warnings.extend(f'{member}:{message}'
+                            for member, message in (result.get('errors') or []))
+            advisories = [f'[{priority}·{advisor}] {message}'
+                          for priority, advisor, message in (result.get('advisories') or [])]
+            job_dirs = [job_dir for _member, job_dir, _warnings
+                        in (result.get('generated') or [])]
+            build_errors = list(result.get('errors') or [])
+            complete = (bool(result.get('ok')) and not build_errors
+                        and len(job_dirs) == len(configs) + 1)
+            error = None if complete else '整组未完整生成；不会自动提交，请按 warnings 修正后重建项目'
+            return {'ok': complete, 'project_path': result.get('project_path'),
+                    'job_dirs': job_dirs, 'reference_species': sorted(refs),
+                    'reused': False, 'preparation': preparation,
+                    'method_check': method_check,
+                    'repair_plan': repair_plan,
+                    'needs_method_confirmation': False,
+                    'advisories': advisories, 'warnings': warnings, 'error': error}
+        except Exception as e:                            # noqa: BLE001
+            return {**empty, 'error': str(e)}
+
+    def submit_project_with_resources(self, project_path, profile_name, cores,
+                                      walltime, password=None, trust_new=False):
+        """按本次选择的核数/墙时提交项目，不改集群 profile 的持久配置。"""
+        base = {'ok': False, 'results': [], 'submitted': [], 'skipped': [],
+                'resources': {}, 'needs_trust': False}
+        try:
+            project = self._adsorption.load_project(str(project_path or '').strip())
+            if project is None:
+                raise ValueError('项目不存在或 project.yaml 无法读取')
+            try:
+                if isinstance(cores, bool):
+                    raise ValueError
+                ncores = int(cores)
+            except (TypeError, ValueError) as e:
+                raise ValueError('核数必须是正整数') from e
+            if ncores <= 0:
+                raise ValueError('核数必须是正整数')
+            wall = str(walltime or '').strip()
+            if not re.fullmatch(r'\d{1,4}:[0-5]\d:[0-5]\d', wall):
+                raise ValueError('墙时格式应为 HH:MM:SS，例如 48:00:00')
+            hours, minutes, seconds = (int(value) for value in wall.split(':'))
+            if hours * 3600 + minutes * 60 + seconds <= 0:
+                raise ValueError('墙时必须大于 00:00:00')
+            prof, pw, resolve_error = self._resolve(str(profile_name or '').strip(), password)
+            if resolve_error:
+                return {**base, 'error': resolve_error.get('error')}
+            launch_profile = copy.copy(prof)
+            launch_profile.nodes = 1
+            launch_profile.ppn = ncores
+            launch_profile.walltime = wall
+            resources = {'profile': prof.name, 'nodes': 1, 'cores': ncores,
+                         'ppn': ncores, 'walltime': wall}
+            if hasattr(self._sub(), 'profile_binding'):
+                resources['profile_binding'] = self._sub().profile_binding(prof)
+            mode = str(getattr(prof, 'script_mode', 'auto') or 'auto')
+            raw_commands = getattr(prof, 'engine_commands', {}) or {}
+            commands = ({str(key).strip().lower(): str(value or '').strip()
+                         for key, value in raw_commands.items()}
+                        if isinstance(raw_commands, dict) else {})
+            mapped_vasp = str(commands.get('vasp') or '').strip()
+            command = mapped_vasp or str(getattr(prof, 'vasp_cmd', '') or '')
+            if mode == 'auto':
+                rendered_command = command.replace('{cores}', str(ncores)).replace(
+                    '{ppn}', str(ncores))
+                literal_counts = _parallel_counts(rendered_command)
+                if literal_counts and any(value != ncores for value in literal_counts):
+                    raise ValueError(
+                        f'服务器 vasp_cmd 中的 MPI/任务核数 {literal_counts} 与本次选择 '
+                        f'{ncores} 核不一致；请改为 {{cores}} 占位符或删除冲突硬编码')
+                if mapped_vasp:
+                    # copy.copy 不会复制 dict；新建一份，避免“本次核数”
+                    # 反向修改已保存的 profile。
+                    launch_profile.engine_commands = {
+                        **commands, 'vasp': rendered_command}
+                else:
+                    launch_profile.vasp_cmd = rendered_command
+            elif mode == 'template':
+                template_path = str(getattr(prof, 'template_path', '') or '')
+                if not template_path or not os.path.isfile(template_path):
+                    raise ValueError('模板模式但模板文件不存在；请重新选择提交脚本')
+                with open(template_path, 'r', encoding='utf-8', errors='replace') as handle:
+                    template_text = handle.read()
+                if not _CORE_PLACEHOLDER_RE.search(template_text):
+                    raise ValueError(
+                        '提交模板必须在有效的 MPI/调度器核数参数中使用 '
+                        '{cores} 或 {ppn} 占位符')
+                if not _WALLTIME_PLACEHOLDER_RE.search(template_text):
+                    raise ValueError(
+                        '提交模板必须在有效的调度器墙时参数中使用 {walltime} 占位符')
+                rendered_template = (template_text
+                                     .replace('{cores}', str(ncores))
+                                     .replace('{ppn}', str(ncores))
+                                     .replace('{nodes}', '1')
+                                     .replace('{walltime}', wall))
+                template_counts = _parallel_counts(rendered_template)
+                if not template_counts or any(value != ncores for value in template_counts):
+                    raise ValueError(
+                        f'提交模板渲染后的 MPI/任务核数 {template_counts} 与本次选择 '
+                        f'{ncores} 核冲突；请删除模板中的硬编码资源')
+                node_counts = [int(match.group(1))
+                               for match in _NODE_COUNT_RE.finditer(rendered_template)]
+                if node_counts and any(value != 1 for value in node_counts):
+                    raise ValueError(
+                        f'提交模板硬编码节点数 {node_counts}，与一站式提交的 1 节点冲突')
+                template_walltimes = _walltimes(rendered_template)
+                if (not template_walltimes
+                        or any(value != wall for value in template_walltimes)):
+                    raise ValueError(
+                        f'提交模板渲染后的墙时 {template_walltimes} 与本次选择 {wall} 冲突；'
+                        '请删除模板中的硬编码墙时')
+            else:
+                raise ValueError(f'未知提交脚本模式：{mode!r}')
+
+            # 与状态监控/报告共用同一成员枚举：除 clean/gas/config 外，导入项目的
+            # species_ref_jobs/molecules 中若仍是 CREATED，也必须能在这一站提交。
+            # 已完成的分子参考会在下面按 DONE 安全跳过。
+            job_dirs = list(dict.fromkeys(
+                str(d) for d in self._project_member_dirs(project) if d))
+            previous_launch = dict(project.get('launch') or {})
+            previous_resources = dict(previous_launch.get('resources') or {})
+            previous_profile = str(previous_resources.get('profile') or '').strip()
+            previous_binding = previous_resources.get('profile_binding') or {}
+            current_binding = resources.get('profile_binding') or {}
+            previous_submitted = list(previous_launch.get('submitted_job_dirs') or [])
+            if previous_submitted and previous_profile and previous_profile != prof.name:
+                raise ValueError(
+                    f'该项目已有 {len(previous_submitted)} 个作业由服务器'
+                    f'「{previous_profile}」自动托管，不能改用「{prof.name}」覆盖项目'
+                    '级服务器绑定。请继续使用原服务器，或新建项目。')
+            if (previous_submitted and previous_binding
+                    and previous_binding.get('fingerprint')
+                    != current_binding.get('fingerprint')):
+                raise ValueError(
+                    f'服务器「{prof.name}」的连接端点已与项目首次提交时不同；'
+                    '为防止同名配置接管旧任务，已阻止本次提交。请恢复原配置或新建项目。')
+
+            eligible, skipped, reconciled = [], [], []
+            for job_dir in job_dirs:
+                manifest = self._manifest.load_manifest(job_dir)
+                state = (manifest or {}).get('state')
+                job_id = (manifest or {}).get('scheduler_job_id')
+                if manifest is None:
+                    skipped.append({'dir': job_dir, 'reason': '缺少可读 job.yaml'})
+                elif state == 'DONE':
+                    # 已收敛分子参考是只读依赖，可跨服务器复用；它既不应进入本项目
+                    # 的提交白名单，也不应因保留了原服务器 job_id 而被误判为串服。
+                    skipped.append({'dir': job_dir, 'reason': '当前状态 DONE 不重复提交'})
+                elif job_id:
+                    bound_profile = str(manifest.get('cluster') or '').strip()
+                    if bound_profile and bound_profile != prof.name:
+                        raise ValueError(
+                            f'项目成员 {self._base(job_dir)} 已绑定服务器'
+                            f'「{bound_profile}」(作业号 {job_id})，不能改投'
+                            f'「{prof.name}」。同一项目当前只允许一台服务器'
+                            '自动托管。')
+                    if bound_profile == prof.name:
+                        if hasattr(self._sub(), 'assert_profile_binding'):
+                            self._sub().assert_profile_binding(
+                                prof, job_dir, '项目继续托管', manifest=manifest)
+                        reconciled.append(job_dir)
+                    skipped.append({'dir': job_dir, 'reason': f'已有作业号 {job_id}'})
+                elif state in _ACTIVE_STATES:
+                    skipped.append({'dir': job_dir, 'reason': f'当前状态 {state} 不重复提交'})
+                else:
+                    eligible.append(job_dir)
+
+            managed_before = list(previous_submitted)
+            managed_before.extend(d for d in reconciled if d not in managed_before)
+            repair_needed = bool(
+                managed_before
+                and (not project.get('autopilot_managed')
+                     or previous_profile != prof.name
+                     or any(d not in previous_submitted for d in reconciled)))
+
+            def _persist_management(new_submitted):
+                """Persist or repair the explicit project automation allow-list."""
+                persistence_errors = []
+                all_submitted = list(managed_before)
+                all_submitted.extend(d for d in new_submitted if d not in all_submitted)
+                project['launch'] = {
+                    **previous_launch,
+                    'resources': resources,
+                    'submitted_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                    'submitted_job_dirs': all_submitted,
+                }
+                project['autopilot_managed'] = True
+                try:
+                    root = project.get('root') or os.path.dirname(str(project_path))
+                    self._adsorption.save_project(root, project)
+                except Exception as e:                    # noqa: BLE001 远程提交不能回滚
+                    persistence_errors.append(f'提交成功但 launch 资源写回失败：{e}')
+                try:
+                    self._config.set_ui_state(
+                        autopilot=True, autopilot_continue=True,
+                        autopilot_fetch=True, autopilot_report=True)
+                    if self._pipeline_supervisor is not None:
+                        self._pipeline_supervisor.reconfigure()
+                        self._pipeline_supervisor.wake()
+                except Exception as e:                    # noqa: BLE001 自动化开关可重试
+                    persistence_errors.append(f'任务已提交，但自动托管设置保存失败：{e}')
+                if getattr(prof, 'auth', 'key') == 'password' and pw:
+                    try:
+                        self._save_password_verified(prof.name, pw)
+                    except Exception as e:                # noqa: BLE001 无人值守凭据失败
+                        persistence_errors.append(
+                            f'提交成功但密码未能保存到系统凭据库：{e}')
+                return persistence_errors
+
+            if not eligible:
+                unsafe = [row for row in skipped
+                          if not ('已有作业号' in row['reason']
+                                  or '当前状态 DONE' in row['reason']
+                                  or any(f'当前状态 {state}' in row['reason']
+                                         for state in _ACTIVE_STATES))]
+                persistence_errors = (_persist_management([])
+                                      if repair_needed and not unsafe else [])
+                return {**base, 'ok': not unsafe and not persistence_errors,
+                        'skipped': skipped, 'resources': resources,
+                        'error': ('；'.join(persistence_errors) if persistence_errors else
+                                  ('没有可提交作业；' + '；'.join(
+                                      f'{self._base(row["dir"])}:{row["reason"]}'
+                                      for row in unsafe) if unsafe else None))}
+
+            response = self._bo().submit_batch(
+                launch_profile, pw, eligible, trust_new)
+            if response.get('needs_trust'):
+                return {**base, 'skipped': skipped, 'resources': resources,
+                        'needs_trust': True,
+                        **self._host_key_evidence(response),
+                        'error': response.get('message') or '需要确认服务器指纹'}
+            results, submitted = [], []
+            for row in (response.get('results') or []):
+                job_dir, success, message = row
+                item = {'dir': job_dir, 'ok': bool(success), 'message': str(message)}
+                results.append(item)
+                if success:
+                    submitted.append(job_dir)
+            persistence_errors = []
+            if submitted or repair_needed:
+                persistence_errors = _persist_management(submitted)
+            failed = [row for row in results if not row['ok']]
+            if persistence_errors:
+                error = '；'.join(persistence_errors)
+            elif failed:
+                error = f'{len(failed)} 个作业提交失败；已成功的不会重复提交，可安全重试'
+            else:
+                error = None
+            return {**base, 'ok': not failed and not persistence_errors,
+                    'results': results, 'submitted': submitted, 'skipped': skipped,
+                    'resources': resources, 'needs_trust': False, 'error': error}
+        except Exception as e:                            # noqa: BLE001
+            return {**base, 'error': str(e)}
+
+    def proj_import_scan(self, source_root):
+        """递归预检本地已算 VASP 结果（纯只读，不落盘）。
+
+        返回每个计算目录的能量来源、多证据收敛判定、建议角色和可执行下一步。
+        不要在扫描阶段写 job.yaml，用户可先修正角色/任务类型再提交。
+        """
+        try:
+            root = str(source_root or '').strip()
+            if not root:
+                return {'ok': False, 'source_root': '', 'candidates': [],
+                        'summary': {}, 'suggested_name': '', 'error': '请先选择结果根目录'}
+            result = dict(self._ri().scan_folder(root) or {})
+            result.setdefault('ok', True)
+            result.setdefault('source_root', root)
+            result.setdefault('candidates', [])
+            result.setdefault('summary', {})
+            result.setdefault('suggested_name', os.path.basename(os.path.normpath(root)))
+            result['error'] = None
+            return result
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'source_root': str(source_root or ''),
+                    'candidates': [], 'summary': {}, 'suggested_name': '', 'error': str(e)}
+
+    def proj_import_commit(self, source_root, out_root, project_name, selections):
+        """把预检后选中的结果复制到受管项目，生成 manifest 并登记台账。
+
+        后端会重新扫描并校验 ``path/role/task_type/manual_confirm``，不信任
+        前端缓存的 DONE 结论；源目录始终只读。
+        """
+        try:
+            source = str(source_root or '').strip()
+            target = str(out_root or '').strip()
+            name = str(project_name or '').strip()
+            if not source:
+                raise ValueError('未选择结果根目录')
+            if not target:
+                raise ValueError('未选择导入后的项目保存位置')
+            if not name:
+                raise ValueError('请填写项目名')
+            items = [dict(x) for x in (selections or []) if isinstance(x, dict)]
+            if not any(x.get('selected', True) and x.get('role') != 'ignore' for x in items):
+                raise ValueError('至少选择一个可导入的结果')
+            result = dict(self._ri().commit_import(
+                source, target, name, items,
+                adsorption_mod=self._adsorption, ledger_mod=self._ledger,
+                manifest_mod=self._manifest) or {})
+            if result.get('ok') and isinstance(result.get('project'), dict):
+                result['project']['work_mode'] = 'lis'
+                project_root = result['project'].get('root') or os.path.join(target, name)
+                self._adsorption.save_project(project_root, result['project'])
+                # 已算结果导入后不再要求用户额外点一次“生成报告”。只有全部成员
+                # 已完成且本地证据可读时才立即出报告；最终门禁未过则出诊断版。
+                try:
+                    states = self._member_states(result['project'])
+                    if states and self._project_all_done(states):
+                        project_path = (result.get('project_path')
+                                        or os.path.join(project_root, 'project.yaml'))
+                        summary = self._adsorption.delta_e_rows(result['project'])
+                        eligible, reason = self._final_report_gate(
+                            result['project'], summary)
+                        report_dir = os.path.join(project_root, 'report')
+                        report_name = (f'{name}_report.html' if eligible
+                                       else f'{name}_diagnostic.html')
+                        generated = self.proj_report(
+                            project_path, os.path.join(report_dir, report_name),
+                            final=eligible)
+                        result['auto_report'] = generated
+                        if not eligible:
+                            result['auto_report_reason'] = reason
+                            if generated.get('ok'):
+                                try:
+                                    result['auto_report_blocked'] = (
+                                        self._persist_blocked_report_marker(
+                                            result['project'], summary, reason,
+                                            generated.get('files')
+                                            or [generated.get('file')]))
+                                except Exception as marker_exc:  # noqa: BLE001 报告本体仍有效
+                                    generated['marker_error'] = str(marker_exc)
+                except Exception as exc:                 # noqa: BLE001 导入成功不因报告降级而回滚
+                    result['auto_report'] = {
+                        'ok': False, 'file': None, 'files': [], 'error': str(exc)}
+            result.setdefault('ok', True)
+            result.setdefault('imported', [])
+            result.setdefault('summary', {})
+            result['error'] = None
+            return result
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'project_path': None, 'project': None,
+                    'imported': [], 'summary': {}, 'error': str(e)}
+
+    def proj_list(self):
+        """项目注册表 → 基本成员数 + 可复用 Li-S 参考物种。
+
+        n_members 内联算(清洁表面 + 气相参考 + 构型族,镜像 project_tab._member_dirs):
         列表渲染绝不触碰 report_full(避免仅为计数拖入 matplotlib,matplotlib 坏时也不
         整体失败)。畸形/已移动的 project.yaml(load_project→None)或坏成员静默跳过。
         """
@@ -546,13 +3166,22 @@ class Api:
                     if proj is None:
                         continue
                     mem = proj.get('members') or {}
-                    member_dirs = [d for d in ([mem.get('clean_slab'),
-                                                mem.get('gas_ref')]
-                                               + list(mem.get('configs') or [])) if d]
+                    member_dirs = self._project_member_dirs(proj)
+                    reference_species = sorted(
+                        str(species) for species in (proj.get('species_ref_jobs') or {})
+                        if str(species).strip())
+                    n_done = sum(
+                        1 for member_dir in member_dirs
+                        if ((self._manifest.load_manifest(member_dir) or {}).get('state') == 'DONE'))
                     projects.append({
                         'path': pp,
                         'name': proj.get('name', '') or '',
                         'n_members': len(member_dirs),
+                        'n_done': n_done,
+                        'reference_mode': ('species' if reference_species else
+                                           'single' if mem.get('gas_ref') else 'none'),
+                        'reference_species': reference_species,
+                        'n_species_refs': len(reference_species),
                     })
                 except Exception:                         # noqa: BLE001 单个坏项目不拖垮全表
                     continue
@@ -562,11 +3191,11 @@ class Api:
 
     def proj_create(self, name, slab_path, config_paths, incar_path, gas_path,
                     out_root):
-        """批量生成 清洁表面 + 组态族 +(可选)气相参考(镜像 project_tab._on_generate)。
+        """批量生成 清洁表面 + 构型族 +(可选)气相参考(镜像 project_tab._on_generate)。
 
-        前置校验照抄 _on_generate;lib_root 从 config 读(失败静默)。坏组态隔离语义在
+        前置校验照抄 _on_generate;lib_root 从 config 读(失败静默)。坏构型隔离语义在
         adsorption 层已就位(create_project 的 errors 只记不拖垮全组)→ 此处把 build 警告
-        与组态 errors 一并透传进 warnings,不整体失败;advisories 转成 "[级别] 文案" 列表
+        与构型 errors 一并透传进 warnings,不整体失败;advisories 转成 "[级别] 文案" 列表
         (project_tab 展示口径)。gas_path 空 → ref_poscar=None(镜像可选气相参考)。
         """
         try:
@@ -586,7 +3215,7 @@ class Api:
             if not incar or not os.path.isfile(incar):
                 errs.append('共享 INCAR 不存在')
             if not configs:
-                errs.append('至少添加一个吸附组态')
+                errs.append('至少添加一个吸附构型')
             if gas and not os.path.isfile(gas):
                 errs.append('气相参考文件不存在')
             if errs:
@@ -602,6 +3231,10 @@ class Api:
                 clean_poscar=slab, config_poscars=configs,
                 incar_path=incar, ref_poscar=(gas or None),
                 lib_root=(lib or None))
+            # 报告口径绑定到项目，之后切换界面工作模式不会改变旧项目的科学输出。
+            if res.get('ok') and isinstance(res.get('project'), dict):
+                res['project']['work_mode'] = 'lis'
+                self._adsorption.save_project(os.path.join(root, name), res['project'])
             advisories = [f'[{pri}·{aname}] {msg}'
                           for pri, aname, msg in (res.get('advisories') or [])]
             warnings = []
@@ -634,14 +3267,36 @@ class Api:
             ref_state, e_ref = s['ref']
             rows = [{'name': r['name'], 'state': r['state'],
                      'e_config': r['e_config'], 'delta_e': r['delta_e'],
-                     'note': r['note']} for r in (s.get('rows') or [])]
+                     'note': r['note'], 'species': r.get('species'),
+                     'reference_species': r.get('reference_species'),
+                     'e_ref': r.get('e_ref'),
+                     'reference_job': r.get('reference_job'),
+                     'reference_source': r.get('reference_source'),
+                     'reference_state': r.get('reference_state'),
+                     'reference_valid': r.get('reference_valid'),
+                     'reference_note': r.get('reference_note'),
+                     'method_check': r.get('method_check'),
+                     'method_warnings': r.get('method_warnings') or [],
+                     'dd_e': r.get('dd_e'),
+                     'is_most_stable': bool(r.get('is_most_stable'))}
+                    for r in (s.get('rows') or [])]
             parts = [f'清洁表面:{slab_state}']
-            parts.append(f'气相参考:{ref_state}' if s.get('has_ref')
-                         else '未设气相参考')
+            if s.get('reference_mode') == 'species':
+                parts.append(f'逐物种参考:{len(s.get("species_refs") or {})} 个')
+            else:
+                parts.append(f'气相参考:{ref_state}' if s.get('has_ref')
+                             else '未设气相参考')
+            final_eligible, final_reason = self._final_report_gate(proj, s)
             return {'ok': True, 'rows': rows, 'note': ';'.join(parts),
+                    'reference_mode': s.get('reference_mode', 'none'),
+                    'species_refs': s.get('species_refs') or {},
+                    'dataset_groups': s.get('dataset_groups') or [],
+                    'method_consistency': s.get('method_consistency') or {},
                     'slab': {'state': slab_state, 'energy': e_slab},
                     'ref': {'state': ref_state, 'energy': e_ref,
                             'has_ref': bool(s.get('has_ref'))},
+                    'final_report_eligible': final_eligible,
+                    'final_report_reason': final_reason,
                     'error': None}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'rows': [], 'note': '', 'error': str(e)}
@@ -662,30 +3317,1706 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'file': None, 'error': str(e)}
 
-    def proj_report(self, path, save_to):
-        """完整项目报告(镜像 project_tab._on_report);同步执行,耗时长在 JS 侧提示等待。
-
-        load_project → 无成员作业防呆(report_full._member_dirs)→ generate_project_report
-        (proj, save_to, config=load_config())。config 读失败降级为 {}(同 _on_report)。
-        """
+    def proj_report(self, path, save_to, final=False):
+        """生成同源 HTML、Word 和 PDF；最终报告会立即写入哈希绑定标记。"""
         try:
             proj = self._adsorption.load_project((path or '').strip())
             if proj is None:
-                return {'ok': False, 'file': None,
+                return {'ok': False, 'file': None, 'files': [],
                         'error': '项目不存在或 project.yaml 已被移动'}
             out = (save_to or '').strip()
             if not out:
-                return {'ok': False, 'file': None, 'error': '未指定报告路径'}
+                return {'ok': False, 'file': None, 'files': [],
+                        'error': '未指定报告路径'}
             if not self._rf()._member_dirs(proj):
-                return {'ok': False, 'file': None, 'error': '项目无成员作业'}
+                return {'ok': False, 'file': None, 'files': [],
+                        'error': '项目无成员作业'}
+            summary = None
+            if final:
+                summary = self._adsorption.delta_e_rows(proj)
+                eligible, reason = self._final_report_gate(proj, summary)
+                if not eligible:
+                    return {'ok': False, 'file': None, 'files': [],
+                            'error': f'最终吸附能报告门禁未通过：{reason}'}
             try:
                 cfg = self._config.load_config()
             except Exception:                             # noqa: BLE001
                 cfg = {}
-            result = self._rf().generate_project_report(proj, out, config=cfg)
-            return {'ok': True, 'file': str(result), 'error': None}
+            generator = self._rf().generate_project_report
+            parameters = inspect.signature(generator).parameters
+            kwargs = {'config': cfg}
+            if ('report_status' in parameters
+                    or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                           for p in parameters.values())):
+                kwargs['report_status'] = 'final' if final else 'diagnostic'
+            result = generator(proj, out, **kwargs)
+            primary = str(result)
+            bundle_fn = getattr(self._rf(), 'report_bundle_paths', None)
+            if callable(bundle_fn):
+                files = [str(item) for item in bundle_fn(primary)]
+            else:
+                candidates = [primary]
+                stem, _ext = os.path.splitext(primary)
+                candidates.extend([stem + '.docx', stem + '.pdf'])
+                files = [item for item in candidates if os.path.isfile(item)]
+            if not primary or (final and not os.path.isfile(primary)):
+                return {'ok': False, 'file': None, 'files': [],
+                        'error': '报告生成器未产出 HTML 主文件'}
+            if not files:
+                files = [primary]
+            if final:
+                summary = summary or self._adsorption.delta_e_rows(proj)
+                marker = self._persist_report_marker(proj, summary, files)
+            else:
+                marker = None
+            return {'ok': True, 'file': primary, 'files': files,
+                    'marker': marker, 'error': None}
         except Exception as e:                            # noqa: BLE001
-            return {'ok': False, 'file': None, 'error': str(e)}
+            return {'ok': False, 'file': None, 'files': [], 'error': str(e)}
+
+    @staticmethod
+    def _safe_report_stem(value) -> str:
+        """Filesystem-safe, readable report stem (also valid on Windows)."""
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', str(value or 'report')).strip(' ._')
+        return (stem or 'report')[:96]
+
+    @staticmethod
+    def _json_safe_report_result(value):
+        """Convert renderer ``Path`` objects to pywebview/JSON-safe strings."""
+        if isinstance(value, os.PathLike):
+            return os.fspath(value)
+        if isinstance(value, dict):
+            return {
+                str(key): Api._json_safe_report_result(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [Api._json_safe_report_result(item) for item in value]
+        return value
+
+    @staticmethod
+    def _comparison_u_by_element(fingerprint):
+        """Map DFT+U vectors onto POTCAR elements without comparing spin.
+
+        Catalyst projects can legitimately contain different metals, so a raw
+        LDAUU vector is not a cross-project protocol identifier.  Mapping the
+        vector to element names lets :mod:`project.comparison` check only
+        elements shared by a pair of projects.
+        """
+        fp = fingerprint if isinstance(fingerprint, dict) else {}
+        potcars = fp.get('potcar_ids') or {}
+        elements = [str(element) for element in potcars]
+        if not elements:
+            return None
+        values = fp.get('u_values')
+        if not isinstance(values, dict):
+            return {element: {'enabled': False} for element in elements}
+        enabled = _method_bool(values.get('LDAU'))
+        if enabled is False or values.get('LDAU') is False:
+            return {element: {'enabled': False} for element in elements}
+        if enabled is not True and values.get('LDAU') is not True:
+            return None
+
+        def _tokens(key, *, integer=False):
+            raw = values.get(key)
+            if isinstance(raw, (list, tuple)):
+                items = list(raw)
+            else:
+                items = str(raw or '').replace(',', ' ').split()
+            parsed = []
+            for item in items:
+                number = _method_number(item)
+                if number is None or (integer and number != int(number)):
+                    return None
+                parsed.append(int(number) if integer else round(number, 10))
+            return parsed
+
+        orbitals = _tokens('LDAUL', integer=True)
+        strengths = _tokens('LDAUU')
+        exchanges = _tokens('LDAUJ')
+        if (orbitals is None or strengths is None or exchanges is None
+                or not (len(orbitals) == len(strengths) == len(exchanges)
+                        == len(elements))):
+            return None
+        ldau_type = _method_integer(values.get('LDAUTYPE'))
+        result = {}
+        for index, element in enumerate(elements):
+            if orbitals[index] < 0:
+                result[element] = {'enabled': False}
+            else:
+                result[element] = {
+                    'enabled': True,
+                    'type': ldau_type,
+                    'l': orbitals[index],
+                    'u_eV': strengths[index],
+                    'j_eV': exchanges[index],
+                }
+        return result
+
+    def _comparison_method_evidence(self, project, summary):
+        """Build a spin-neutral cross-project protocol from actual job evidence."""
+        method = (summary or {}).get('method_consistency') or {}
+        if str(method.get('status') or '').lower() != 'verified':
+            return {
+                'status': 'unverified',
+                'fingerprint': '',
+                'missing': ['项目内部方法证据尚未 verified'],
+            }
+        members = (project or {}).get('members') or {}
+        configs = [str(path) for path in (members.get('configs') or []) if path]
+        selected_names = {
+            str(row.get('name') or '')
+            for row in self._comparison_model().stable_species_rows(summary)
+        }
+        representative = next(
+            (path for path in configs
+             if os.path.basename(os.path.normpath(path)) in selected_names),
+            configs[0] if configs else members.get('clean_slab'),
+        )
+        if not representative:
+            return {
+                'status': 'unverified',
+                'fingerprint': '',
+                'missing': ['没有可读取的周期能量操作数'],
+            }
+        try:
+            from vcstudio.project import energy_gate
+            manifest = self._manifest.load_manifest(representative)
+            record = energy_gate.method_record(
+                representative, manifest, '跨项目代表构型')
+        except Exception as exc:                         # noqa: BLE001
+            return {
+                'status': 'unverified',
+                'fingerprint': '',
+                'missing': [f'实际方法证据读取失败：{exc}'],
+            }
+        fp = record.get('fingerprint') or {}
+        known = record.get('known') or {}
+        required = ('functional', 'dispersion', 'encut',
+                    'kpoints_scheme', 'potcar_ids')
+        missing = [field for field in required if not known.get(field)]
+        potcars = dict(fp.get('potcar_ids') or {})
+        if not potcars and 'potcar_ids' not in missing:
+            missing.append('potcar_ids')
+        u_by_element = self._comparison_u_by_element(fp)
+        if u_by_element is None:
+            missing.append('u_values_by_element')
+        protocol = {
+            'functional': fp.get('functional'),
+            'dispersion': fp.get('dispersion'),
+            'encut_eV': _method_number(fp.get('encut')),
+            'kpoints_scheme': fp.get('kpoints_scheme'),
+            'reference_mode': str((summary or {}).get('reference_mode') or ''),
+            'energy_quantity': 'E0',
+        }
+        if missing:
+            return {
+                'status': 'unverified',
+                'fingerprint': '',
+                'protocol': protocol,
+                'potcar_ids': potcars,
+                'u_by_element': u_by_element or {},
+                'source_job': str(representative),
+                'missing': list(dict.fromkeys(missing)),
+            }
+        encoded = json.dumps(
+            protocol, ensure_ascii=False, sort_keys=True,
+            separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return {
+            'status': 'verified',
+            'fingerprint': hashlib.sha256(encoded).hexdigest(),
+            'protocol': protocol,
+            'potcar_ids': potcars,
+            'u_by_element': u_by_element,
+            'source_job': str(representative),
+            'missing': [],
+        }
+
+    @staticmethod
+    def _candidate_evaluation_table(evaluations, *, title='候选材料后续计算优先级'):
+        rows = []
+        for evaluation in evaluations or []:
+            candidate = evaluation.get('candidate') or {}
+            decision = evaluation.get('decision') or {}
+            evidence = evaluation.get('evidence') or {}
+            profile = evaluation.get('profile') or {}
+            thermo = evaluation.get('thermodynamics') or {}
+            rows.append([
+                candidate.get('name') or '项目',
+                decision.get('priority') or 'hold_for_evidence',
+                decision.get('summary_zh') or '证据不足',
+                (profile.get('short_chain_risk') or {}).get('status') or 'unknown',
+                evidence.get('claim_ceiling') or 'electronic_adsorption_screen',
+                ('—' if thermo.get('u_l_V') is None
+                 else f'{thermo.get("u_l_V"):.3f}'),
+                ('—' if thermo.get('eta_V') is None
+                 else f'{thermo.get("eta_V"):.3f}'),
+            ])
+        return {
+            'title': title,
+            'columns': [
+                '催化剂', '建议', '评价结论', '短链风险',
+                '结论上限', 'U_L / V', 'η / V',
+            ],
+            'rows': rows,
+            'caption': (
+                'advance 表示建议优先进入自由能、溶剂化与关键 NEB；'
+                'hold_for_evidence 表示先补齐方法或物种证据。电子吸附能不直接等同于活性。'),
+        } if rows else None
+
+    @staticmethod
+    def _recommendation_blocks(evaluations):
+        blocks, seen = [], set()
+        for evaluation in evaluations or []:
+            candidate = (evaluation.get('candidate') or {}).get('name') or '项目'
+            for item in evaluation.get('recommendations') or []:
+                code = str(item.get('code') or '')
+                key = (candidate, code)
+                if key in seen:
+                    continue
+                seen.add(key)
+                targets = '、'.join(str(value) for value in item.get('targets') or [])
+                suffix = f'；目标：{targets}' if targets else ''
+                blocks.append({
+                    'title': (
+                        f'{item.get("priority") or "P2"} · {candidate} · '
+                        f'{item.get("action_zh") or code}'
+                    ),
+                    'text': f'{item.get("reason") or ""}{suffix}',
+                })
+        return blocks
+
+    def _project_report_model(self, proj, summary, fed, *, report_kind='final',
+                              figures=None, comparison_context=None):
+        """Build the single source of truth consumed by HTML/DOCX/PDF renderers."""
+        evaluation = self._candidate_eval().evaluate_candidate(
+            summary, project=proj, fed=fed)
+        selected = self._comparison_model().stable_species_rows(summary)
+        method = summary.get('method_consistency') or {}
+        basis = evaluation.get('basis') or {}
+        decision = evaluation.get('decision') or {}
+        profile = evaluation.get('profile') or {}
+        evidence = evaluation.get('evidence') or {}
+        trend = profile.get('trend') or {}
+        short_chain = profile.get('short_chain_risk') or {}
+        rows = []
+        for row in selected:
+            co_minima = row.get('co_minima') or []
+            rows.append([
+                row.get('species'),
+                row.get('name'),
+                f'{row.get("delta_e"):.3f}',
+                (f'{len(co_minima) + 1} 个近简并构型'
+                 if co_minima else '唯一最低构型'),
+                row.get('method_status') or 'unverified',
+            ])
+        findings = [
+            decision.get('summary_zh') or '当前数据仅支持吸附能层面的初筛判断。',
+            f'吸附序列趋势：{trend.get("status") or "insufficient"}；'
+            f'短链风险：{short_chain.get("status") or "unknown"}。',
+        ]
+        if fed:
+            findings.append(
+                f'自由能路径：U_L={fed.get("u_l") if fed.get("u_l") is not None else "—"} V，'
+                f'PDS={fed.get("pds_index") if fed.get("pds_index") is not None else "—"}。')
+        limitations = []
+        for missing in (evidence.get('coverage') or {}).get('missing_species') or []:
+            limitations.append(f'缺少证据：{missing}')
+        limitations.extend(str(value) for value in (method.get('warnings') or []))
+        comparability = evaluation.get('comparability') or {}
+        limitations.extend(
+            str(item.get('message') or item)
+            for item in comparability.get('blocking') or [])
+        limitations.extend(
+            str(item.get('message') or item)
+            for item in comparability.get('warnings') or [])
+        if not fed:
+            limitations.append('未获得配平反应路径的自由能台阶，不能由吸附能差值推导 U_L。')
+        else:
+            limitations.extend(str(value) for value in (fed.get('warnings') or []))
+        methods = [
+            '吸附能定义：E_ads = E(slab+ads) - E(slab) - E(adsorbate)，负值表示放热吸附。',
+            ('本报告使用 lis_eads_sabatier_screen_v1 初筛策略；区间是筛选启发式，'
+             '不是跨材料、覆盖度和计算设置通用的最佳吸附能标准。'),
+            f'方法可比性状态：{method.get("status") or "unverified"}。',
+            ('吸附能小于约 0.15 eV 的构型按近简并处理，不强行声明唯一最稳构型。'),
+        ]
+        if fed:
+            methods.append(
+                '反应台阶已叠加 ZPE−TS 热校正。'
+                if fed.get('thermo_corrected')
+                else '反应台阶当前为未叠加 ZPE−TS 的电子能口径。')
+        return {
+            'schema': 'vcstudio.research-report/v1',
+            'locale': 'zh-CN',
+            'title': f'{proj.get("name") or "催化剂"} 吸附能与反应路径评估',
+            'subtitle': ('锂硫电池正极催化材料第一性原理筛选报告'
+                         if report_kind == 'final' else '诊断报告：证据尚未满足最终结论门槛'),
+            'kicker': 'VASP CATALYST STUDIO · RESEARCH REPORT',
+            'report_kind': report_kind,
+            'metadata': {
+                '项目': proj.get('name') or '—',
+                '项目标识': proj.get('project_uuid') or '—',
+                '数据口径': basis.get('quantity') or 'delta_E_ads',
+                '方法门禁': method.get('status') or 'unverified',
+                '结论上限': decision.get('claim_ceiling') or
+                            evidence.get('level') or 'electronic_adsorption_screen',
+                '评价策略': (evaluation.get('audit') or {}).get('policy_id') or
+                            'lis_eads_sabatier_screen_v1',
+            },
+            'executive_summary': decision.get('summary_zh') or
+                                 '当前结果仅支持吸附能初筛，建议结合自由能和势垒继续验证。',
+            'key_findings': findings,
+            'candidate_evaluations': self._candidate_evaluation_table([evaluation]),
+            'adsorption_table': {
+                'title': '各物种最稳吸附构型与电子吸附能',
+                'columns': ['物种', '最稳构型', 'E_ads / eV', '近简并保护', '方法状态'],
+                'rows': rows,
+                'caption': ('同一物种按 E_ads 最低值选取；差值不超过 0.15 eV 的构型'
+                            '保留为近简并候选。该表不能直接相邻相减作为反应台阶。'),
+            },
+            'figures': list(figures or []),
+            'methods': methods,
+            'limitations': list(dict.fromkeys(limitations)),
+            'recommendations': self._recommendation_blocks([evaluation]),
+            'comparison_context': comparison_context or {},
+        }
+
+    def _project_report_figures(self, proj, summary, fed, out_dir):
+        """Generate report figures from the same selected rows/fed snapshot."""
+        nc = self._nc()
+        os.makedirs(out_dir, exist_ok=True)
+        selected = self._comparison_model().stable_species_rows(summary)
+        name = str(proj.get('name') or 'project')
+        figures, files = [], []
+        if selected:
+            data = {
+                'adsorbates': [row['species'] for row in selected],
+                'substrates': {name: [row['delta_e'] for row in selected]},
+            }
+            bar_files = nc.adsorption_bar(
+                data, os.path.join(out_dir, 'adsorption_profile.png'),
+                negative_up=False, value_labels=True,
+                title='Adsorption-energy profile', formats=('png', 'pdf'))
+            files.extend(bar_files)
+            figures.append({
+                'path': bar_files[0],
+                'title': 'Li-S 物种最稳构型的电子吸附能',
+                'caption': ('数值越负表示吸附越强；'
+                            '过强吸附不自动等同于更优催化性能。'),
+            })
+            table_files = nc.energy_matrix_table(
+                data, os.path.join(out_dir, 'adsorption_table.png'),
+                title='Adsorption-energy screening', formats=('png', 'pdf'))
+            files.extend(table_files)
+        if fed and fed.get('steps'):
+            ladder_files = nc.free_energy_ladder(
+                [{
+                    'name': name,
+                    'G': [step['G'] for step in fed['steps']],
+                    'pds_index': fed.get('pds_index'),
+                    'u_l': fed.get('u_l'),
+                }],
+                os.path.join(out_dir, 'free_energy_ladder.png'),
+                step_labels=[step.get('label') or step.get('species')
+                             for step in fed['steps']],
+                show_ul=True, title='Li-S reaction free-energy path',
+                formats=('png', 'pdf'))
+            files.extend(ladder_files)
+            figures.append({
+                'path': ladder_files[0],
+                'title': '配平反应路径的自由能台阶',
+                'caption': ('PDS 与 U_L 直接取自'
+                            '自由能模块的逐电子定义，不由绘图层重新推导。'),
+            })
+        return figures, files
+
+    def proj_report_bundle(self, path, out_dir, formats=None, final=True, stem=None):
+        """Generate a thesis-style HTML + DOCX + PDF bundle from one data snapshot.
+
+        A failed final-result gate produces an explicit diagnostic report instead
+        of silently skipping the request or pretending the result is final.
+        """
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'kind': None, 'files': {},
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            target = os.path.abspath(os.path.normpath(str(out_dir or '').strip()))
+            if not str(out_dir or '').strip():
+                return {'ok': False, 'kind': None, 'files': {}, 'error': '未指定报告目录'}
+            os.makedirs(target, exist_ok=True)
+            summary = self._adsorption.delta_e_rows(proj)
+            eligible, reason = self._final_report_gate(proj, summary)
+            report_kind = 'final' if bool(final) and eligible else 'diagnostic'
+            fed, fed_reason = self._proj_fed(proj, summary)
+            figure_dir = os.path.join(target, 'figures')
+            figures, figure_files = self._project_report_figures(
+                proj, summary, fed, figure_dir)
+            model = self._project_report_model(
+                proj, summary, fed, report_kind=report_kind, figures=figures)
+            if reason and report_kind == 'diagnostic':
+                model['limitations'] = [f'最终报告门禁未通过：{reason}',
+                                        *model.get('limitations', [])]
+            if fed_reason:
+                model['limitations'] = [f'自由能台阶未生成：{fed_reason}',
+                                        *model.get('limitations', [])]
+            wanted = tuple(str(value).lower() for value in
+                           (formats or ('html', 'docx', 'pdf')))
+            safe_stem = self._safe_report_stem(
+                stem or f'{proj.get("name") or "project"}_吸附能评估报告')
+            rendered = self._json_safe_report_result(
+                self._paper().render_report_bundle(
+                    model, target, stem=safe_stem, formats=wanted))
+            rendered.setdefault('ok', True)
+            rendered.update({
+                'kind': report_kind,
+                'eligible_final': eligible,
+                'gate_reason': reason,
+                'figures': figure_files,
+                'error': rendered.get('error'),
+            })
+            return rendered
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'kind': None, 'files': {}, 'error': str(e)}
+
+    def _comparison_items(self, paths, preset_key=None):
+        items = []
+        for raw_path in paths or []:
+            path = str(raw_path or '').strip()
+            proj = self._adsorption.load_project(path)
+            if proj is None:
+                items.append({'path': path, 'project': None})
+                continue
+            summary = dict(self._adsorption.delta_e_rows(proj) or {})
+            explicit_fingerprint = (
+                summary.get('comparison_method_fingerprint')
+                or proj.get('comparison_method_fingerprint')
+            )
+            if not explicit_fingerprint:
+                method_evidence = self._comparison_method_evidence(proj, summary)
+                summary['comparison_method_evidence'] = method_evidence
+                if method_evidence.get('fingerprint'):
+                    summary['comparison_method_fingerprint'] = (
+                        method_evidence['fingerprint'])
+            if preset_key:
+                fed, reason, _title = self._proj_fed_preset(proj, summary, preset_key)
+            else:
+                fed, reason = self._proj_fed(proj, summary)
+            items.append({
+                'path': path, 'project': proj, 'summary': summary,
+                'fed': fed, 'fed_reason': reason,
+            })
+        return items
+
+    def proj_compare_preview(self, paths, preset_key=None):
+        """Preview every selected project, including moved/blocked selections."""
+        try:
+            snapshot = self._comparison_model().build_comparison_snapshot(
+                self._comparison_items(paths, preset_key), preset_key=preset_key)
+            return {'ok': True, **snapshot, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'projects': [], 'comparison_gate': {},
+                    'can_plot': False, 'can_final_report': False, 'error': str(e)}
+
+    def proj_evaluate_candidate(self, path, options=None):
+        """Return deterministic, auditable follow-up priority for one project."""
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'evaluation': None,
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            summary = self._adsorption.delta_e_rows(proj)
+            fed, _reason = self._proj_fed(proj, summary)
+            evaluation = self._candidate_eval().evaluate_candidate(
+                summary, project=proj, fed=fed, options=options)
+            return {'ok': True, 'evaluation': evaluation, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'evaluation': None, 'error': str(e)}
+
+    def _comparison_figures(self, snapshot, out_dir):
+        nc = self._nc()
+        os.makedirs(out_dir, exist_ok=True)
+        figures, files, skipped = [], [], []
+        matrix = snapshot.get('adsorption_matrix') or {}
+        if matrix.get('rows') and matrix.get('cols'):
+            heat_files = nc.heatmap_matrix(
+                matrix, os.path.join(out_dir, 'adsorption_comparison.png'),
+                cbar_label=r'$E_\mathrm{ads}$ (eV)',
+                title='Most-stable adsorption configurations',
+                cmap='cividis_r',
+                formats=('png', 'pdf'))
+            files.extend(heat_files)
+            figures.append({
+                'path': heat_files[0],
+                'title': '多催化剂最稳构型吸附能矩阵',
+                'caption': ('仅比较同一规范物种，'
+                            '空白表示该项目没有可审计数值。'),
+            })
+        ladder = snapshot.get('ladder') or {}
+        if snapshot.get('can_plot') and ladder.get('paths'):
+            ladder_files = nc.free_energy_ladder(
+                ladder['paths'], os.path.join(out_dir, 'free_energy_comparison.png'),
+                step_labels=ladder.get('step_labels'), show_ul=True, mark_pds=False,
+                title='Multi-catalyst free-energy pathways',
+                formats=('png', 'pdf'))
+            files.extend(ladder_files)
+            figures.append({
+                'path': ladder_files[0],
+                'title': '多催化剂自由能台阶叠加比较',
+                'caption': ('图中项目使用相同步骤顺序'
+                            '与能量修正口径；U_L 采用各项目自由能模块的权威值。'),
+            })
+        else:
+            skipped.append({
+                'kind': 'ladder',
+                'reason': '；'.join((snapshot.get('comparison_gate') or {}).get('blocking') or
+                                    (snapshot.get('comparison_gate') or {}).get('warnings') or
+                                    ['没有至少两组可比自由能路径']),
+            })
+        return figures, files, skipped
+
+    def proj_batch_report(self, paths, out_dir, preset_key=None, formats=None,
+                          include_individual=True, final=True):
+        """Generate N individual reports and one multi-catalyst comparison report."""
+        try:
+            target = os.path.abspath(os.path.normpath(str(out_dir or '').strip()))
+            if not str(out_dir or '').strip():
+                return {'ok': False, 'kind': None, 'files': {},
+                        'error': '未指定批次报告目录'}
+            os.makedirs(target, exist_ok=True)
+            items = self._comparison_items(paths, preset_key)
+            snapshot = self._comparison_model().build_comparison_snapshot(
+                items, preset_key=preset_key)
+            if snapshot.get('selected_count', 0) < 2:
+                return {'ok': False, 'kind': None, 'files': {},
+                        'error': '批次报告至少需要选择 2 个项目'}
+            figures, figure_files, skipped = self._comparison_figures(
+                snapshot, os.path.join(target, 'comparison_figures'))
+            evaluations = []
+            item_by_path = {str(item.get('path') or ''): item for item in items}
+            for project in snapshot.get('projects') or []:
+                source = item_by_path.get(str(project.get('path') or ''))
+                if not source or not source.get('project'):
+                    continue
+                evaluations.append(self._candidate_eval().evaluate_candidate(
+                    source.get('summary') or {}, project=source['project'],
+                    fed=source.get('fed')))
+            matrix = snapshot.get('adsorption_matrix') or {}
+            comparison_rows = []
+            for name, values in zip(matrix.get('rows') or [], matrix.get('values') or []):
+                comparison_rows.append([
+                    name,
+                    *[('—' if value is None else f'{value:.3f}') for value in values],
+                ])
+            gate = snapshot.get('comparison_gate') or {}
+            report_kind = ('final' if bool(final) and snapshot.get('can_final_report')
+                           else 'diagnostic')
+            model = {
+                'schema': 'vcstudio.research-report/v1',
+                'locale': 'zh-CN',
+                'title': '多催化剂吸附能与自由能路径比较',
+                'subtitle': ('批次比较研究报告' if report_kind == 'final'
+                             else '诊断型批次报告：方法或路径证据尚未完全可比'),
+                'kicker': 'VASP CATALYST STUDIO · COMPARATIVE STUDY',
+                'report_kind': report_kind,
+                'metadata': {
+                    '已选项目': snapshot.get('selected_count'),
+                    '可评价项目': snapshot.get('ready_count'),
+                    '同图台阶项目': snapshot.get('ladder_ready_count'),
+                    '比较门禁': gate.get('status'),
+                    '反应预设': preset_key or 'Li-S discharge',
+                    '数据指纹': snapshot.get('data_fingerprint'),
+                },
+                'executive_summary': (
+                    f'本批次选择 {snapshot.get("selected_count")} 个催化剂项目，'
+                    f'{snapshot.get("ready_count")} 个具有可审计吸附能；'
+                    f'比较门禁状态为 {gate.get("status")}。'
+                    + ('当前可生成同轴自由能台阶比较。' if snapshot.get('can_plot')
+                       else '当前不强行叠加不可比的自由能路径。')),
+                'key_findings': [
+                    (evaluation.get('decision') or {}).get('summary_zh') or
+                    f'{(evaluation.get("candidate") or {}).get("name") or "项目"}：证据不足'
+                    for evaluation in evaluations
+                ],
+                'candidate_evaluations': self._candidate_evaluation_table(
+                    evaluations, title='候选材料后续计算优先级'),
+                'comparison_table': {
+                    'title': '多催化剂最稳构型吸附能比较',
+                    'columns': ['催化剂', *(matrix.get('cols') or [])],
+                    'rows': comparison_rows,
+                    'caption': ('每个物种采用项目内最低 E_ads 构型；0.15 eV 内的构型'
+                                '作为近简并候选保留。不同 Li2Sx 不能依次相减代替反应自由能。'),
+                },
+                'figures': figures,
+                'methods': [
+                    '各项目先按规范物种分组并选取最稳构型，再进行横向比较。',
+                    '台阶图仅叠加步骤标签、顺序和能量修正口径一致的自由能路径。',
+                    '项目间自旋初态可不同；是否可比较由实际能量操作数和方法证据决定。',
+                ],
+                'limitations': [
+                    *gate.get('blocking', []), *gate.get('warnings', []),
+                    *[f'{item.get("display_name")}: {reason}'
+                      for item in snapshot.get('projects') or []
+                      for reason in item.get('block_reasons') or []],
+                    *[f'{item.get("display_name")}: {warning}'
+                      for item in snapshot.get('projects') or []
+                      for warning in item.get('warnings') or []],
+                    *[f'图表未生成（{item.get("kind") or "unknown"}）：'
+                      f'{item.get("reason") or "原因未记录"}'
+                      for item in skipped],
+                ],
+                'recommendations': self._recommendation_blocks(evaluations),
+            }
+            wanted = tuple(str(value).lower() for value in
+                           (formats or ('html', 'docx', 'pdf')))
+            comparison_result = self._json_safe_report_result(
+                self._paper().render_report_bundle(
+                    model, target, stem='多催化剂_批次比较报告', formats=wanted))
+            individual = []
+            if include_individual:
+                used_stems = set()
+                for index, source in enumerate(items):
+                    project = source.get('project')
+                    if project is None:
+                        continue
+                    base = self._safe_report_stem(
+                        f'{project.get("name") or "project"}_吸附能评估报告')
+                    stem = base
+                    serial = 2
+                    while stem in used_stems:
+                        stem = f'{base}_{serial}'
+                        serial += 1
+                    used_stems.add(stem)
+                    result = self.proj_report_bundle(
+                        source['path'], target, wanted, final=final, stem=stem)
+                    individual.append({
+                        'path': source['path'], 'name': project.get('name') or f'项目{index + 1}',
+                        'kind': result.get('kind'), 'files': result.get('files') or {},
+                        'ok': bool(result.get('ok')), 'error': result.get('error'),
+                    })
+            return {
+                'ok': bool(comparison_result.get('ok', True)),
+                'kind': report_kind,
+                'files': {
+                    'comparison': comparison_result.get('files') or {},
+                    'individual': individual,
+                },
+                'figures': figure_files,
+                'skipped': skipped,
+                'blocked': gate.get('blocking') or [],
+                'warnings': gate.get('warnings') or [],
+                'snapshot': snapshot,
+                'out_dir': target,
+                'error': comparison_result.get('error'),
+            }
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'kind': None, 'files': {}, 'error': str(e)}
+
+    # ── 论文级出图(原生 matplotlib 引擎,不依赖 Origin/POV-Ray) ────────────────
+    @staticmethod
+    def _ads_short(member_name, proj_name) -> str:
+        """构型成员名 → 吸附质短名:剥掉 create_project 的 '{项目名}_ads_' 前缀。"""
+        prefix = f'{proj_name}_ads_'
+        n = str(member_name)
+        return n[len(prefix):] if n.startswith(prefix) else n
+
+    def _proj_delta_data(self, proj):
+        """项目 → (吸附质短名列表, ΔE 列表(None=未完成), delta 汇总 dict)。"""
+        s = self._adsorption.delta_e_rows(proj)
+        name = str(proj.get('name') or '')
+        rows = s.get('rows') or []
+        shorts = [self._ads_short(r['name'], name) for r in rows]
+        des = [r['delta_e'] for r in rows]
+        return shorts, des, s
+
+    def _proj_stable_delta_map(self, proj, summary):
+        """多项目比较只取每个物种最低能的最稳构型；旧数据无 species 时兼容短名。"""
+        rows = list((summary or {}).get('rows') or [])
+        if not any(
+                str(row.get('species') or row.get('reference_species') or '').strip()
+                for row in rows):
+            name = str(proj.get('name') or '')
+            return {
+                self._ads_short(row.get('name'), name): row.get('delta_e')
+                for row in rows
+            }
+        grouped = {}
+        for row in rows:
+            species = str(row.get('species') or row.get('reference_species') or '').strip()
+            if not species:
+                continue
+            grouped.setdefault(species, []).append(row)
+        result = {}
+        for species, candidates in grouped.items():
+            marked = [row for row in candidates if row.get('is_most_stable')]
+            marked_complete = [
+                row for row in marked
+                if isinstance(row.get('delta_e'), (int, float))
+            ]
+            complete = [
+                row for row in candidates
+                if isinstance(row.get('delta_e'), (int, float))
+            ]
+            pool = marked_complete or complete or marked or candidates
+            chosen = (min(pool, key=lambda row: row['delta_e'])
+                      if isinstance(pool[0].get('delta_e'), (int, float))
+                      else pool[0])
+            result[species] = chosen.get('delta_e')
+        return result
+
+    def _project_molecules_dir(self, proj) -> str:
+        """项目自带分子库优先，失效时回退全局配置。
+
+        整文件夹导入会把锂硫参考态复制到项目的 ``molecules_dir``。这里与
+        report_full 使用同一优先级，确保“项目页出图”和“完整报告”读到同一批
+        参考能量；老项目仍继续使用 config.lis_molecules_dir。
+        """
+        local = str((proj or {}).get('molecules_dir') or '').strip()
+        if local and os.path.isdir(local):
+            return local
+        try:
+            cfg = self._config.load_config()
+        except Exception:                                 # noqa: BLE001
+            cfg = {}
+        configured = str((cfg or {}).get('lis_molecules_dir') or '').strip()
+        return configured if configured and os.path.isdir(configured) else ''
+
+    def _report_thermo_corrections(self):
+        """Load the same filtered ZPE−TS corrections used by legacy reports."""
+        try:
+            cfg = self._config.load_config()
+        except Exception:                                 # noqa: BLE001
+            cfg = {}
+        raw_freq_dirs = (cfg or {}).get('freq_dirs') or {}
+        if not isinstance(raw_freq_dirs, dict):
+            return (
+                None,
+                {},
+                ['freq_dirs 配置不是“物种 → 频率目录”映射，本次报告未加入热校正'],
+                None,
+                298.15,
+            )
+        freq_dirs = dict(raw_freq_dirs)
+        if not freq_dirs:
+            return None, {}, [], None, 298.15
+        from vcstudio.project import thermo
+        temperature = _method_number(getattr(thermo, 'DEFAULT_T', 298.15)) or 298.15
+        try:
+            corrections = thermo.load_corrections(freq_dirs)
+        except Exception as exc:                          # noqa: BLE001
+            return (
+                None,
+                {},
+                [f'频率热校正读取失败，本次报告保留电子能口径：{exc}'],
+                None,
+                temperature,
+            )
+        warnings = []
+        missing = [str(species) for species in freq_dirs if species not in corrections]
+        if missing:
+            warnings.append(
+                '以下频率目录没有可用振动证据，未加入热校正：' + '、'.join(missing))
+        accepted = {}
+        for species, value in corrections.items():
+            if not isinstance(value, dict) or value.get('excluded'):
+                detail = (value or {}).get('exclude_reason') if isinstance(value, dict) else ''
+                warnings.append(
+                    f'{species} 热校正未通过虚频/完整性门，已排除'
+                    + (f'：{detail}' if detail else ''))
+                continue
+            number = _method_number(value.get('g_corr'))
+            if number is None:
+                warnings.append(f'{species} 的 g_corr 不是有限数，已排除')
+                continue
+            accepted[str(species)] = {**value, 'g_corr': number}
+        if not accepted:
+            return None, {}, warnings, None, temperature
+        g_corr = {
+            species: value['g_corr'] for species, value in accepted.items()
+        }
+        encoded = json.dumps(
+            {'temperature_K': temperature, 'mode': 'zpe_ts', 'g_corr': g_corr},
+            ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+            allow_nan=False).encode('utf-8')
+        return (
+            g_corr,
+            accepted,
+            warnings,
+            hashlib.sha256(encoded).hexdigest(),
+            temperature,
+        )
+
+    def _proj_fed(self, proj, summary):
+        """项目 → Li-S 放电路径 fed;成功 (fed, None),失败 (None, 中文原因)。"""
+        mol_dir = self._project_molecules_dir(proj)
+        if not mol_dir:
+            return None, ('项目未导入有效分子参考态，且未配置分子库目录 '
+                          'lis_molecules_dir(config)，无法算 ΔG 台阶')
+        _state, e_slab = summary['slab']
+        if e_slab is None:
+            return None, '清洁表面未完成,无法算 ΔG 台阶'
+        try:
+            (g_corr, thermo_meta, thermo_warnings, thermo_fingerprint,
+             thermo_temperature) = (
+                self._report_thermo_corrections())
+            fed = self._fe().path_from_project_and_molecules(
+                summary['rows'], e_slab=e_slab, molecules_dir=mol_dir,
+                g_corr=g_corr,
+                managed_dirs=(proj.get('species_ref_jobs') or {}).values(),
+                project=proj)
+            try:
+                fed['_comparison_reference_energies'] = self._fe().load_molecule_energies(
+                    mol_dir, managed_dirs=(proj.get('species_ref_jobs') or {}).values())
+            except Exception:                             # noqa: BLE001 路径本身仍可画，跨项目仅降级
+                fed['_comparison_reference_energies'] = None
+            if thermo_meta:
+                fed['thermo_meta'] = thermo_meta
+                fed['temperature_K'] = thermo_temperature
+                fed['thermo_correction_fingerprint'] = thermo_fingerprint
+            fed.setdefault('warnings', []).extend(thermo_warnings)
+            return fed, None
+        except ValueError as e:
+            return None, str(e)
+
+    @staticmethod
+    def _match_species_energy(species_bare, short_energies):
+        """物种裸名 → 项目构型能量:短名精确匹配(或短名以物种名+分隔符起头)。
+
+        取最稳(能量最低)的匹配。'OH' 不会误配 'OOH'(下一字符为字母);'O_top' 配 'O'。
+        无匹配 → None。
+        """
+        low = str(species_bare).lower()
+        if not low:
+            return None
+        best = None
+        for short, e in short_energies.items():
+            s = str(short).lower()
+            hit = s == low or (s.startswith(low)
+                               and (len(s) == len(low) or not s[len(low)].isalnum()))
+            if hit and (best is None or e < best):
+                best = e
+        return best
+
+    def _proj_fed_preset(self, proj, summary, preset_key):
+        """通用反应预设台阶(F16):项目构型/分子能量 → free_energy_path。
+
+        → (fed, None, 标题) 或 (None, 中文原因, 标题)。构型名映射为物种能量,
+        缺失物种/分子能量集中报"缺 {物种} 的能量"。
+        """
+        try:
+            spec = self._rx().get_preset(preset_key)
+        except Exception as e:                            # noqa: BLE001 未知预设
+            return None, f'未知反应预设「{preset_key}」:{e}', str(preset_key)
+        ptitle = spec.get('description') or spec.get('name') or str(preset_key)
+        # 分子/参考态能量:复用 Li-S 分子库扫描(mol_*/molecule_* 子目录 OSZICAR)
+        mol_dir = self._project_molecules_dir(proj)
+        mol_e = {}
+        if mol_dir:
+            try:
+                mol_e = self._fe().load_molecule_energies(mol_dir)
+            except Exception:                             # noqa: BLE001 分子库坏 → 视作空
+                mol_e = {}
+        _state, e_slab = summary['slab']
+        # 项目构型短名 → 最稳能量(仅 DONE)
+        pname = str(proj.get('name') or '')
+        short_e = {}
+        for r in (summary.get('rows') or []):
+            if r.get('e_config') is None or r.get('state') != 'DONE':
+                continue
+            short = self._ads_short(r['name'], pname)
+            e = r['e_config']
+            if short not in short_e or e < short_e[short]:
+                short_e[short] = e
+        energies, missing = {}, []
+
+        def _need(key, energy):
+            if energy is None:
+                if key not in missing:
+                    missing.append(key)
+            else:
+                energies[key] = energy
+
+        for st in spec.get('steps') or []:
+            sp = st.get('species', '')
+            if sp in energies or sp in missing:
+                continue
+            bare = str(sp).rstrip('*')
+            if bare == '':                    # 干净基底 '*' → 清洁表面能量
+                _need(sp, e_slab)
+            else:
+                _need(sp, self._match_species_energy(bare, short_e))
+        for st in spec.get('steps') or []:
+            for g in (st.get('coadsorbates_or_gas') or []):
+                nm = g.get('name')
+                if nm and nm not in energies and nm not in missing:
+                    _need(nm, mol_e.get(nm))
+        # 参比电对定标所需分子(Li/Li+ 需 Li2S/S8;RHE 需 H2)
+        for nm in (('Li2S', 'S8') if spec.get('electrode') == 'Li/Li+'
+                   else ('H2',) if spec.get('electrode') == 'RHE' else ()):
+            if nm not in energies and nm not in missing:
+                _need(nm, mol_e.get(nm))
+        if missing:
+            return None, '缺 ' + '、'.join(missing) + ' 的能量(对应构型/分子需 DONE)', ptitle
+        try:
+            (g_corr, thermo_meta, thermo_warnings, _thermo_fingerprint,
+             thermo_temperature) = self._report_thermo_corrections()
+            # 通用预设的能量键可能带 ``*``，而频率配置通常使用裸物种名。
+            # 只把本条路径实际用到的校正交给 free_energy_path；否则一个完全
+            # 不相关的 freq_dirs 条目也会把结果错误标成 thermo_corrected。
+            path_corr, path_meta = {}, {}
+            for key in energies:
+                source_key = next(
+                    (candidate for candidate in (str(key), str(key).rstrip('*'))
+                     if candidate in (g_corr or {})),
+                    None,
+                )
+                if source_key is None:
+                    continue
+                path_corr[key] = g_corr[source_key]
+                meta = dict((thermo_meta or {}).get(source_key) or {})
+                if source_key != key:
+                    meta['source_species'] = source_key
+                path_meta[key] = meta
+            if g_corr and not path_corr:
+                thermo_warnings.append(
+                    '已读取频率热校正，但其物种键与当前反应预设不匹配；'
+                    '本条台阶保留电子能口径')
+            fed = self._fe().free_energy_path(
+                spec, energies, g_corr=path_corr or None)
+            if path_meta:
+                encoded = json.dumps(
+                    {
+                        'temperature_K': thermo_temperature,
+                        'mode': 'zpe_ts',
+                        'g_corr': path_corr,
+                    },
+                    ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+                    allow_nan=False,
+                ).encode('utf-8')
+                fed['thermo_meta'] = path_meta
+                fed['temperature_K'] = thermo_temperature
+                fed['thermo_correction_fingerprint'] = hashlib.sha256(
+                    encoded).hexdigest()
+            fed.setdefault('warnings', []).extend(thermo_warnings)
+            return fed, None, ptitle
+        except ValueError as e:
+            return None, str(e), ptitle
+
+    def proj_figures(self, path, kinds=None, save_to=None, preset_key=None):
+        """单项目论文级出图(原生引擎)。kinds ⊂ {'bar','table','ladder'},缺省全选。
+
+        bar/table 只用已完成的 ΔE 行;ladder 需 config.lis_molecules_dir 分子库。
+        preset_key 为空(默认)→ ladder 走既有 Li-S 放电路径(向后兼容,行为完全不变);
+        给非空反应预设 key(见 reaction_presets)→ ladder 改走通用 free_energy_path 引擎,
+        项目构型名映射为物种能量,映射不上的物种记 skipped 原因"缺 {物种} 的能量"。
+        某类图缺数据只记 skipped(kind+中文原因),不拖垮其他图。
+        返回 {'ok','files','skipped','out_dir','error'}。
+        """
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            try:
+                nc = self._nc()
+            except ImportError:
+                return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                        'error': '未安装 matplotlib/numpy(原生出图可选依赖):'
+                                 'pip install matplotlib numpy 后重试'}
+            kinds = [str(k) for k in (kinds or ['bar', 'table', 'ladder'])]
+            shorts, des, summary = self._proj_delta_data(proj)
+            pname = str(proj.get('name') or '') or '项目'
+            out_dir = (save_to or '').strip() or os.path.join(
+                str(proj.get('root') or os.path.dirname(str(path))), 'figures')
+            os.makedirs(out_dir, exist_ok=True)
+
+            files, skipped = [], []
+            done = [(s, d) for s, d in zip(shorts, des) if d is not None]
+            data = {'adsorbates': [s for s, _ in done],
+                    'substrates': {pname: [d for _, d in done]}}
+            for kind in kinds:
+                if kind in ('bar', 'table') and not done:
+                    skipped.append({'kind': kind,
+                                    'reason': '无已完成的 ΔE(需构型+清洁表面+参考全 DONE)'})
+                    continue
+                if kind == 'bar':
+                    files += nc.adsorption_bar(
+                        data, os.path.join(out_dir, 'adsorption_bar.png'),
+                        negative_up=True)
+                elif kind == 'table':
+                    files += nc.energy_matrix_table(
+                        data, os.path.join(out_dir, 'delta_e_table.png'))
+                elif kind == 'ladder':
+                    if preset_key:
+                        fed, reason, ptitle = self._proj_fed_preset(
+                            proj, summary, preset_key)
+                    else:
+                        fed, reason = self._proj_fed(proj, summary)
+                        ptitle = 'Li-S discharge path'
+                    if fed is None:
+                        skipped.append({'kind': 'ladder', 'reason': reason})
+                        continue
+                    title = (f'{ptitle} ($U_L$ = {fed["u_l"]:.2f} V)'
+                             if fed.get('u_l') is not None else ptitle)
+                    files += nc.free_energy_ladder(
+                        [{
+                            'name': pname,
+                            'G': [st['G'] for st in fed['steps']],
+                            'pds_index': fed.get('pds_index'),
+                            'u_l': fed.get('u_l'),
+                        }],
+                        os.path.join(out_dir, 'free_energy_ladder.png'),
+                        step_labels=[st['label'] for st in fed['steps']],
+                        pds_index=fed.get('pds_index'), show_ul=True, title=title)
+                else:
+                    skipped.append({'kind': kind, 'reason': '未知图类型'})
+            return {'ok': True, 'files': files, 'skipped': skipped,
+                    'out_dir': out_dir, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                    'error': str(e)}
+
+    def proj_compare_figures(self, paths, kinds=None, save_to=None, preset_key=None):
+        """多项目对比出图。
+
+        ``kinds`` 可含 heatmap/scaling/volcano/ladder。吸附能矩阵和自由能
+        台阶共用 :mod:`project.comparison` 的冻结快照，保证项目多选预览、
+        出图和批次报告使用同一组最稳构型及同一方法门禁。自由能路径即使
+        超过 5 组也保留在同一坐标轴；步骤或校正口径不一致时明确跳过，
+        不把不同 Li-S 物种的电子吸附能相减冒充台阶。
+        """
+        try:
+            try:
+                nc = self._nc()
+            except ImportError:
+                return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                        'error': '未安装 matplotlib/numpy(原生出图可选依赖):'
+                                 'pip install matplotlib numpy 后重试'}
+            kinds = [str(k) for k in (kinds or ['heatmap'])]
+            make_report = 'report' in kinds
+            items = self._comparison_items(paths, preset_key)
+            snapshot = self._comparison_model().build_comparison_snapshot(
+                items, preset_key=preset_key)
+            projs = []
+            for item in items:
+                proj = item.get('project')
+                if proj is None:
+                    continue
+                _shorts, _des, summary = self._proj_delta_data(proj)
+                projs.append({'name': str(proj.get('name') or '') or '项目',
+                              'proj': proj, 'summary': summary,
+                              'de': self._proj_stable_delta_map(proj, summary)})
+            if len(projs) < 2:
+                return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                        'error': '多项目对比至少需要选中 2 个有效项目'}
+            matrix = snapshot.get('adsorption_matrix') or {}
+            cols = list(matrix.get('cols') or [])
+            out_dir = (save_to or '').strip() or os.path.join(
+                str(projs[0]['proj'].get('root') or '.'), 'compare_figures')
+            os.makedirs(out_dir, exist_ok=True)
+
+            files, skipped = [], []
+            ladder_cache = None
+            for kind in kinds:
+                if kind == 'report':
+                    continue
+                if kind == 'heatmap':
+                    values = matrix.get('values') or []
+                    if not any(v is not None for row in values for v in row):
+                        skipped.append({'kind': 'heatmap',
+                                        'reason': '所有项目均无已完成的 ΔE'})
+                        continue
+                    files += nc.heatmap_matrix(
+                        {'rows': matrix.get('rows') or [], 'cols': cols,
+                         'values': values},
+                        os.path.join(out_dir, 'delta_e_heatmap.png'),
+                        cmap='cividis_r')
+                elif kind == 'scaling':
+                    # 标度关系保留旧的任意吸附质支持；这里只做统计相关性，
+                    # 不把它当作配平反应路径或催化优劣的决定性证据。
+                    raw_cols = []
+                    for pr in projs:
+                        for species in pr['de']:
+                            if species not in raw_cols:
+                                raw_cols.append(species)
+                    pair = self._best_scaling_pair(projs, raw_cols)
+                    if pair is None:
+                        skipped.append({'kind': 'scaling',
+                                        'reason': '不足 3 个项目同时具备两个共同吸附质的 ΔE'})
+                        continue
+                    a, b, xs, ys, labels = pair
+                    files += nc.scaling_relation(
+                        xs, ys, os.path.join(out_dir, 'scaling_relation.png'),
+                        xlabel=f'$\\Delta E$({a}) (eV)',
+                        ylabel=f'$\\Delta E$({b}) (eV)', labels=labels)
+                elif kind == 'volcano':
+                    pts, reason = self._volcano_points(projs, cols)
+                    if pts is None:
+                        skipped.append({'kind': 'volcano', 'reason': reason})
+                        continue
+                    sp, points = pts
+                    files += nc.volcano_plot(
+                        points, os.path.join(out_dir, 'volcano.png'),
+                        descriptor_label=(
+                            r'$\Delta G_{\mathrm{ads}}(*\mathrm{LiS}_2)$ (eV)'
+                            if sp == 'LiS2' else
+                            f'$\\Delta G_{{\\mathrm{{ads}}}}({sp})$ (eV)'
+                        ),
+                        activity_label='$U_L$ (V)')
+                elif kind == 'ladder':
+                    ladder_cache = self._compare_ladder_paths(projs)
+                    ladder_paths, step_labels, reason = ladder_cache
+                    if ladder_paths is None:
+                        skipped.append({'kind': 'ladder', 'reason': reason})
+                        continue
+                    files += nc.free_energy_ladder(
+                        ladder_paths,
+                        os.path.join(out_dir, 'multi_catalyst_free_energy.png'),
+                        step_labels=step_labels, show_ul=True, mark_pds=False,
+                        title='Multi-catalyst Li-S free-energy pathways')
+                    if reason:
+                        skipped.append({
+                            'kind': 'ladder',
+                            'reason': '对比说明：' + reason,
+                            'partial': True,
+                        })
+                else:
+                    skipped.append({'kind': kind, 'reason': '未知图类型'})
+            if make_report:
+                if ladder_cache is None:
+                    ladder_cache = self._compare_ladder_paths(projs)
+                try:
+                    from vcstudio.project import report_documents
+                    model = self._compare_report_model(
+                        projs, cols, ladder_cache, files, out_dir)
+                    docx, pdf = report_documents.generate_report_documents(
+                        model,
+                        os.path.join(out_dir, 'multi_catalyst_comparison.docx'),
+                        os.path.join(out_dir, 'multi_catalyst_comparison.pdf'))
+                    files.extend([str(docx), str(pdf)])
+                except Exception as exc:                  # noqa: BLE001 其它图仍保留
+                    skipped.append({'kind': 'report', 'reason': str(exc)})
+            return {'ok': True, 'files': files, 'skipped': skipped,
+                    'out_dir': out_dir, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'files': [], 'skipped': [], 'out_dir': None,
+                    'error': str(e)}
+
+    def _compare_ladder_paths(self, projs):
+        """聚合各催化剂权威 ΔG/PDS/U_L；物种顺序不同的项目明确跳过。"""
+        paths, labels, reasons = [], None, []
+        baseline_method = None
+        baseline_references = None
+        baseline_explicit_fingerprint = None
+        baseline_molecules_dir = None
+        baseline_name = None
+        for item in projs:
+            method = (item.get('summary') or {}).get('method_consistency') or {}
+            if method.get('status') == 'incompatible':
+                reasons.append(
+                    f'{item["name"]}: 方法不兼容（'
+                    + '；'.join(method.get('issues') or ['未给出原因']) + '）')
+                continue
+            if method.get('status') == 'unverified':
+                reasons.append(
+                    f'{item["name"]}: 已纳入探索性同图，但方法证据尚未完整核验（'
+                    + '；'.join(method.get('warnings') or ['未给出原因']) + '）')
+            fed, reason = self._proj_fed(item['proj'], item['summary'])
+            if fed is None:
+                reasons.append(f'{item["name"]}: {reason}')
+                continue
+            current_labels = [step.get('label') for step in fed.get('steps') or []]
+            if labels is None:
+                labels = current_labels
+            elif current_labels != labels:
+                reasons.append(f'{item["name"]}: 反应中间体顺序与首个项目不同')
+                continue
+            candidate_method = self._comparison_method_record(item)
+            candidate_references = fed.get('_comparison_reference_energies')
+            candidate_explicit_fingerprint = str(
+                (item.get('proj') or {}).get('comparison_method_fingerprint') or '')
+            raw_molecules_dir = str(
+                (item.get('proj') or {}).get('molecules_dir') or '')
+            candidate_molecules_dir = (
+                os.path.normcase(os.path.abspath(raw_molecules_dir))
+                if raw_molecules_dir else None
+            )
+            if paths:
+                if (baseline_explicit_fingerprint
+                        and candidate_explicit_fingerprint
+                        and baseline_explicit_fingerprint == candidate_explicit_fingerprint):
+                    method_check = {'status': 'verified', 'issues': [], 'warnings': []}
+                else:
+                    method_check = self._comparison_method_pair(
+                        baseline_method, candidate_method,
+                        baseline_name or '首个项目', item['name'])
+                if method_check['status'] == 'incompatible':
+                    reasons.append(
+                        f'{item["name"]}: 与 {baseline_name} 的跨项目方法不可比（'
+                        + '；'.join(method_check['issues']) + '）')
+                    continue
+                if method_check['status'] == 'unverified':
+                    reasons.append(
+                        f'{item["name"]}: 已纳入探索性同图，但跨项目方法证据不完整（'
+                        + '；'.join(method_check['warnings'][:3]) + '）')
+                ref_issue = self._comparison_reference_issue(
+                    baseline_references, candidate_references)
+                if (ref_issue and not ref_issue['blocking']
+                        and baseline_molecules_dir
+                        and candidate_molecules_dir == baseline_molecules_dir):
+                    ref_issue = None
+                if ref_issue and ref_issue['blocking']:
+                    reasons.append(
+                        f'{item["name"]}: 与 {baseline_name} 的分子参考不可比（'
+                        f'{ref_issue["message"]}）')
+                    continue
+                if ref_issue:
+                    reasons.append(
+                        f'{item["name"]}: 已纳入探索性同图，但分子参考证据不完整（'
+                        f'{ref_issue["message"]}）')
+            else:
+                baseline_method = candidate_method
+                baseline_references = candidate_references
+                baseline_explicit_fingerprint = candidate_explicit_fingerprint
+                baseline_molecules_dir = candidate_molecules_dir
+                baseline_name = item['name']
+                if candidate_method is None and not baseline_explicit_fingerprint:
+                    reasons.append(
+                        f'{item["name"]}: 已作为对比基线，但跨项目方法指纹不可读')
+                if (not isinstance(candidate_references, dict)
+                        and not baseline_molecules_dir):
+                    reasons.append(
+                        f'{item["name"]}: 已作为对比基线，但分子参考能量签名不可读')
+            paths.append({
+                'name': item['name'],
+                'G': [step.get('G') for step in fed.get('steps') or []],
+                'pds_index': fed.get('pds_index'),
+                'u_l': fed.get('u_l'),
+            })
+        if len(paths) < 2:
+            detail = '；'.join(reasons[:6]) or '具备完整自由能路径的项目不足 2 个'
+            return None, labels or [], detail
+        return paths, labels or [], '；'.join(reasons)
+
+    def _comparison_method_record(self, item):
+        """读取一个实际参与 ΔE 的构型方法指纹，供催化剂间配对核验。"""
+        from vcstudio.project import energy_gate
+
+        proj = item.get('proj') or {}
+        summary = item.get('summary') or {}
+        configs = list(((proj.get('members') or {}).get('configs') or []))
+        complete_names = {
+            os.path.normcase(str(row.get('name') or ''))
+            for row in (summary.get('rows') or [])
+            if isinstance(row.get('delta_e'), (int, float))
+        }
+        ordered = [
+            path for path in configs
+            if os.path.normcase(self._base(path)) in complete_names
+        ]
+        ordered.extend(path for path in configs if path not in ordered)
+        for job_dir in ordered:
+            if not os.path.isdir(str(job_dir)):
+                continue
+            manifest = self._manifest.load_manifest(job_dir)
+            return energy_gate.method_record(
+                job_dir, manifest, f'{item.get("name") or "项目"}代表构型')
+        return None
+
+    @staticmethod
+    def _comparison_method_pair(left, right, left_name, right_name):
+        """跨催化剂只硬比较能量方法；自旋与 K 点按各体系设置。"""
+        if left is None or right is None:
+            missing = left_name if left is None else right_name
+            return {
+                'status': 'unverified', 'issues': [],
+                'warnings': [f'{missing} 缺少可读的代表构型方法指纹'],
+            }
+        from vcstudio.project import energy_gate
+
+        check = energy_gate.compare_methods(
+            [left, right], require_same_kpoints=False)
+        # 不同催化剂可以有各自的磁性基态；不同晶胞也不要求 KPOINTS 文本相同。
+        issues = [
+            issue for issue in (check.get('issues') or [])
+            if not issue.startswith('ISPIN 不一致')
+            and not issue.startswith('各作业 POTCAR 没有可核对的共同元素身份')
+        ]
+        warnings = [
+            warning for warning in (check.get('warnings') or [])
+            if not warning.startswith('K 点方案不一致')
+        ]
+        status = 'incompatible' if issues else ('verified' if not warnings else 'unverified')
+        return {'status': status, 'issues': issues, 'warnings': warnings}
+
+    @staticmethod
+    def _comparison_reference_issue(left, right, tolerance=1e-3):
+        """比较实际分子参考能量；不同参考库不得被悄悄叠为定量结论。"""
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return {'blocking': False, 'message': '至少一个项目缺少参考能量签名'}
+        left_keys, right_keys = set(left), set(right)
+        if left_keys != right_keys:
+            missing = sorted(left_keys ^ right_keys)
+            return {
+                'blocking': True,
+                'message': '参考物种集合不同：' + '、'.join(missing[:8]),
+            }
+        differences = []
+        for species in sorted(left_keys):
+            try:
+                delta = abs(float(left[species]) - float(right[species]))
+            except (TypeError, ValueError):
+                return {
+                    'blocking': True,
+                    'message': f'{species} 的参考能量不可解析',
+                }
+            if delta > tolerance:
+                differences.append(f'{species} 差 {delta:.6g} eV')
+        if differences:
+            return {
+                'blocking': True,
+                'message': '；'.join(differences[:8]),
+            }
+        return None
+
+    @staticmethod
+    def _compare_report_model(projs, cols, ladder_cache, files, out_dir):
+        ladder_paths, step_labels, ladder_reason = ladder_cache
+        matrix_rows = [
+            [item['name']] + [
+                (f'{item["de"][species]:.4f}'
+                 if isinstance(item['de'].get(species), (int, float)) else '—')
+                for species in cols
+            ]
+            for item in projs
+        ]
+        summary_rows = []
+        for path in ladder_paths or []:
+            pds = path.get('pds_index')
+            valid_pds = (isinstance(pds, int)
+                         and 0 <= pds < max(len(step_labels) - 1, 0))
+            pds_text = ('—' if not valid_pds else
+                        f'{pds + 1}: {step_labels[pds]} → {step_labels[pds + 1]}')
+            ul = path.get('u_l')
+            summary_rows.append([
+                path.get('name') or '—',
+                f'{ul:.4f}' if isinstance(ul, (int, float)) else '—',
+                pds_text,
+            ])
+        blocks = [{
+            'type': 'table', 'caption': 'Most-stable adsorption energies by catalyst',
+            'columns': ['Catalyst'] + list(cols), 'rows': matrix_rows,
+        }]
+        pngs = [str(path) for path in files
+                if str(path).lower().endswith('.png') and os.path.isfile(str(path))]
+        for path in pngs:
+            blocks.append({
+                'type': 'figure', 'path': path,
+                'caption': os.path.splitext(os.path.basename(path))[0].replace('_', ' '),
+            })
+        pathway_blocks = []
+        if summary_rows:
+            pathway_blocks.append({
+                'type': 'table', 'caption': 'Limiting potentials and PDS',
+                'columns': ['Catalyst', 'U_L / V', 'Potential-determining step'],
+                'rows': summary_rows, 'column_widths': [1.2, 0.8, 2.4],
+            })
+        if ladder_reason:
+            pathway_blocks.append({
+                'type': 'note',
+                'text': '比较说明：' + ladder_reason,
+            })
+        return {
+            'title': '多催化剂项目对比报告',
+            'subtitle': 'Most-stable adsorption energies and overlaid Li-S pathways',
+            'report_label': 'MULTI-CATALYST COMPARISON',
+            'base_dir': out_dir,
+            'metadata': {
+                'Catalyst projects': len(projs),
+                'Overlay policy': 'All comparable catalyst pathways in one stair plot',
+                'Generated': time.strftime('%Y-%m-%d %H:%M:%S'),
+            },
+            'abstract': (
+                '每个催化剂项目按物种选取最低吸附能的最稳构型。'
+                '只在反应中间体顺序和方法证据可比较时叠加自由能路径；'
+                '即使超过 5 组，也保留在同一台阶图并使用颜色、线型和标记联合区分。'
+            ),
+            'sections': [
+                {'title': '吸附能比较 / Adsorption comparison', 'blocks': blocks},
+                {'title': '自由能路径 / Free-energy pathways',
+                 'blocks': pathway_blocks or [{
+                     'type': 'note',
+                     'text': '没有至少两个可比较的完整自由能路径。',
+                 }]},
+            ],
+        }
+
+    @staticmethod
+    def _best_scaling_pair(projs, cols):
+        """选覆盖最好的两个吸附质:≥3 个项目同时有 ΔE → (a,b,xs,ys,labels);否则 None。"""
+        best = None
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+                a, b = cols[i], cols[j]
+                pts = [(pr['de'].get(a), pr['de'].get(b), pr['name']) for pr in projs]
+                pts = [(x, y, n) for x, y, n in pts if x is not None and y is not None]
+                if len(pts) >= 3 and (best is None or len(pts) > len(best[2])):
+                    best = (a, b, pts)
+        if best is None:
+            return None
+        a, b, pts = best
+        return (a, b, [x for x, _, _ in pts], [y for _, y, _ in pts],
+                [n for _, _, n in pts])
+
+    def _volcano_points(self, projs, cols):
+        """Return a path-specific ``ΔG_ads(*LiS2)`` volcano dataset.
+
+        An arbitrary common ``ΔE_ads(Li2Sx)`` is *not* a valid substitute for
+        the descriptor used by the thesis volcano relationship.  Projects
+        therefore have to persist an explicit ``volcano_descriptor`` mapping
+        with quantity, species, reaction path, sign convention and value.
+        """
+        del cols  # historical argument retained for API compatibility
+        points, contexts, reasons = [], set(), []
+        for pr in projs:
+            fed, reason = self._proj_fed(pr['proj'], pr['summary'])
+            descriptor = pr['proj'].get('volcano_descriptor') or {}
+            quantity = str(descriptor.get('quantity') or '')
+            species = self._comparison_model().canonical_species(
+                descriptor.get('species') or descriptor.get('descriptor_species'))
+            path_id = str(descriptor.get('reaction_path_id') or '')
+            sign = str(descriptor.get('sign_convention') or '')
+            value = descriptor.get('value_eV', descriptor.get('descriptor_value_eV'))
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = None
+            u_l = fed.get('u_l') if isinstance(fed, dict) else None
+            if (quantity != 'delta_G_ads' or species != 'LiS2' or
+                    not path_id or sign != 'negative_is_stronger' or
+                    value is None or not math.isfinite(value) or
+                    not isinstance(u_l, (int, float)) or not math.isfinite(u_l)):
+                detail = reason or (
+                    '缺少路径专用 ΔG_ads(*LiS2) 描述符及其反应路径/符号口径')
+                reasons.append(f"{pr['name']}: {detail}")
+                continue
+            contexts.add(path_id)
+            points.append({'name': pr['name'], 'x': value, 'y': float(u_l)})
+        if len(contexts) > 1:
+            return None, '火山图项目使用了不同反应路径，不能套用同一个描述符关系'
+        if len(points) < 3:
+            why = '；'.join(reasons[:3])
+            return None, (
+                f'火山图需 ≥3 个项目同时具备同一路径的 ΔG_ads(*LiS2) 与 U_L'
+                f'(当前 {len(points)} 个)。{why}')
+        return ('LiS2', points), None
+
+    # ── MatClaw 式对话助手（Python 原生、安全附件、限定本地工具） ───────────
+    def ai_chat_sessions(self):
+        try:
+            return {'ok': True, 'sessions': self._chat().list_sessions(), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'sessions': [], 'error': str(e)}
+
+    def ai_chat_new(self, title=''):
+        try:
+            session = self._chat().create_session(str(title or '').strip() or None)
+            return {'ok': True, 'session': session, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'session': None, 'error': str(e)}
+
+    def ai_chat_history(self, session_id):
+        try:
+            chat = self._chat()
+            return {
+                'ok': True,
+                'messages': chat.history(str(session_id or ''), include_previews=False),
+                'attachments': chat.list_attachments(
+                    str(session_id or ''), include_previews=False),
+                'error': None,
+            }
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'messages': [], 'attachments': [], 'error': str(e)}
+
+    def ai_chat_attach(self, session_id, paths):
+        """把用户明确选择的本地文件复制进会话隔离区；源路径不进数据库/模型。"""
+        try:
+            values = paths if isinstance(paths, (list, tuple)) else [paths]
+            values = [str(path or '').strip() for path in values if str(path or '').strip()]
+            if not values:
+                return {'ok': False, 'attachments': [], 'error': '未选择附件'}
+            if len(values) > 10:
+                return {'ok': False, 'attachments': [],
+                        'error': '一次最多导入 10 个附件，请分批选择'}
+            chat = self._chat()
+            attached, rejected = [], []
+            for path in values:
+                try:
+                    attached.append(chat.attach(str(session_id or ''), path))
+                except Exception as exc:                 # noqa: BLE001 单文件失败需如实返回部分成功
+                    rejected.append({
+                        'name': os.path.basename(path) or path,
+                        'error': str(exc),
+                    })
+            if rejected:
+                detail = '；'.join(
+                    f'{item["name"]}: {item["error"]}' for item in rejected)
+                return {
+                    'ok': False,
+                    'attachments': attached,
+                    'rejected': rejected,
+                    'error': ('部分附件导入失败；已成功导入的文件仍保留：' + detail
+                              if attached else '附件导入失败：' + detail),
+                }
+            return {'ok': True, 'attachments': attached, 'rejected': [], 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'attachments': [], 'rejected': [], 'error': str(e)}
+
+    def _chat_project_status_text(self, query=''):
+        status = self.pipeline_status()
+        if not status.get('ok'):
+            return '项目状态读取失败：' + str(status.get('error') or '未知错误')
+        projects = list(status.get('projects') or [])
+        needle = str(query or '').strip()
+        if needle:
+            key = os.path.normcase(os.path.abspath(os.path.normpath(needle)))
+            projects = [
+                item for item in projects
+                if str(item.get('name') or '').casefold() == needle.casefold()
+                or os.path.normcase(os.path.abspath(
+                    os.path.normpath(str(item.get('path') or '')))) == key
+            ]
+        if not projects:
+            return ('没有找到匹配的吸附能项目。用法：/status，或 '
+                    '/status 项目名（也可粘贴 project.yaml 路径）。')
+        stage_names = {
+            'generate': '待生成', 'submit': '待提交', 'monitor': '监控中',
+            'recover': '自动续算', 'analysis': '结果分析', 'report_done': '报告完成',
+        }
+        runtime = self.pipeline_runtime_status()
+        state = runtime.get('state') if runtime.get('ok') else {}
+        if isinstance(state, dict):
+            if state.get('last_error'):
+                supervisor = '后台主管异常：' + str(state['last_error'])
+            elif state.get('enabled') is False or state.get('paused'):
+                supervisor = '后台主管：已暂停'
+            elif state.get('tick_running'):
+                supervisor = '后台主管：正在检查'
+            elif state.get('running'):
+                supervisor = '后台主管：运行中'
+            else:
+                supervisor = '后台主管：尚未启动'
+            if state.get('next_check'):
+                supervisor += f'；下次检查 {state["next_check"]}'
+            if state.get('last_finished'):
+                supervisor += f'；上次完成 {state["last_finished"]}'
+        else:
+            supervisor = '后台主管状态不可用'
+        lines = [supervisor, '当前项目状态：']
+        for item in projects:
+            round_text = (f'，续算 {item.get("recover_round", 0)}/3'
+                          if item.get('stage') == 'recover' else '')
+            flag = '，需要人工处理' if item.get('needs_human') else ''
+            report_note = str(item.get('report_reason') or '').strip()
+            extra = f'；报告：{report_note}' if report_note else ''
+            lines.append(
+                f'- {item.get("name") or "(未命名)"}：'
+                f'{stage_names.get(item.get("stage"), item.get("stage"))}，'
+                f'{item.get("done", 0)}/{item.get("total", 0)} DONE'
+                f'{round_text}{flag}{extra}')
+        return '\n'.join(lines)
+
+    def _chat_project_report_text(self, query=''):
+        needle = str(query or '').strip()
+        matches = []
+        for path in self._adsorption.list_projects():
+            proj = self._adsorption.load_project(path)
+            if proj is None:
+                continue
+            if (not needle or str(proj.get('name') or '').casefold() == needle.casefold()
+                    or os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+                    == os.path.normcase(os.path.abspath(os.path.normpath(needle)))):
+                matches.append((path, proj))
+        if not needle:
+            return '请指定项目：/report 项目名（或 project.yaml 路径）。'
+        if len(matches) != 1:
+            return '没有找到唯一匹配的项目，请使用完整项目名或 project.yaml 路径。'
+        path, proj = matches[0]
+        root = str(proj.get('root') or os.path.dirname(str(path)))
+        name = str(proj.get('name') or 'project')
+        summary = self._adsorption.delta_e_rows(proj)
+        final, reason = self._final_report_gate(proj, summary)
+        report_dir = os.path.join(root, 'report')
+        suffix = 'report' if final else 'diagnostic'
+        out = os.path.join(report_dir, f'{name}_{suffix}.html')
+        result = self.proj_report(path, out, final=final)
+        if not result.get('ok'):
+            return '报告尚未生成：' + str(result.get('error') or '未知错误')
+        files = result.get('files') or [result.get('file')]
+        heading = ('最终报告已生成：' if final else
+                   f'诊断报告已生成（未标记为最终报告：{reason}）：')
+        return heading + '\n' + '\n'.join(f'- {item}' for item in files if item)
+
+    def ai_chat_send(self, session_id, text, attachment_ids=None):
+        """发送对话；/status 和 /report 走本地确定性工具，其余受联网开关约束。"""
+        try:
+            message = str(text or '').strip()
+            if not message:
+                return {'ok': False, 'result': None, 'error': '消息不能为空'}
+            command, _, argument = message.partition(' ')
+            command = command.casefold()
+            chat = self._chat()
+            if command == '/help':
+                reply = (
+                    '可用命令：\n'
+                    '/status [项目名] — 查看项目、续算轮次和报告状态\n'
+                    '/report 项目名 — 在本地生成最终 HTML、Word 与 PDF 报告\n'
+                    '/stop — 只停止当前 AI 回复，不会取消任何集群作业\n\n'
+                    '普通消息可明确勾选附件后发送；未勾选的本地文件不会提供给模型。'
+                )
+                result = chat.local_reply(str(session_id or ''), message, reply)
+            elif command == '/status':
+                result = chat.local_reply(
+                    str(session_id or ''), message,
+                    self._chat_project_status_text(argument))
+            elif command == '/report':
+                result = chat.local_reply(
+                    str(session_id or ''), message,
+                    self._chat_project_report_text(argument))
+            elif command == '/stop' and argument.strip():
+                result = chat.local_reply(
+                    str(session_id or ''), message,
+                    '/stop 不接受附加文本。请单独输入 /stop；它只停止 AI 回复，'
+                    '不会取消任何集群作业。')
+            elif command.startswith('/') and command != '/stop':
+                result = chat.local_reply(
+                    str(session_id or ''), message,
+                    '未知命令。输入 /help 查看可用命令；本助手不提供 shell 或任意集群操作。')
+            else:
+                if command != '/stop':
+                    cfg = self._config.load_config()
+                    llm = cfg.get('llm') if isinstance(cfg, dict) else {}
+                    if not isinstance(llm, dict) or not llm.get('allow_external'):
+                        return {
+                            'ok': False, 'result': None,
+                            'error': ('联网对话默认关闭。请在设置页配置模型并开启'
+                                      '“允许将项目数据发送到外部 LLM”；/status、'
+                                      '/report 和 /help 仍可离线使用。'),
+                        }
+                result = chat.send(
+                    str(session_id or ''), message,
+                    attachment_ids=list(attachment_ids or []))
+            return {'ok': True, 'result': result, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'result': None, 'error': str(e)}
+
+    def ai_chat_stop(self, session_id):
+        try:
+            result = self._chat().stop(str(session_id or ''))
+            return {'ok': True, 'result': result, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'result': None, 'error': str(e)}
 
     # ── 文件/目录选择(web 无原生 input;pywebview 延迟 import,测试注入 dialog_fn) ──
     def pick_file(self, kind='poscar'):
@@ -700,6 +5031,24 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'path': None, 'error': str(e)}
 
+    def pick_files(self, kind='files'):
+        try:
+            if self._dialog_fn is not None:
+                selected = self._dialog_fn(kind)
+            else:
+                import webview                            # 延迟:测试永不 import
+                selected = webview.windows[0].create_file_dialog(
+                    webview.OPEN_DIALOG, allow_multiple=True)
+            if not selected:
+                paths = []
+            elif isinstance(selected, (list, tuple)):
+                paths = [str(path) for path in selected if path]
+            else:
+                paths = [str(selected)]
+            return {'paths': paths, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'paths': [], 'error': str(e)}
+
     def pick_dir(self):
         try:
             if self._dialog_fn is not None:
@@ -712,16 +5061,5228 @@ class Api:
         except Exception as e:                            # noqa: BLE001
             return {'path': None, 'error': str(e)}
 
-    # ── 打开本地目录(仅 win32:os.startfile) ──
+    # ── 打开本地目录(传文件路径 → 打开其所在目录) ──
     def open_dir(self, path):
         try:
-            if not os.path.isdir(path):
+            p = path
+            # 传入文件路径(如报告 html / CSV)→ 打开其所在目录(输出反馈统一口径)
+            if p and os.path.isfile(p):
+                p = os.path.dirname(p)
+            if not p or not os.path.isdir(p):
                 return {'ok': False, 'error': '目录不存在'}
             if sys.platform == 'win32':
-                os.startfile(path)  # noqa: S606
+                os.startfile(p)  # noqa: S606
             else:
                 import subprocess
-                subprocess.Popen(['xdg-open', path])
+                subprocess.Popen(['xdg-open', p])
             return {'ok': True}
         except Exception as e:                            # noqa: BLE001
             return {'ok': False, 'error': str(e)}
+
+    def save_text(self, path, text):
+        """把文本写到指定路径(②预览区「保存预览到文件」等用)→ {'ok','path','error'}。"""
+        try:
+            p = (path or '').strip()
+            if not p:
+                return {'ok': False, 'path': None, 'error': '未指定保存路径'}
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(str(text if text is not None else ''))
+            return {'ok': True, 'path': p, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': None, 'error': str(e)}
+
+    # ── 设置页(config 读写 + keyring 状态;全走注入的 config/ai_analysis,可测) ─────────
+    @staticmethod
+    def _parse_ideal_window(lo, hi):
+        """两个数(可留空)→ [lo, hi] 或 None。都空 → None;非法数字 → ValueError。"""
+        def _num(x):
+            s = str(x if x is not None else '').strip()
+            return None if s == '' else float(s)
+        a, b = _num(lo), _num(hi)
+        if a is None and b is None:
+            return None
+        if a is None or b is None:
+            raise ValueError('ideal_window 需同时给两个数字,或都留空')
+        return [a, b]
+
+    def _ui_defaults(self, ui):
+        """ui 小节 → 外观/自动化设置(带默认值)。"""
+        return {
+            'theme': ui.get('theme') if ui.get('theme') in _THEMES else 'classic',
+            'autopilot': bool(ui.get('autopilot', False)),
+            'poll_interval': int(ui.get('poll_interval', 10) or 10),
+            'autopilot_continue': bool(ui.get('autopilot_continue', True)),
+            'autopilot_fetch': bool(ui.get('autopilot_fetch', True)),
+            'autopilot_report': bool(ui.get('autopilot_report', True)),
+            'autopilot_campaigns': bool(ui.get('autopilot_campaigns', False)),
+            'scenario': str(ui.get('scenario') or ''),
+            'active_engine': str(ui.get('active_engine') or ''),
+            'active_calculation': str(ui.get('active_calculation') or ''),
+        }
+
+    def settings_get(self):
+        """设置页汇总读:LLM(不含密钥明文,仅 key_saved)/提示词/数据路径/外观自动化。"""
+        try:
+            cfg = self._config.load_config()
+            llm = dict(cfg.get('llm') or {})
+            ui = self._config.get_ui_state(cfg)
+            iw = cfg.get('ideal_window')
+            key_saved = False
+            try:
+                key_saved = self._ai().load_api_key() is not None
+            except Exception:                             # noqa: BLE001 keyring 不可用 → 视作未设置
+                key_saved = False
+            preset = llm.get('prompt_preset')
+            is_default = not (isinstance(preset, str) and preset.strip())
+            return {
+                'ok': True, 'error': None,
+                'llm': {'base_url': llm.get('base_url', '') or '',
+                        'model': llm.get('model', '') or '',
+                        'allow_external': bool(llm.get('allow_external', False)),
+                        'key_saved': bool(key_saved)},   # 绝不回显密钥,仅掩码状态
+                'prompt': {'text': preset if not is_default else self._ai().DEFAULT_PROMPT_PRESET,
+                           'is_default': is_default},
+                'paths': {'potcar_lib_root': cfg.get('potcar_lib_root', '') or '',
+                          'lis_molecules_dir': cfg.get('lis_molecules_dir', '') or '',
+                          'ideal_window': list(iw) if isinstance(iw, (list, tuple)) else []},
+                'ui': self._ui_defaults(ui),
+                'figures': {  # 出图偏好(期刊风格 / 自动出图 / 多面板)
+                    'journal_style': (str(ui.get('journal_style') or 'nature').lower()
+                                      if str(ui.get('journal_style') or 'nature').lower()
+                                      in self._JOURNAL_STYLES else 'nature'),
+                    'auto_figures': bool(ui.get('auto_figures', True)),
+                    'multi_panel': bool(ui.get('multi_panel', True))},
+            }
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def llm_save(self, base_url, model, allow_external=None):
+        """保存 LLM 端点/模型(可选联网开关)到 config.llm(密钥不走这里)。"""
+        try:
+            cfg = self._config.load_config()
+            llm = dict(cfg.get('llm') or {})
+            llm['base_url'] = (base_url or '').strip()
+            llm['model'] = (model or '').strip()
+            if allow_external is not None:
+                llm['allow_external'] = bool(allow_external)
+            cfg['llm'] = llm
+            self._config.save_config(cfg)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def llm_key_save(self, key):
+        """密钥进 keyring(经 ai_analysis.save_api_key),绝不落 config/yaml。"""
+        try:
+            k = (key or '').strip()
+            if not k:
+                return {'ok': False, 'error': 'API 密钥不能为空'}
+            self._ai().save_api_key(k)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def llm_key_status(self):
+        """密钥是否已存(仅掩码状态,绝不回显)。"""
+        try:
+            return {'saved': self._ai().load_api_key() is not None}
+        except Exception:                                 # noqa: BLE001
+            return {'saved': False}
+
+    def llm_test(self, base_url='', model='', transport=None):
+        """测试连接:用当前(未保存的表单)端点/模型 + keyring 密钥发一个极小请求。"""
+        try:
+            res = self._ai().probe(base_url=(base_url or '').strip(),
+                                   model=(model or '').strip(), transport=transport)
+            return {'ok': bool(res.get('ok')), 'error': res.get('error')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def prompt_get(self):
+        """取生效中的分析提示词预设(config llm.prompt_preset,缺 → 内置默认)。"""
+        try:
+            llm = dict(self._config.load_config().get('llm') or {})
+            preset = llm.get('prompt_preset')
+            is_default = not (isinstance(preset, str) and preset.strip())
+            return {'ok': True, 'error': None, 'is_default': is_default,
+                    'text': preset if not is_default else self._ai().DEFAULT_PROMPT_PRESET}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'text': '', 'error': str(e)}
+
+    def prompt_save(self, text):
+        """保存自定义分析提示词到 config.llm.prompt_preset。"""
+        try:
+            if not (text or '').strip():
+                return {'ok': False, 'error': '提示词不能为空'}
+            cfg = self._config.load_config()
+            llm = dict(cfg.get('llm') or {})
+            llm['prompt_preset'] = text
+            cfg['llm'] = llm
+            self._config.save_config(cfg)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def prompt_reset(self):
+        """恢复默认:删除 config.llm.prompt_preset,返回内置默认文本。"""
+        try:
+            cfg = self._config.load_config()
+            llm = dict(cfg.get('llm') or {})
+            llm.pop('prompt_preset', None)
+            cfg['llm'] = llm
+            self._config.save_config(cfg)
+            return {'ok': True, 'error': None, 'text': self._ai().DEFAULT_PROMPT_PRESET}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def paths_save(self, potcar_lib_root='', lis_molecules_dir='',
+                   ideal_window_lo=None, ideal_window_hi=None):
+        """保存数据路径(赝势库 / Li-S 分子库 / 理想窗口)到 config 对应键。"""
+        try:
+            iw = self._parse_ideal_window(ideal_window_lo, ideal_window_hi)
+            cfg = self._config.load_config()
+            cfg['potcar_lib_root'] = (potcar_lib_root or '').strip()
+            cfg['lis_molecules_dir'] = (lis_molecules_dir or '').strip()
+            if iw is None:
+                cfg.pop('ideal_window', None)
+            else:
+                cfg['ideal_window'] = iw
+            self._config.save_config(cfg)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def theme_set(self, name):
+        """三选主题即时生效(写 config ui.theme;非法值回落 classic)。"""
+        try:
+            n = str(name or '').strip().lower()
+            if n not in _THEMES:
+                n = 'classic'
+            self._config.set_ui_state(theme=n)
+            return {'ok': True, 'theme': n, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def autopilot_save(self, autopilot=None, poll_interval=None,
+                       autopilot_continue=None, autopilot_fetch=None,
+                       autopilot_report=None, autopilot_campaigns=None):
+        """保存自动驾驶开关/间隔/子开关到 config ui.*(None 的字段不改)。"""
+        try:
+            kv = {}
+            if autopilot is not None:
+                kv['autopilot'] = bool(autopilot)
+            if poll_interval is not None:
+                pi = int(poll_interval)
+                kv['poll_interval'] = pi if pi in (5, 10, 15) else 10
+            if autopilot_continue is not None:
+                kv['autopilot_continue'] = bool(autopilot_continue)
+            if autopilot_fetch is not None:
+                kv['autopilot_fetch'] = bool(autopilot_fetch)
+            if autopilot_report is not None:
+                kv['autopilot_report'] = bool(autopilot_report)
+            if autopilot_campaigns is not None:
+                kv['autopilot_campaigns'] = bool(autopilot_campaigns)
+            self._config.set_ui_state(**kv)
+            if self._pipeline_supervisor is not None:
+                self._pipeline_supervisor.reconfigure()
+                if kv.get('autopilot') is True:
+                    self._pipeline_supervisor.wake()
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    # ── 自动驾驶管线 ─────────────────────────────────────────────────────────────
+    def _autopilot_cfg(self):
+        try:
+            ui = self._config.get_ui_state()
+        except Exception:                                 # noqa: BLE001
+            ui = {}
+        d = self._ui_defaults(ui if isinstance(ui, dict) else {})
+        return {'enabled': d['autopilot'], 'interval': d['poll_interval'],
+                'cont': d['autopilot_continue'], 'fetch': d['autopilot_fetch'],
+                'report': d['autopilot_report'],
+                'campaigns': d['autopilot_campaigns']}
+
+    def _member_states(self, proj):
+        """项目成员状态、续算轮次与远端结果是否已完整回到本地。"""
+        out = []
+        for d in self._project_member_dirs(proj):
+            m = self._manifest.load_manifest(d)
+            if m is None:
+                out.append({'dir': d, 'state': None, 'restartable': False, 'rounds': 0})
+                continue
+            res = m.get('results') or {}
+            dgn = res.get('diagnosis') or {}
+            out.append({'dir': d, 'state': m.get('state'),
+                        'restartable': bool(dgn.get('restartable')),
+                        'rounds': int(res.get('continue_rounds', 0) or 0),
+                        'local_results_ready': self._local_results_ready(d, m)})
+        return out
+
+    @staticmethod
+    def _local_results_ready(job_dir, manifest):
+        """当前调度轮次的结果已完整下载；旧轮次同名文件不能冒充新结果。"""
+        if not manifest:
+            return False
+        remote_dir = str(manifest.get('remote_dir') or '')
+        if not remote_dir:
+            # 本地导入的已算结果没有远端身份，沿用其 manifest 状态/能量证据。
+            return True
+        job_id = str(manifest.get('scheduler_job_id') or '')
+        results = manifest.get('results') or {}
+        if (str(manifest.get('state') or '') != 'DONE'
+                or not job_id or not results.get('fetched_at')
+                or str(results.get('fetched_state') or '') != 'DONE'
+                or str(results.get('fetched_job_id') or '') != job_id
+                or str(results.get('fetched_remote_dir') or '') != remote_dir):
+            return False
+        try:
+            from vcstudio.cluster.submitter import current_attempt_token
+            if (str(results.get('fetched_attempt_token') or '')
+                    != current_attempt_token(manifest)):
+                return False
+        except (ImportError, TypeError, ValueError):
+            return False
+        contract = results.get('fetch_contract') or {}
+        if (not isinstance(contract, dict)
+                or str(contract.get('state') or '') != 'DONE'
+                or str(contract.get('scheduler_job_id') or '') != job_id
+                or str(contract.get('remote_dir') or '') != remote_dir
+                or str(contract.get('attempt_token') or '')
+                != str(results.get('fetched_attempt_token') or '')):
+            return False
+        hashes = results.get('fetched_sha256') or {}
+        sizes = results.get('fetched_sizes') or {}
+        fetched = {str(name) for name in (results.get('fetched') or [])}
+        for filename in fetched:
+            path = os.path.join(job_dir, *filename.split('/'))
+            try:
+                if (not os.path.isfile(path)
+                        or int(sizes.get(filename, -1)) != os.path.getsize(path)
+                        or str(hashes.get(filename) or '') != _sha256_file(path)):
+                    return False
+            except (OSError, TypeError, ValueError):
+                return False
+        if str(manifest.get('task_type') or '') == 'neb':
+            return bool(fetched)
+        required = {'CONTCAR', 'OSZICAR', 'OUTCAR'}
+        missing = {str(name) for name in (results.get('fetched_missing') or [])}
+        return (required.issubset(fetched) and required.isdisjoint(missing)
+                and required.issubset(set(hashes))
+                and required.issubset(set(sizes)))
+
+    def _project_stage(self, states, has_marker):
+        """成员状态 + 报告标记 → (stage, needs_human, recover_round)。规则见 pipeline_status。"""
+        all_states = [s['state'] for s in states]
+        exhausted = any(s['state'] in _TERMINAL_FAIL and s['restartable']
+                        and s['rounds'] >= 3 for s in states)
+        needs_human = (any(s == 'NEEDS_HUMAN' for s in all_states) or exhausted
+                       or any(s['state'] in _TERMINAL_FAIL and not s['restartable']
+                              for s in states))
+        recover_round = max([s['rounds'] for s in states
+                             if s['restartable'] and s['state'] in _TERMINAL_FAIL] or [0])
+        if not states:
+            stage = 'generate'
+        elif any(s == 'CREATED' for s in all_states):
+            stage = 'submit'
+        elif any(s in _ACTIVE_STATES for s in all_states):
+            stage = 'monitor'
+        elif any(s['restartable'] and s['state'] in _TERMINAL_FAIL and s['rounds'] < 3
+                 for s in states):
+            stage = 'recover'
+        elif all_states and all(s == 'DONE' for s in all_states):
+            if not all(s.get('local_results_ready', True) for s in states):
+                stage = 'monitor'  # 已结束但结果尚未完整回收，不能提前进入分析
+            else:
+                stage = 'report_done' if has_marker else 'analysis'
+        elif any(s in _TERMINAL_FAIL for s in all_states):
+            stage = 'analysis'                            # 达上限/不可续算：转人工，不再伪装恢复中
+        else:
+            stage = 'generate'
+        return stage, needs_human, recover_round
+
+    def pipeline_status(self):
+        """每项目管线阶段:生成→提交→监控→恢复(n/3)→分析→报告完成;NEEDS_HUMAN 红旗。"""
+        try:
+            projs = []
+            for pp in self._adsorption.list_projects():
+                try:
+                    proj = self._adsorption.load_project(pp)
+                    if proj is None:
+                        continue
+                    states = self._member_states(proj)
+                    has_marker = self._report_marker_current(proj)
+                    stage, needs_human, rr = self._project_stage(states, has_marker)
+                    marker = proj.get('autopilot_report') if has_marker else {}
+                    blocked = (proj.get('autopilot_report_blocked')
+                               if isinstance(proj.get('autopilot_report_blocked'), dict)
+                               else {})
+                    report_files = ((marker or {}).get('files') or
+                                    (blocked or {}).get('files') or {})
+                    projs.append({
+                        'path': pp, 'name': proj.get('name', '') or '',
+                        'profile': str((((proj.get('launch') or {}).get('resources') or {})
+                                       .get('profile') or '')),
+                        'stage': stage, 'stage_index': _STAGES.index(stage),
+                        'stages': list(_STAGES), 'needs_human': needs_human,
+                        'recover_round': rr,
+                        'done': sum(1 for s in states if s['state'] == 'DONE'),
+                        'total': len(states),
+                        'report_status': ('final' if has_marker
+                                          else 'blocked' if blocked else 'pending'),
+                        'report_reason': ('' if has_marker else
+                                          str((blocked or {}).get('reason') or '')),
+                        'report_files': report_files,
+                    })
+                except Exception:                         # noqa: BLE001 单个坏项目跳过
+                    continue
+            return {'ok': True, 'projects': projs, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'projects': [], 'error': str(e)}
+
+    @staticmethod
+    def _base(d):
+        return os.path.basename(os.path.normpath(str(d)))
+
+    def _tick_cluster(self, name, prof, pw, ap, events, errors):
+        """单集群一轮；所有写远端动作只落在项目保存的显式提交白名单。"""
+        def _key(path):
+            return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+
+        managed_dirs = {}
+        for project_path in self._adsorption.list_projects():
+            try:
+                project = self._adsorption.load_project(project_path)
+                launch = (project or {}).get('launch') or {}
+                resources = launch.get('resources') or {}
+                if not (project or {}).get('autopilot_managed') or resources.get('profile') != name:
+                    continue
+                member_dirs = {
+                    _key(path) for path in self._project_member_dirs(project)
+                }
+                submitted_dirs = launch.get('submitted_job_dirs') or []
+                # 必须同时是该项目成员、且确由一站式提交成功后写入 launch 的目录。
+                for path in submitted_dirs:
+                    if path and _key(path) in member_dirs:
+                        managed_dirs[_key(path)] = str(path)
+            except Exception as exc:                     # noqa: BLE001 单个坏项目不拖停同服务器
+                errors.append(f'集群「{name}」项目托管清单读取失败({project_path}):{exc}')
+
+        def _in_scope(job_dir):
+            # 空白名单必须 fail closed，绝不能退化成“台账里的所有旧任务”。
+            return _key(job_dir) in managed_dirs
+
+        sync_ok = True
+        did_remote_action = False
+
+        def _record_remote_failure(stage, detail):
+            nonlocal sync_ok
+            sync_ok = False
+            label = {'refresh': '刷新', 'continue': '续算', 'fetch': '下载'}.get(stage, stage)
+            text = f'集群「{name}」{label}跳过:{detail}'
+            events.append({'kind': stage, 'cluster': name, 'text': text})
+            errors.append(f'集群「{name}」同步失败({label}):{detail}')
+
+        # project.launch.submitted_job_dirs 是远程写操作的授权真源；台账只是 UI 索引，
+        # 丢条目后仍须继续监控明确托管的项目，不能静默停管。
+        entries = [(path, self._manifest.load_manifest(path))
+                   for path in managed_dirs.values()]
+        targets = [d for d, m in entries
+                   if m and m.get('scheduler_job_id') and m.get('cluster') == name
+                   and m.get('state') in ('SUBMITTED', 'QUEUED', 'RUNNING')
+                   and _in_scope(d)]
+        if targets:
+            res = self._bo().refresh_batch(prof, pw, targets, False)
+            if res.get('needs_trust'):
+                events.append({'kind': 'skip',
+                               'cluster': name,
+                               'text': f'集群「{name}」主机指纹未信任,跳过本轮'})
+                errors.append(f'集群「{name}」同步失败:主机指纹未信任')
+                return False
+            did_remote_action = True
+            for d, note in (res.get('results') or []):
+                events.append({'kind': 'refresh', 'cluster': name,
+                               'text': f'{self._base(d)}:{note}'})
+                if str(note).startswith('查询失败:'):
+                    _record_remote_failure('refresh', f'{self._base(d)}:{note}')
+        entries2 = [(path, self._manifest.load_manifest(path))
+                    for path in managed_dirs.values()]
+        # 续算:刷新后 restartable 终态且 attempts<3 → 自动续算(复用 filter_continuable)
+        if ap['cont']:
+            try:
+                cdirs = [d for d, m in entries2
+                         if m and m.get('cluster') == name and _in_scope(d)]
+                eligible, _sk = self._bo().filter_continuable(cdirs)
+                if eligible:
+                    cres = self._bo().continue_batch(prof, pw, eligible, False)
+                    if cres.get('needs_trust'):
+                        _record_remote_failure('continue', '主机指纹未信任')
+                        return False
+                    did_remote_action = True
+                    for d, ok, msg in (cres.get('results') or []):
+                        events.append({'kind': 'continue', 'cluster': name,
+                                       'text': f'{self._base(d)}:{msg}'})
+                        if not ok:
+                            _record_remote_failure('continue', f'{self._base(d)}:{msg}')
+            except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其它集群
+                _record_remote_failure('continue', str(e))
+        # 拉回：不能只看“本轮新变 DONE”。应用可能在任务结束后才重启，此时本地
+        # 没有 fetched_at/关键输出；每拍重新检查缺口，fetch_results 成功写 fetched_at，
+        # 因而完整结果天然幂等，未完整的结果会在下拍继续补拉。
+        if ap['fetch']:
+            try:
+                needs_fetch = []
+                for job_dir, manifest in entries2:
+                    if (not manifest or manifest.get('cluster') != name
+                            or manifest.get('state') != 'DONE'
+                            or not manifest.get('remote_dir') or not _in_scope(job_dir)):
+                        continue
+                    if not self._local_results_ready(job_dir, manifest):
+                        needs_fetch.append(job_dir)
+                if needs_fetch:
+                    fres = self._bo().fetch_batch(prof, pw, needs_fetch, False)
+                    if fres.get('needs_trust'):
+                        _record_remote_failure('fetch', '主机指纹未信任')
+                        return False
+                    did_remote_action = True
+                    for d, ok, msg in (fres.get('results') or []):
+                        events.append({'kind': 'fetch', 'cluster': name,
+                                       'text': f'{self._base(d)}:{msg}'})
+                        if not ok:
+                            _record_remote_failure('fetch', f'{self._base(d)}:{msg}')
+            except Exception as e:                        # noqa: BLE001 单集群失败不拖垮其它集群
+                _record_remote_failure('fetch', str(e))
+        return sync_ok and did_remote_action
+
+    def _project_all_done(self, states):
+        return bool(states) and all(s['state'] == 'DONE' for s in states)
+
+    @staticmethod
+    def _method_confirmation(project) -> dict:
+        check = ((project or {}).get('preparation') or {}).get('method_check') or {}
+        confirmation = check.get('confirmation') or {}
+        return confirmation if isinstance(confirmation, dict) else {}
+
+    def _final_report_gate(self, project, summary):
+        """Return whether ``summary`` is a deliverable adsorption-energy result."""
+        rows = list((summary or {}).get('rows') or [])
+        if not (summary or {}).get('has_ref'):
+            return False, '未设置有效气相/逐物种参考态；当前差值不是完整吸附能'
+        if not rows:
+            return False, '没有吸附构型结果'
+        invalid_refs = [row.get('name') for row in rows if not row.get('reference_valid')]
+        if invalid_refs:
+            return False, '以下构型的参考态未通过完整性校验：' + '、'.join(
+                str(name or '?') for name in invalid_refs)
+        incomplete = [row.get('name') for row in rows
+                      if _method_number(row.get('delta_e')) is None]
+        if incomplete:
+            return False, '以下构型尚无有效 ΔE：' + '、'.join(
+                str(name or '?') for name in incomplete)
+        method = (summary or {}).get('method_consistency') or {}
+        status = str(method.get('status') or 'unverified')
+        if status == 'incompatible':
+            return False, '能量项方法不兼容：' + '；'.join(method.get('issues') or [])
+        if status != 'verified':
+            confirmation = self._method_confirmation(project)
+            if not (confirmation.get('confirmed')
+                    and str(confirmation.get('reason') or '').strip()):
+                return False, '方法证据仍为 unverified，且没有保存带理由的人工确认'
+        return True, ''
+
+    def _report_input_fingerprint(self, project, summary) -> str:
+        """Bind a final report to member attempts, downloaded files and ΔE rows."""
+        members = []
+        for job_dir in self._project_member_dirs(project):
+            manifest = self._manifest.load_manifest(job_dir) or {}
+            results = manifest.get('results') or {}
+            attempts = manifest.get('attempts') or []
+            members.append({
+                'dir': os.path.abspath(os.path.normpath(str(job_dir))),
+                'state': manifest.get('state'),
+                'job_id': manifest.get('scheduler_job_id'),
+                'attempt': attempts[-1] if attempts else None,
+                'energy_e0_eV': results.get('energy_e0_eV'),
+                'fetched_job_id': results.get('fetched_job_id'),
+                'fetched_remote_dir': results.get('fetched_remote_dir'),
+                'fetched_sha256': results.get('fetched_sha256') or {},
+            })
+        payload = {
+            'project': project.get('project_uuid') or project.get('name'),
+            'members': members,
+            'reference_mode': summary.get('reference_mode'),
+            'species_reference_evidence': summary.get('species_reference_evidence') or [],
+            'method_consistency': summary.get('method_consistency') or {},
+            'method_confirmation': self._method_confirmation(project),
+            'rows': [{
+                'name': row.get('name'), 'species': row.get('species'),
+                'delta_e': row.get('delta_e'), 'dd_e': row.get('dd_e'),
+                'reference_job': row.get('reference_job'),
+                'reference_valid': row.get('reference_valid'),
+            } for row in (summary.get('rows') or [])],
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                             separators=(',', ':'), default=str).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _persist_blocked_report_marker(self, project, summary, reason, files):
+        """保存诊断报告状态；它可见但永远不能冒充最终报告。"""
+        paths = [os.path.abspath(str(path)) for path in files
+                 if path and os.path.isfile(str(path))]
+        if not paths:
+            raise RuntimeError('诊断报告状态落盘失败：没有可读的报告文件')
+        by_format = {
+            os.path.splitext(path)[1].lower().lstrip('.') or 'file': path
+            for path in paths
+        }
+        blocked = {
+            'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'input_fingerprint': self._report_input_fingerprint(project, summary),
+            'reason': str(reason or '最终报告门禁未通过'),
+            'files': by_format,
+        }
+        root = project.get('root') or os.path.dirname(paths[0])
+        persisted = dict(project)
+        persisted['autopilot_report_blocked'] = blocked
+        persisted.pop('autopilot_report', None)
+        persisted.pop('autopilot_report_done', None)
+        self._adsorption.save_project(root, persisted)
+        project['autopilot_report_blocked'] = blocked
+        project.pop('autopilot_report', None)
+        project.pop('autopilot_report_done', None)
+        return blocked
+
+    def _persist_report_marker(self, project, summary, files):
+        """原子保存多格式最终报告标记；任一声明文件变化都会让标记失效。"""
+        paths = [os.path.abspath(str(path)) for path in files
+                 if path and os.path.isfile(str(path))]
+        if not paths:
+            raise RuntimeError('报告标记落盘失败：没有可读的报告文件')
+        by_format, hashes = {}, {}
+        for path in paths:
+            suffix = os.path.splitext(path)[1].lower().lstrip('.') or 'file'
+            by_format[suffix] = path
+            hashes[suffix] = _sha256_file(path)
+        html_path = by_format.get('html') or paths[0]
+        generated_at = time.strftime('%Y-%m-%dT%H:%M:%S')
+        marker = {
+            'generated_at': generated_at,
+            'input_fingerprint': self._report_input_fingerprint(project, summary),
+            'file': html_path,                       # 旧界面只读兼容
+            'report_sha256': _sha256_file(html_path),
+            'files': by_format,
+            'sha256': hashes,
+            'figures_dir': os.path.dirname(html_path),
+        }
+        root = project.get('root') or os.path.dirname(html_path)
+        persisted = dict(project)
+        persisted['autopilot_report'] = marker
+        persisted['autopilot_report_done'] = generated_at
+        persisted.pop('autopilot_report_blocked', None)
+        try:
+            self._adsorption.save_project(root, persisted)
+        except Exception as exc:                         # noqa: BLE001
+            raise RuntimeError(f'报告标记落盘失败：{exc}') from exc
+        project['autopilot_report'] = marker
+        project['autopilot_report_done'] = generated_at
+        project.pop('autopilot_report_blocked', None)
+        return marker
+
+    def _report_marker_current(self, project, summary=None) -> bool:
+        marker = (project or {}).get('autopilot_report')
+        if not isinstance(marker, dict):
+            return False
+        try:
+            current = summary or self._adsorption.delta_e_rows(project)
+            if marker.get('input_fingerprint') != self._report_input_fingerprint(project, current):
+                return False
+            declared = marker.get('files')
+            hashes = marker.get('sha256') or marker.get('report_hashes')
+            if isinstance(declared, dict) and isinstance(hashes, dict) and declared:
+                return all(
+                    os.path.isfile(str(path))
+                    and str(hashes.get(fmt) or '')
+                    and _sha256_file(str(path)) == str(hashes.get(fmt))
+                    for fmt, path in declared.items())
+            report_path = str(marker.get('file') or '')
+            if not report_path or not os.path.isfile(report_path):
+                return False
+            expected_hash = str(marker.get('report_sha256') or '')
+            return bool(expected_hash and _sha256_file(report_path) == expected_hash)
+        except Exception:                                # noqa: BLE001 失效即重建，绝不误报完成
+            return False
+
+    def _tick_reports(self, events, errors):
+        """Generate an idempotent HTML/DOCX/PDF bundle once calculations finish.
+
+        Managed submissions and imported-result projects share this close-out
+        path.  If the final scientific gate is not satisfied, the renderer
+        emits a clearly labelled diagnostic bundle instead of silently doing
+        nothing or mislabelling it as a final result.
+        """
+        for pp in self._adsorption.list_projects():
+            try:
+                proj = self._adsorption.load_project(pp)
+                if proj is None:
+                    continue
+                is_imported = bool(
+                    proj.get('import_source') or proj.get('result_import')
+                    or proj.get('imported_results'))
+                if not proj.get('autopilot_managed') and not is_imported:
+                    continue
+                # A reference-library-only import has no clean slab/config pair
+                # and therefore no project report to close out.  Keep it reusable
+                # as a reference library without producing a misleading
+                # “adsorption report”.
+                members = proj.get('members') or {}
+                if (is_imported
+                        and (not members.get('clean_slab')
+                             or not list(members.get('configs') or []))):
+                    continue
+                states = self._member_states(proj)
+                if not self._project_all_done(states):
+                    continue
+                if not all(state.get('local_results_ready', True) for state in states):
+                    # 远端 DONE 但轻量结果仍未完整回到本地时，不抢跑报告；_tick_cluster
+                    # 会在本拍先补拉，成功后这里重新读 manifest 即可同拍继续。
+                    continue
+                summary = self._adsorption.delta_e_rows(proj)
+                if self._report_marker_current(proj, summary):
+                    continue
+                name = proj.get('name', '') or self._base(os.path.dirname(str(pp)))
+                root = proj.get('root') or os.path.dirname(str(pp))
+                report_dir = os.path.join(root, 'report')
+                os.makedirs(report_dir, exist_ok=True)
+                rep = self.proj_report_bundle(
+                    pp, report_dir, ('html', 'docx', 'pdf'), final=True,
+                    stem=f'{name}_吸附能评估报告')
+                if not rep.get('ok'):
+                    errors.append(f'项目「{name}」自动报告失败:{rep.get("error")}')
+                    continue
+                report_files = {
+                    str(fmt): str(path)
+                    for fmt, path in (rep.get('files') or {}).items()
+                    if path and os.path.isfile(str(path))
+                }
+                required = {'html', 'docx', 'pdf'}
+                if not required.issubset(report_files):
+                    missing = '、'.join(sorted(required - set(report_files)))
+                    errors.append(f'项目「{name}」报告包缺少:{missing}')
+                    continue
+                generated_at = time.strftime('%Y-%m-%dT%H:%M:%S')
+                primary = report_files.get('pdf') or report_files.get('html')
+                marker = {
+                    'generated_at': generated_at,
+                    'input_fingerprint': self._report_input_fingerprint(proj, summary),
+                    'kind': rep.get('kind') or 'diagnostic',
+                    'file': primary,
+                    'files': report_files,
+                    'report_sha256': _sha256_file(primary),
+                    'report_hashes': {
+                        fmt: _sha256_file(path) for fmt, path in report_files.items()
+                    },
+                    'figures_dir': os.path.join(report_dir, 'figures'),
+                }
+                # 先用独立副本落盘，成功后才更新当前内存对象。
+                # 否则一次保存失败会在进程内留下“伪 marker”，
+                # 下一拍可能错误认为报告已持久化而不再重试。
+                persisted = dict(proj)
+                persisted['autopilot_report'] = marker
+                persisted['autopilot_report_done'] = generated_at  # 旧界面只读兼容
+                try:
+                    self._adsorption.save_project(root, persisted)
+                except Exception as e:                    # noqa: BLE001
+                    errors.append(f'项目「{name}」报告标记落盘失败:{e}')
+                    continue
+                proj['autopilot_report'] = marker
+                proj['autopilot_report_done'] = generated_at
+                events.append({'kind': 'report_done', 'project': name,
+                               'report': primary, 'files': report_files,
+                               'report_kind': marker['kind'],
+                               'figures_dir': marker['figures_dir'],
+                               'engine': 'paper_report_bundle',
+                               'n_figures': len(rep.get('figures') or []),
+                               'text': (f'项目「{name}」'
+                                        f'{"最终" if marker["kind"] == "final" else "诊断"}'
+                                        '报告（Word + PDF + HTML）已自动生成')})
+            except Exception as e:                        # noqa: BLE001 单项目失败不拖垮其他
+                errors.append(f'项目报告自动化异常:{e}')
+
+    # ── 一键出图接线:全 DONE 项目自动出图升级(auto_figures 场景感知 + 期刊风格) ──
+    def _af_scenario(self, proj):
+        """项目 → auto_figures 场景(lis/general)。只读项目自身口径，不受后来 UI 切换影响。"""
+        mode = str((proj or {}).get('work_mode') or
+                   ((proj or {}).get('preparation') or {}).get('work_mode') or '')
+        if mode == 'lis' or (proj or {}).get('config_species') or (proj or {}).get('species_refs'):
+            return 'lis'
+        return 'general'
+
+    def _af_molecules_dir(self):
+        try:
+            return (self._config.load_config().get('lis_molecules_dir') or '').strip() or None
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    def _auto_figures_for_project(self, proj, pp, out_dir):
+        """全 DONE 项目一键出图:优先 auto_figures.run_auto_figures(场景感知 + 期刊风格 + 多面板),
+        引擎不可用(缺 matplotlib)/偏好关闭 → 回退 proj_figures(bar/table/ladder)。"""
+        prefs = self.figure_prefs_get()
+        if prefs.get('auto_figures', True):
+            try:
+                r = self._af().run_auto_figures(
+                    proj, self._af_scenario(proj), out_dir,
+                    journal=prefs.get('journal_style', 'nature'),
+                    adsorption_mod=self._adsorption,
+                    molecules_dir=self._project_molecules_dir(proj),
+                    compose_panel=bool(prefs.get('multi_panel', True)))
+                if r.get('ok'):
+                    return {'out_dir': r.get('out_dir'), 'files': list(r.get('files') or []),
+                            'panel': r.get('panel'), 'manifest': list(r.get('manifest') or []),
+                            'engine': 'auto_figures'}
+            except Exception:                             # noqa: BLE001 引擎不可用 → 回退
+                pass
+        fig = self.proj_figures(pp, ['bar', 'table', 'ladder'], out_dir)
+        return {'out_dir': fig.get('out_dir'), 'files': [], 'panel': None,
+                'manifest': [], 'engine': 'proj_figures'}
+
+    # ── campaign 全链推进接线:消费 next_derivations 自动派生下一阶段作业(自动驾驶时) ──
+    def _tick_campaigns(self, events, errors):
+        """扫已登记 campaign,消费 next_derivations 自动派生下一阶段作业并 mark_derived(幂等)。
+
+        依赖 campaign_templates(不可用则整体跳过);每目录/每项失败只记 event/error,绝不抛出。
+        """
+        try:
+            ct = self._ct()
+        except Exception:                                 # noqa: BLE001 模块不可用 → 跳过
+            return
+        try:
+            ui = self._config.get_ui_state()
+        except Exception:                                 # noqa: BLE001
+            ui = {}
+        for cdir in list((ui or {}).get('campaign_dirs') or []):
+            try:
+                pending = ct.next_derivations(cdir)
+            except Exception as e:                        # noqa: BLE001
+                errors.append(f'批次「{self._base(cdir)}」推进扫描失败:{e}')
+                continue
+            for item in pending:
+                src = item.get('src_dir')
+                derive = item.get('derive')
+                if not src or not os.path.isdir(str(src)):
+                    continue
+                try:
+                    if derive == 'estatic':
+                        r = self.derive_estatic(src, item.get('kinds') or ['pdos'])
+                        ok = bool(r.get('ok'))
+                    elif derive == 'freq':
+                        r = self.derive_freq(src)
+                        ok = bool(r.get('ok'))
+                    else:
+                        continue
+                    if ok:
+                        try:
+                            ct.mark_derived(cdir, item.get('src_id'), derive)
+                        except Exception as e:            # noqa: BLE001 记事件失败下拍再试
+                            errors.append(f'批次派生标记失败:{e}')
+                        events.append({'kind': 'derive',
+                                       'text': f'{self._base(src)}:自动派生 {derive} '
+                                               f'({self._base(cdir)})'})
+                except Exception as e:                    # noqa: BLE001 单项失败不拖垮其他
+                    errors.append(f'批次自动派生失败({self._base(src)}/{derive}):{e}')
+
+    def pipeline_tick(self):
+        """Run at most one automation tick in this backend process."""
+        if not self._pipeline_lock.acquire(blocking=False):
+            return {
+                'ok': True,
+                'events': [{'kind': 'skip', 'text': '上一轮自动托管仍在执行，本轮已跳过'}],
+                'errors': [], 'synced': 0,
+                'last_sync': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'busy': True,
+            }
+        try:
+            return self._pipeline_tick_once()
+        finally:
+            self._pipeline_lock.release()
+
+    def _pipeline_tick_once(self):
+        """服务端一拍编排(幂等,全部复用现有方法):逐集群刷新/续算/拉回 + 自动报告。
+
+        返回 {'ok','events':[{kind,text,...}],'errors':[...],'last_sync','synced'}。
+        无凭据的 profile 记 skip event;各阶段失败只记 event/error,绝不抛到 JS。
+        """
+        events, errors, synced = [], [], 0
+        ap = self._autopilot_cfg()
+        if not ap['enabled']:
+            # Remote automation remains fail-closed.  Report close-out is an
+            # independent, local-only stage: imported completed results should
+            # still receive their report when the user has left the global
+            # cluster monitor disabled.  Do not load profiles/secrets/campaigns
+            # on this path.
+            if ap['report']:
+                try:
+                    self._tick_reports(events, errors)
+                except Exception as e:                    # noqa: BLE001
+                    errors.append(f'报告自动化失败:{e}')
+            return {'ok': True, 'events': events, 'errors': errors, 'synced': 0,
+                    'last_sync': time.strftime('%Y-%m-%d %H:%M:%S')}
+        try:
+            profiles = self._profiles.load_profiles()
+        except Exception as e:                            # noqa: BLE001
+            profiles = {}
+            errors.append(f'读取集群配置失败:{e}')
+        # 项目仍声明托管、但配置已删除时必须明确报警；静默忽略会让用户误以为
+        # 任务仍在监控。逐项目隔离，坏项目不能掩盖其它服务器。
+        try:
+            for project_path in self._adsorption.list_projects():
+                try:
+                    project = self._adsorption.load_project(project_path)
+                    if not (project or {}).get('autopilot_managed'):
+                        continue
+                    profile_name = str(((((project or {}).get('launch') or {})
+                                        .get('resources') or {}).get('profile') or '')).strip()
+                    if profile_name and profile_name not in profiles:
+                        errors.append(
+                            f'托管项目「{(project or {}).get("name") or project_path}」引用的'
+                            f'服务器「{profile_name}」已不存在；请恢复该配置或停止托管')
+                except Exception as exc:                 # noqa: BLE001
+                    errors.append(f'托管项目读取失败({project_path}):{exc}')
+        except Exception as exc:                         # noqa: BLE001
+            errors.append(f'托管项目注册表读取失败:{exc}')
+        runnable = []
+        for name, prof in profiles.items():
+            try:
+                if getattr(prof, 'auth', 'key') == 'password':
+                    pw = self._secrets.get_password(name)
+                    if not pw:
+                        events.append({'kind': 'skip', 'cluster': name,
+                                       'text': f'集群「{name}」无保存凭据,跳过本轮同步'})
+                        continue
+                else:
+                    pw = None
+                runnable.append((name, prof, pw))
+            except Exception as e:                        # noqa: BLE001 单集群凭据失败隔离
+                errors.append(f'集群「{name}」读取凭据失败:{e}')
+
+        def _run_cluster(name, profile, password):
+            cluster_events, cluster_errors = [], []
+            try:
+                did_sync = bool(self._tick_cluster(
+                    name, profile, password, ap, cluster_events, cluster_errors))
+            except Exception as exc:                     # noqa: BLE001 单集群失败不拖垮其他
+                did_sync = False
+                cluster_errors.append(f'集群「{name}」同步失败:{exc}')
+            return did_sync, cluster_events, cluster_errors
+
+        completed = {}
+        if runnable:
+            with ThreadPoolExecutor(
+                    max_workers=min(8, len(runnable)),
+                    thread_name_prefix='vcs-pipeline') as pool:
+                futures = {
+                    pool.submit(_run_cluster, name, prof, pw): name
+                    for name, prof, pw in runnable
+                }
+                for future in as_completed(futures):
+                    completed[futures[future]] = future.result()
+        # Preserve profile order in the user-visible event log even though the
+        # network work above runs concurrently.
+        for name, _prof, _pw in runnable:
+            did_sync, cluster_events, cluster_errors = completed[name]
+            synced += int(did_sync)
+            events.extend(cluster_events)
+            errors.extend(cluster_errors)
+        # campaign 派生是独立能力；一站式吸附能启用续算/拉回不能顺带推进别的批次。
+        if ap['campaigns']:
+            try:
+                self._tick_campaigns(events, errors)
+            except Exception as e:                        # noqa: BLE001
+                errors.append(f'批次全链推进失败:{e}')
+        if ap['report']:
+            try:
+                self._tick_reports(events, errors)
+            except Exception as e:                        # noqa: BLE001
+                errors.append(f'报告自动化失败:{e}')
+        return {'ok': True, 'events': events, 'errors': errors, 'synced': synced,
+                'last_sync': time.strftime('%Y-%m-%d %H:%M:%S')}
+
+    # ── Phase A 引擎:公共小工具 ────────────────────────────────────────────────
+    @staticmethod
+    def _rotations_tuple(n):
+        """取向数 → 绕 z 采样角度(度)。1→(0,);2→(0,180);4→(0,90,180,270);其余均分。"""
+        try:
+            n = int(n or 1)
+        except (TypeError, ValueError):
+            n = 1
+        n = max(1, n)
+        if n == 1:
+            return (0,)
+        if n == 2:
+            return (0, 180)
+        if n == 4:
+            return (0, 90, 180, 270)
+        step = 360.0 / n
+        return tuple(int(round(step * i)) for i in range(n))
+
+    @staticmethod
+    def _filter_sites(sites, sites_mode):
+        """位点策略:'metal_top' 仅金属顶位;其余(全位点)返回全部。"""
+        if str(sites_mode) == 'metal_top':
+            return [s for s in sites if s.get('kind') == 'top_metal']
+        return list(sites)
+
+    @staticmethod
+    def _poscar_natoms(text):
+        """POSCAR 文本 → 原子数(取首个全整数行即计数行之和;解析不出 → 0)。"""
+        for ln in (text or '').splitlines()[5:9]:
+            parts = ln.split()
+            if parts and all(p.isdigit() for p in parts):
+                return sum(int(p) for p in parts)
+        return 0
+
+    def _job_from_text(self, poscar_text, incar_path, out_dir, lib):
+        """把 POSCAR 文本经既有四件套链落 out_dir + 写 job.yaml + 入台账 →(job_dir, warnings)。
+
+        build 失败向上抛(调用方记 skipped);job.yaml/台账写失败只并入 warnings,
+        绝不撤销已生成的四件套(同 gen_run 口径)。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            ppath = os.path.join(td, 'POSCAR')
+            with open(ppath, 'w', encoding='utf-8') as f:
+                f.write(poscar_text)
+            payload = self._job_builder.build_job_dir(
+                ppath, incar_path, out_dir, calc_type='slab', lib_root=(lib or None))
+        job_dir = payload['out_dir']
+        warnings = list(payload.get('warnings') or [])
+        try:
+            self._manifest.create_from_build(
+                job_dir, payload, poscar_path=os.path.join(job_dir, 'POSCAR'),
+                validate=True)
+            self._ledger.register(job_dir)
+        except Exception as e:                            # noqa: BLE001
+            warnings.append(f'job.yaml/台账写入失败(不影响四件套):{e}')
+        return job_dir, warnings
+
+    # ── 派生计算(作业页):频率(ZPE)/ 电子结构静态 ─────────────────────────────
+    def derive_freq(self, job_dir, out_root=None):
+        """派生频率作业(F14,ZPE):调 freq_builder 从 CONTCAR+INCAR 派生 → 入台账。
+
+        out_root 缺省 → 与原作业同级;命名 {原名}_freq。
+        返回 {'ok','job_dir','changes'(逐条改动 dict),'warnings','error'}。
+        """
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'job_dir': None, 'changes': [],
+                        'warnings': [], 'error': '作业目录不存在'}
+            base = os.path.basename(os.path.normpath(d))
+            parent = (out_root or '').strip() or os.path.dirname(os.path.normpath(d))
+            out_dir = os.path.join(parent, f'{base}_freq')
+            res = self._fb().build_freq_job(d, out_dir)
+            warnings = list(res.get('warnings') or [])
+            try:
+                self._ledger.register(res['out_dir'])
+            except Exception as e:                        # noqa: BLE001
+                warnings.append(f'台账登记失败(不影响已派生目录):{e}')
+            return {'ok': True, 'job_dir': res['out_dir'],
+                    'changes': list(res.get('changes') or []),
+                    'warnings': warnings, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'job_dir': None, 'changes': [],
+                    'warnings': [], 'error': str(e)}
+
+    def derive_estatic(self, job_dir, kinds, out_root=None):
+        """派生电子结构静态作业:kinds ⊂ {'pdos','bader','chgdiff'},每类一份 → 入台账。
+
+        命名 {原名}_st_{kind}('_st' 为静态标记)。单类失败只记 skipped,不拖垮其他类。
+        返回 {'ok','jobs':[{'kind','job_dir','changes','warnings'}],'skipped':[...],'error'}。
+        """
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'jobs': [], 'skipped': [],
+                        'error': '作业目录不存在'}
+            valid = ('pdos', 'bader', 'chgdiff')
+            req = [str(k).strip().lower() for k in (kinds or []) if str(k).strip()]
+            picks = [k for k in valid if k in req]        # 保序去重、只留合法
+            skipped = [{'kind': k, 'reason': '不支持的静态类型(仅 pdos/bader/chgdiff)'}
+                       for k in req if k not in valid]
+            if not picks:
+                return {'ok': False, 'jobs': [], 'skipped': skipped,
+                        'error': '未选择有效的静态类型(pdos/bader/差分电荷)'}
+            base = os.path.basename(os.path.normpath(d))
+            parent = (out_root or '').strip() or os.path.dirname(os.path.normpath(d))
+            es = self._es()
+            jobs = []
+            for kind in picks:
+                out_dir = os.path.join(parent, f'{base}_st_{kind}')
+                try:
+                    res = es.build_static_job(d, out_dir, purpose=kind)
+                except Exception as e:                    # noqa: BLE001 单类失败隔离
+                    skipped.append({'kind': kind, 'reason': str(e)})
+                    continue
+                warnings = list(res.get('warnings') or [])
+                try:
+                    self._ledger.register(res['out_dir'])
+                except Exception as e:                    # noqa: BLE001
+                    warnings.append(f'台账登记失败:{e}')
+                jobs.append({'kind': kind, 'job_dir': res['out_dir'],
+                             'changes': list(res.get('changes') or []),
+                             'warnings': warnings})
+            return {'ok': bool(jobs), 'jobs': jobs, 'skipped': skipped, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'jobs': [], 'skipped': [], 'error': str(e)}
+
+    # ── SAC 批量建模(生成页) ───────────────────────────────────────────────────
+    def molecule_list(self):
+        """内置分子库清单(SAC 吸附质 chips 取此)→
+        {'ok','molecules':[{name,formula,spin_hint}],'error'}。"""
+        try:
+            mols = self._sac().molecules
+            out = []
+            for n in mols.list_molecules():
+                try:
+                    info = mols.molecule_info(n)
+                except Exception:                         # noqa: BLE001
+                    info = {}
+                out.append({'name': n, 'formula': info.get('formula') or n,
+                            'spin_hint': info.get('spin_hint')})
+            return {'ok': True, 'molecules': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'molecules': [], 'error': str(e)}
+
+    def sac_matrix_preview(self, metals, templates, adsorbates,
+                           sites_mode='all', rotations=1):
+        """SAC 候选矩阵预览 →
+        {'ok','n_slabs','n_configs','n_total_jobs','estimate_note','names','error'}。
+
+        金属 × 模板 × 吸附质 × 位点 × 取向。位点数按模板配位(与金属无关),故每模板建一
+        样本 SAC 数位点。机时为粗估(Σ原子数 × 系数),文案注明"粗估"。
+        """
+        empty = {'ok': False, 'n_slabs': 0, 'n_configs': 0, 'n_total_jobs': 0,
+                 'estimate_note': '', 'names': []}
+        try:
+            metals = [str(m).strip() for m in (metals or []) if str(m).strip()]
+            templates = [str(t).strip() for t in (templates or []) if str(t).strip()]
+            adsorbates = [str(a).strip() for a in (adsorbates or []) if str(a).strip()]
+            if not metals or not templates:
+                return {**empty, 'error': '请至少选择一个金属与一个模板'}
+            sac = self._sac()
+            rots = self._rotations_tuple(rotations)
+            n_rot = len(rots)
+            n_sites_by_t, natoms_by_t = {}, {}
+            for t in templates:
+                built = sac.sac_builder.build_sac(t, metals[0])
+                sites = sac.sites.enumerate_sac_sites(
+                    built['poscar'], built['site_indices'])
+                n_sites_by_t[t] = len(self._filter_sites(sites, sites_mode))
+                natoms_by_t[t] = self._poscar_natoms(built['poscar'])
+            n_slabs = len(metals) * len(templates)
+            n_ads = len(adsorbates)
+            n_configs = sum(len(metals) * n_sites_by_t[t] * n_ads * n_rot
+                            for t in templates)
+            n_total = n_slabs + n_configs
+            names = [f'{metal}@{t}_clean' for metal in metals for t in templates]
+            names += [f'{metal}@{t}_ads_{ads}'
+                      for metal in metals for t in templates for ads in adsorbates]
+            names = names[:20]
+            total_atoms = sum(
+                len(metals) * natoms_by_t[t] * (1 + n_sites_by_t[t] * n_ads * n_rot)
+                for t in templates)
+            est = round(total_atoms * _SAC_EST_COEF)
+            estimate_note = (
+                f'粗估机时 ≈ {est} 核时(按 Σ原子数({total_atoms})× {_SAC_EST_COEF} '
+                f'核时·原子⁻¹ 粗估:{n_slabs} 清洁面 + {n_configs} 吸附构型作业);'
+                f'仅数量级参考,实际随体系/收敛差异大。')
+            return {'ok': True, 'n_slabs': n_slabs, 'n_configs': n_configs,
+                    'n_total_jobs': n_total, 'estimate_note': estimate_note,
+                    'names': names, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {**empty, 'error': str(e)}
+
+    def sac_matrix_generate(self, metals, templates, adsorbates, sites_mode='all',
+                            rotations=1, incar_path='', out_root=''):
+        """SAC 候选矩阵生成:逐个 build_sac → 清洁 slab 作业 + 每个吸附构型作业(用
+        job_builder 四件套链,INCAR 用用户提供的)→ 入台账;按 slab 建吸附能项目(清洁面
+        + 构型族);引擎可用则同步注册 campaign(记预估机时)。
+
+        返回 {'ok','created','project_paths','skipped','campaign','error'}。
+        """
+        try:
+            metals = [str(m).strip() for m in (metals or []) if str(m).strip()]
+            templates = [str(t).strip() for t in (templates or []) if str(t).strip()]
+            adsorbates = [str(a).strip() for a in (adsorbates or []) if str(a).strip()]
+            incar = (incar_path or '').strip()
+            root = (out_root or '').strip()
+            errs = []
+            if not metals or not templates:
+                errs.append('请至少选择一个金属与一个模板')
+            if not incar or not os.path.isfile(incar):
+                errs.append('共享 INCAR 不存在')
+            if not root:
+                errs.append('未选输出根目录')
+            if errs:
+                return {'ok': False, 'created': 0, 'project_paths': [],
+                        'skipped': [], 'campaign': None, 'error': ';'.join(errs)}
+            lib = ''
+            try:
+                lib = self._config.load_config().get('potcar_lib_root', '') or ''
+            except Exception:                             # noqa: BLE001
+                pass
+            sac = self._sac()
+            rots = self._rotations_tuple(rotations)
+            created, project_paths, skipped, tasks = 0, [], [], []
+            for metal in metals:
+                for template in templates:
+                    label = f'{metal}@{template}'
+                    try:
+                        built = sac.sac_builder.build_sac(template, metal)
+                    except Exception as e:                # noqa: BLE001 单体系建模失败隔离
+                        skipped.append({'name': label, 'reason': f'建模失败:{e}'})
+                        continue
+                    base = f'{metal}_{template}'.replace('+', 'p')
+                    proj_root = os.path.join(root, base)
+                    try:
+                        cdir, _cw = self._job_from_text(
+                            built['poscar'], incar,
+                            os.path.join(proj_root, f'{base}_clean'), lib)
+                    except Exception as e:                # noqa: BLE001
+                        skipped.append({'name': f'{label} 清洁面', 'reason': str(e)})
+                        continue
+                    created += 1
+                    # 配方注记:标记 SAC 石墨烯来源(层厚收敛据此给「单层无层厚」针对性说明)
+                    self._annotate_recipe(cdir, {'kind': 'sac', 'template': template,
+                                                 'metal': metal})
+                    tasks.append({'id': os.path.basename(cdir), 'dir': cdir,
+                                  'natoms': self._poscar_natoms(built['poscar'])})
+                    try:
+                        sites = self._filter_sites(sac.sites.enumerate_sac_sites(
+                            built['poscar'], built['site_indices']), sites_mode)
+                    except Exception as e:                # noqa: BLE001
+                        skipped.append({'name': f'{label} 位点', 'reason': str(e)})
+                        sites = []
+                    config_dirs = []
+                    for ads in adsorbates:
+                        for site in sites:
+                            try:
+                                texts = sac.sites.place_adsorbate(
+                                    built['poscar'], ads, site, rotations=rots)
+                            except Exception as e:        # noqa: BLE001 拒绝/失败隔离
+                                skipped.append(
+                                    {'name': f'{ads}@{site.get("name")}',
+                                     'reason': str(e)})
+                                continue
+                            for i, text in enumerate(texts):
+                                deg = rots[i] if i < len(rots) else i
+                                cfg_dir = os.path.join(
+                                    proj_root,
+                                    f'{base}_ads_{ads}_{site.get("name")}_r{deg}')
+                                try:
+                                    jd, _w = self._job_from_text(text, incar,
+                                                                 cfg_dir, lib)
+                                except Exception as e:    # noqa: BLE001
+                                    skipped.append(
+                                        {'name': os.path.basename(cfg_dir),
+                                         'reason': str(e)})
+                                    continue
+                                self._annotate_recipe(
+                                    jd, {'kind': 'sac', 'template': template,
+                                         'metal': metal, 'adsorbate': ads})
+                                config_dirs.append(jd)
+                                tasks.append({'id': os.path.basename(jd), 'dir': jd,
+                                              'natoms': self._poscar_natoms(text)})
+                                created += 1
+                    if config_dirs:
+                        pp = self._save_sac_project(base, proj_root, cdir, config_dirs)
+                        if pp:
+                            project_paths.append(pp)
+            campaign = self._register_sac_campaign(root, tasks)
+            return {'ok': True, 'created': created, 'project_paths': project_paths,
+                    'skipped': skipped, 'campaign': campaign, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'created': 0, 'project_paths': [],
+                    'skipped': [], 'campaign': None, 'error': str(e)}
+
+    def _save_sac_project(self, name, proj_root, clean_dir, config_dirs):
+        """按 slab 建吸附能项目(清洁面 + 构型族)并登记注册表 → project.yaml 路径|None。"""
+        try:
+            proj = {'name': name, 'root': proj_root, 'work_mode': 'lis',
+                    'members': {'clean_slab': clean_dir, 'gas_ref': None,
+                                'configs': list(config_dirs)}}
+            self._adsorption.save_project(proj_root, proj)
+            pp = os.path.join(proj_root, 'project.yaml')
+            try:
+                self._adsorption.register_project(pp)
+            except Exception:                             # noqa: BLE001 注册失败不致命
+                pass
+            return pp
+        except Exception:                                 # noqa: BLE001 建项目失败不拖垮生成
+            return None
+
+    def _register_sac_campaign(self, root, tasks):
+        """引擎可用则为本批生成注册 campaign(每作业一任务节点 + 记预估机时)→ 目录|None。
+
+        campaign 不可用/失败一律降级为 None,绝不拖垮生成。
+        """
+        if not tasks:
+            return None
+        try:
+            cmp = self._cmp()
+        except ImportError:
+            return None
+        try:
+            cid = 'sac-' + time.strftime('%Y%m%d-%H%M%S')
+            nodes = [cmp.new_task(t['id'], 'relax', job_dir=t['dir']) for t in tasks]
+            camp = cmp.init_campaign(
+                root, cid, tasks=nodes, title=f'SAC 批量建模 {len(tasks)} 作业',
+                hypothesis='SAC 候选矩阵筛选')
+            cdir = camp['dir']
+            for t in tasks:
+                try:
+                    est = cmp.estimate_job(t.get('natoms', 1), 1, 'relax', 32)
+                    cmp.record_estimate(cdir, t['id'], est)
+                except Exception:                         # noqa: BLE001 单条预估失败跳过
+                    continue
+            self._register_campaign_dir(cdir)
+            return cdir
+        except Exception:                                 # noqa: BLE001 注册失败降级
+            return None
+
+    def _register_campaign_dir(self, cdir):
+        """把 campaign 目录记入 config ui.campaign_dirs(供仪表盘 campaign_list 发现)。"""
+        try:
+            ui = self._config.get_ui_state()
+            dirs = list((ui or {}).get('campaign_dirs') or [])
+            if cdir not in dirs:
+                dirs.append(cdir)
+                self._config.set_ui_state(campaign_dirs=dirs)
+        except Exception:                                 # noqa: BLE001 记不进注册表不致命
+            pass
+
+    # ── 金属 slab 建模(结构建模页;层厚收敛的可再生入口,Backlog #2) ────────────────
+    def metal_slab_catalog(self):
+        """支持的(结构,晶面)组合 + 晶格常数初猜表 → {'ok','surfaces','guess','error'}。
+
+        guess 为**实验值初猜**表(发表口径须同泛函 EOS/晶胞优化),前端用于自动回填。
+        """
+        try:
+            ms = self._msl()
+            return {'ok': True, 'surfaces': ms.supported_surfaces(),
+                    'guess': ms.LATTICE_GUESS, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'surfaces': [], 'guess': {}, 'error': str(e)}
+
+    def _annotate_recipe(self, job_dir, recipe):
+        """把可再生配方并入 job.yaml 的 inputs.recipe → 是否成功(失败不抛,由调用方记 warning)。"""
+        try:
+            m = self._manifest.load_manifest(job_dir)
+            if not m:
+                return False
+            inputs = dict(m.get('inputs') or {})
+            inputs['recipe'] = dict(recipe or {})
+            m['inputs'] = inputs
+            self._manifest.save_manifest(job_dir, m)
+            return True
+        except Exception:                                 # noqa: BLE001
+            return False
+
+    def metal_slab_build(self, element, structure, miller, layers, a=None, c=None,
+                         nx=3, ny=3, vacuum=15.0, fix_bottom=0, incar_path=None,
+                         out_dir=None):
+        """建金属 slab 作业(fcc/bcc/hcp 低指数面)——层厚收敛的**可再生入口**。
+
+        - 给 INCAR → 四件套链 + job.yaml + 入台账(同 SAC 矩阵口径);不给 → 仅写
+          POSCAR + job.yaml,提示到②生成输入页补全(不假装是完整作业)。
+        - job.yaml inputs.recipe 记全部构造参数:之后从该作业派生 conv_thickness 时
+          可由配方再生不同层数 slab(不再诚实报错,见 _thickness_builder_from_job)。
+        返回 {'ok','job_dir','poscar','description','natoms','warnings','error'}。
+        """
+        try:
+            d = (out_dir or '').strip()
+            if not d:
+                return {'ok': False, 'job_dir': None, 'poscar': '', 'description': '',
+                        'natoms': 0, 'warnings': [], 'error': '未指定输出目录'}
+            inc = (incar_path or '').strip()
+            if inc and not os.path.isfile(inc):
+                return {'ok': False, 'job_dir': None, 'poscar': '', 'description': '',
+                        'natoms': 0, 'warnings': [], 'error': f'INCAR 不存在:{inc}'}
+            ms = self._msl()
+            built = ms.build_metal_slab(
+                element, structure, miller, int(layers or 4),
+                a=(float(a) if a not in (None, '') else None),
+                c=(float(c) if c not in (None, '') else None),
+                nx=int(nx or 3), ny=int(ny or 3), vacuum=float(vacuum or 15.0),
+                fix_bottom=int(fix_bottom or 0))
+            warnings = list(built['warnings'])
+            if inc:
+                lib = ''
+                try:
+                    lib = self._config.load_config().get('potcar_lib_root', '') or ''
+                except Exception:                         # noqa: BLE001
+                    pass
+                job_dir, w2 = self._job_from_text(built['poscar'], inc, d, lib)
+                warnings += list(w2 or [])
+            else:
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, 'POSCAR'), 'w', encoding='utf-8') as f:
+                    f.write(built['poscar'])
+                m = self._manifest.new_manifest(
+                    job_id=os.path.basename(os.path.normpath(d)),
+                    system=built['poscar'].splitlines()[0].strip(),
+                    task_type='relax', calc_type='slab',
+                    inputs={'natoms': built['natoms']}, warnings=warnings)
+                self._manifest.save_manifest(d, m)
+                job_dir = d
+                warnings.append('未给 INCAR:仅写出 POSCAR 与 job.yaml(含可再生配方);'
+                                '请到「②生成输入」页补全 INCAR/KPOINTS/POTCAR。')
+            if not self._annotate_recipe(job_dir, built['recipe']):
+                warnings.append('配方写入 job.yaml 失败:层厚收敛派生将退回诚实报错路径。')
+            return {'ok': True, 'job_dir': job_dir, 'poscar': built['poscar'],
+                    'description': built['description'], 'natoms': built['natoms'],
+                    'warnings': warnings, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'job_dir': None, 'poscar': '', 'description': '',
+                    'natoms': 0, 'warnings': [], 'error': str(e)}
+
+    def _thickness_builder_from_job(self, job_dir):
+        """作业 job.yaml 的 inputs.recipe → (slab_builder_fn|None, 针对性中文说明|None)。
+
+        metal_slab 配方 → 层数再生器(层厚收敛真跑);sac 配方 → 单层无层厚概念的针对性
+        说明;无配方 → (None, None)(走 conv_scan 默认诚实 note);配方损坏 → 错误说明。
+        """
+        try:
+            m = self._manifest.load_manifest(job_dir)
+        except Exception:                                 # noqa: BLE001
+            m = None
+        inputs = (m or {}).get('inputs')
+        recipe = inputs.get('recipe') if isinstance(inputs, dict) else None
+        if not isinstance(recipe, dict) or not recipe:
+            return None, None
+        kind = recipe.get('kind')
+        if kind == 'sac':
+            return None, ('该作业来自石墨烯 SAC 建模:单层二维基底没有「层厚」概念,'
+                          '层厚收敛不适用;可改做超胞尺寸(nx×ny)或真空层收敛。')
+        if kind != 'metal_slab':
+            return None, f'job.yaml 配方 kind={kind!r} 未知,无法再生不同层数 slab。'
+        try:
+            return self._msl().slab_builder_from_recipe(recipe), None
+        except Exception as e:                            # noqa: BLE001
+            return None, f'配方无法再生 slab:{e}'
+
+    # ── 多自旋并跑(生成页 / 作业页) ────────────────────────────────────────────
+    def spin_family_generate(self, poscar, incar, out_root):
+        """多自旋并跑(F3):结构+INCAR → NM/LS/HS 家族作业组(spin_scan)→ 入台账。
+
+        返回 {'ok','variants':[{name,job_dir,magmom,changes,warnings}],'error'}。
+        """
+        try:
+            pos = (poscar or '').strip()
+            inc = (incar or '').strip()
+            root = (out_root or '').strip()
+            errs = []
+            if not pos or not os.path.isfile(pos):
+                errs.append('POSCAR 文件不存在')
+            if not inc or not os.path.isfile(inc):
+                errs.append('INCAR 文件不存在')
+            if not root:
+                errs.append('未选输出根目录')
+            if errs:
+                return {'ok': False, 'variants': [], 'error': ';'.join(errs)}
+            lib = ''
+            try:
+                lib = self._config.load_config().get('potcar_lib_root', '') or ''
+            except Exception:                             # noqa: BLE001
+                pass
+            base_name = os.path.splitext(os.path.basename(pos))[0] or 'spin'
+            with tempfile.TemporaryDirectory() as td:
+                base_dir = os.path.join(td, base_name)
+                payload = self._job_builder.build_job_dir(
+                    pos, inc, base_dir, calc_type='slab', lib_root=(lib or None))
+                try:
+                    self._manifest.create_from_build(
+                        payload['out_dir'], payload, poscar_path=pos, validate=True)
+                except Exception:                         # noqa: BLE001 基座 manifest 失败不致命
+                    pass
+                variants = self._sp().build_spin_variants(base_dir, root)
+            out = []
+            for v in variants:
+                warnings = list(v.get('warnings') or [])
+                try:
+                    self._ledger.register(v['out_dir'])
+                except Exception as e:                    # noqa: BLE001
+                    warnings.append(f'台账登记失败:{e}')
+                out.append({'name': v.get('name'), 'job_dir': v.get('out_dir'),
+                            'magmom': v.get('magmom'),
+                            'changes': list(v.get('changes') or []),
+                            'warnings': warnings})
+            return {'ok': True, 'variants': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'variants': [], 'error': str(e)}
+
+    def spin_family_compare(self, dirs):
+        """同家族(_nm/_ls/_hs)全 DONE 后判自旋基态 + 磁矩审计(spin_scan)。
+
+        返回 {'ok','ground'(pick_ground_state 结果),'audits':[{dir,name,...}],'error'}。
+        """
+        try:
+            dirs = [str(d).strip() for d in (dirs or []) if str(d).strip()]
+            if not dirs:
+                return {'ok': False, 'ground': None, 'audits': [],
+                        'error': '未提供作业目录'}
+            sp = self._sp()
+            ground = sp.pick_ground_state(dirs)
+            audits = []
+            for d in dirs:
+                name = os.path.basename(os.path.normpath(d))
+                outcar_path = os.path.join(d, 'OUTCAR')
+                if not os.path.isfile(outcar_path):
+                    audits.append({'dir': d, 'name': name, 'audited': False,
+                                   'warning': '缺 OUTCAR,无法审计磁矩'})
+                    continue
+                with open(outcar_path, 'r', encoding='utf-8', errors='replace') as f:
+                    outcar = f.read()
+                m = self._manifest.load_manifest(d) or {}
+                init = (m.get('inputs') or {}).get('spin_magmom')
+                a = self._sp().audit_magmom(outcar, init)
+                audits.append({'dir': d, 'name': name, **a})
+            result = {'ok': True, 'ground': ground, 'audits': audits, 'error': None}
+            try:
+                from vcstudio.project import special_report
+                parent = os.path.dirname(os.path.normpath(dirs[0]))
+                result['report_file'] = special_report.write(
+                    '多自旋态比较报告', result, dirs,
+                    os.path.join(parent, 'vcstudio-spin-comparison-report.html'))
+            except Exception as report_error:             # noqa: BLE001
+                result['report_file'] = None
+                result['report_error'] = str(report_error)
+            return result
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'ground': None, 'audits': [], 'error': str(e)}
+
+    # ── 通用反应预设(项目页 ΔG 台阶) ──────────────────────────────────────────
+    def reaction_presets(self, scenario_key=None):
+        """通用反应预设 → {'ok','presets':[{key,name,description}],'error'}(供 ΔG 台阶下拉)。"""
+        try:
+            presets = self._rx().list_presets()
+            keys = list(presets)
+            if scenario_key:
+                sc = self._scenarios.get_scenario(str(scenario_key))
+                keys = [key for key in (sc.get('reaction_presets') or []) if key in presets]
+            out = [{'key': key, 'name': presets[key].get('name') or key,
+                    'description': presets[key].get('description') or ''}
+                   for key in keys]
+            return {'ok': True, 'presets': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'presets': [], 'error': str(e)}
+
+    # ── campaign 最小接线(仪表盘) ─────────────────────────────────────────────
+    def campaign_list(self):
+        """仪表盘批次(campaign)统计 → {'ok','available','campaigns':[...],'error'}。
+
+        每个 campaign {name,dir,n_tasks,states:{completed,validated,accepted}(累计口径,
+        completed⊇validated⊇accepted),budget:{estimated,cap}}。campaign 模块不可用/无批次
+        → available=False 或空列表(前端据此隐藏区块)。全程 try/except 降级,绝不拖垮仪表盘。
+        """
+        try:
+            try:
+                cmp = self._cmp()
+            except ImportError:
+                return {'ok': True, 'available': False, 'campaigns': [], 'error': None}
+            try:
+                ui = self._config.get_ui_state()
+            except Exception:                             # noqa: BLE001
+                ui = {}
+            dirs = list((ui or {}).get('campaign_dirs') or [])
+            campaigns = []
+            for cdir in dirs:
+                try:
+                    camp = cmp.load_campaign(cdir)
+                    if camp is None:
+                        continue
+                    summary = cmp.progress_summary(camp)
+                    acc = int(summary.get('accepted', 0) or 0)
+                    val = int(summary.get('validated', 0) or 0) + acc
+                    comp = int(summary.get('completed', 0) or 0) + val
+                    meta = camp.get('meta') or {}
+                    try:
+                        bud = cmp.load_budget(cdir)
+                        estimated = round(float(sum(
+                            float(v or 0.0)
+                            for v in (bud.get('estimates') or {}).values())), 2)
+                    except Exception:                     # noqa: BLE001 预算读失败给 0
+                        estimated = 0.0
+                    campaigns.append({
+                        'name': meta.get('title') or meta.get('id')
+                        or os.path.basename(str(cdir)),
+                        'dir': cdir,
+                        'n_tasks': int(summary.get('total', 0) or 0),
+                        'states': {'completed': comp, 'validated': val,
+                                   'accepted': acc},
+                        'budget': {'estimated': estimated,
+                                   'cap': meta.get('budget_core_hours')},
+                    })
+                except Exception:                         # noqa: BLE001 单个坏 campaign 跳过
+                    continue
+            return {'ok': True, 'available': True, 'campaigns': campaigns,
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'available': False, 'campaigns': [], 'error': str(e)}
+
+    # ── 研究场景(界面裁剪:显隐页面/卡片/图型/引擎/反应预设) ────────────────────
+    @staticmethod
+    def _scenario_view(sc):
+        """场景 dict → 前端消费视图(JSON-safe;含显隐判定所需全部键)。"""
+        return {
+            'key': sc.get('key'), 'name': sc.get('name'),
+            'description': sc.get('description'),
+            'pages': list(sc.get('pages') or []),
+            'cards': sc.get('cards') or {},
+            'figure_preset_order': list(sc.get('figure_preset_order') or []),
+            'reaction_presets': list(sc.get('reaction_presets') or []),
+            'engines': list(sc.get('engines') or []),
+            'defaults': sc.get('defaults') or {},
+            'ai_context': sc.get('ai_context') or '',
+            'primary': bool(sc.get('primary', False)),
+            'task_keys': list(sc.get('task_keys') or []),
+            'home_actions': list(sc.get('home_actions') or []),
+        }
+
+    def scenario_list(self):
+        """全部内置研究场景(展示序)→ {'ok','scenarios':[view...],'error'}(首启场景选择模态用)。"""
+        try:
+            out = [self._scenario_view(s) for s in self._scenarios.list_scenarios()]
+            return {'ok': True, 'scenarios': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'scenarios': [], 'error': str(e)}
+
+    def scenario_get(self):
+        """当前生效场景 + 是否已显式配置(config 无 ui.scenario → configured=False,首启弹模态)。"""
+        try:
+            try:
+                cfg = self._config.load_config()
+            except Exception:                             # noqa: BLE001
+                cfg = {}
+            ui = self._config.get_ui_state(cfg)
+            configured = bool(isinstance(ui, dict) and ui.get('scenario'))
+            sc = self._scenarios.active_scenario(cfg)
+            return {'ok': True, 'configured': configured,
+                    'scenario': self._scenario_view(sc), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'configured': False, 'scenario': None, 'error': str(e)}
+
+    def scenario_set(self, key):
+        """切换研究场景(写 config ui.scenario)→ 返回新场景视图供前端即时 applyScenario。"""
+        try:
+            k = (key or '').strip()
+            known = {str(s.get('key')) for s in self._scenarios.list_scenarios()}
+            if k not in known:
+                return {'ok': False, 'scenario': None,
+                        'error': f'未知工作模式 {k!r}；可选：{", ".join(sorted(known))}'}
+            self._scenarios.set_scenario(k)
+            sc = self._scenarios.get_scenario(k)
+            return {'ok': True, 'key': sc.get('key'),
+                    'scenario': self._scenario_view(sc), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'scenario': None, 'error': str(e)}
+
+    def calculation_get(self):
+        """当前“本次计算类型”。同时受工作模式与当前引擎能力白名单约束。"""
+        try:
+            cfg = self._config.load_config()
+            ui = self._config.get_ui_state(cfg)
+            sc = self._scenarios.active_scenario(cfg)
+            registered = [self._normalize_engine_key(e)
+                          for e in self._eng().available_engines()]
+            engine = self._active_engine(sc, ui, registered)
+            allowed = self._engine_task_keys(engine, sc)
+            requested = str((ui or {}).get('active_calculation') or '')
+            default = str((sc.get('defaults') or {}).get('active_calculation') or '')
+            active = requested if requested in allowed else default
+            if active not in allowed:
+                active = allowed[0] if allowed else ''
+            return {'ok': True, 'configured': requested in allowed,
+                    'engine': engine, 'active_calculation': active,
+                    'allowed': allowed, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'configured': False, 'active_calculation': '',
+                    'engine': 'vasp', 'allowed': [], 'error': str(e)}
+
+    def calculation_set(self, key):
+        """保存本次计算类型；必须同时属于当前工作模式与当前引擎能力白名单。"""
+        try:
+            k = str(key or '').strip()
+            cfg = self._config.load_config()
+            ui = self._config.get_ui_state(cfg)
+            sc = self._scenarios.active_scenario(cfg)
+            registered = [self._normalize_engine_key(e)
+                          for e in self._eng().available_engines()]
+            engine = self._active_engine(sc, ui, registered)
+            allowed = self._engine_task_keys(engine, sc)
+            if k not in allowed:
+                return {'ok': False, 'active_calculation': None,
+                        'engine': engine,
+                        'error': (f'计算类型 {k!r} 不适用于「{sc.get("name", "")} / '
+                                  f'{self._ENGINE_DISPLAY.get(engine, engine)}」')}
+            self._config.set_ui_state(active_calculation=k)
+            return {'ok': True, 'engine': engine,
+                    'active_calculation': k, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'engine': None,
+                    'active_calculation': None, 'error': str(e)}
+
+    # ── 界面语言(i18n:zh 基准 + en 回落) ──────────────────────────────────────
+    def lang_get(self):
+        """当前界面语言 + 可选语言列表 → {'ok','lang','available','error'}。"""
+        try:
+            try:
+                cfg = self._config.load_config()
+            except Exception:                             # noqa: BLE001
+                cfg = {}
+            return {'ok': True, 'lang': self._i18n.current_lang(cfg),
+                    'available': self._i18n.available_langs(), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'lang': 'zh', 'available': [], 'error': str(e)}
+
+    def lang_set(self, lang):
+        """切换界面语言(写 config ui.lang);前端据返回值重拉 i18n_dict 换文案。"""
+        try:
+            lg = (lang or '').strip() or 'zh'
+            self._i18n.set_lang(lg)
+            return {'ok': True, 'lang': lg, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def i18n_dict(self, lang):
+        """某语言的完整词典(回落补齐后)→ {'ok','lang','dict','error'};供前端一次性注入替换。"""
+        try:
+            lg = (lang or '').strip() or 'zh'
+            return {'ok': True, 'lang': lg,
+                    'dict': self._i18n.export_for_js(lg), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'lang': lang, 'dict': {}, 'error': str(e)}
+
+    # ── 论文出图:图表预设画廊 + 一键出图(数据后端装配) ───────────────────────
+    def figure_presets(self):
+        """图表预设清单(含缩略 SVG + 参数 schema)→ 论文出图页画廊按分类渲染。"""
+        try:
+            fp = self._figpresets
+            presets = []
+            for p in fp.list_presets():
+                key = p.get('key')
+                try:
+                    thumb = fp.get_preset(key).get('thumbnail_svg', '')
+                except Exception:                         # noqa: BLE001 缩略缺失不致命
+                    thumb = ''
+                presets.append({
+                    'key': key, 'name': p.get('name'), 'category': p.get('category'),
+                    'description': p.get('description', ''),
+                    'required_data': p.get('required_data', ''),
+                    'thumbnail_svg': thumb,
+                    'params_schema': p.get('params_schema') or {},
+                })
+            return {'ok': True, 'presets': presets,
+                    'categories': fp.categories(), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'presets': [], 'categories': [], 'error': str(e)}
+
+    def render_figure_preset(self, key, project_path, params=None):
+        """按图表预设 + 当前项目出图:后端从项目数据装配 → figure_presets.render_preset 出图。
+
+        能量学类(柱/表/热图)取 delta_e_rows 的已完成 ΔE;台阶图取 freeenergy/reactions 路径
+        (params.reaction_preset 为空 → Li-S 放电,向后兼容);标度/火山需多催化剂对比、电子结构/
+        NEB/差分电荷需专门解析产物 → 项目层无从组装,返回中文 skipped 原因(绝不假装出图)。
+        返回 {'ok','files','skipped':[{kind,reason}],'out_dir','provenance','error'}。
+        """
+        empty = {'ok': True, 'files': [], 'skipped': [], 'out_dir': None,
+                 'provenance': None, 'error': None}
+        try:
+            k = str(key or '').strip()
+            params = dict(params or {})
+            fp = self._figpresets
+            try:
+                fp.get_preset(k)                          # 校验预设 key 存在(未知即抛)
+            except Exception:                             # noqa: BLE001 未知预设
+                return {**empty, 'ok': False, 'error': f'未知图表预设:{k}'}
+            # 需专门解析产物的图型(电子结构/NEB/差分电荷/收敛):项目层无从组装 → skipped
+            if k in _FIG_NEEDS_PARSE:
+                return {**empty, 'skipped': [{'kind': k, 'reason': _FIG_NEEDS_PARSE[k]}]}
+            # 标度/火山:单项目无法出(需多催化剂横比)→ skipped 明说去④页多项目对比
+            if k in _FIG_MULTI:
+                return {**empty, 'skipped': [{'kind': k,
+                        'reason': '标度关系/火山图需多催化剂横向对比(≥3 组);'
+                                  '请在④结果分析页用「多项目对比」出图。'}]}
+            proj = self._adsorption.load_project((project_path or '').strip())
+            if proj is None:
+                return {**empty, 'ok': False,
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            reaction_preset = params.pop('reaction_preset', None) or None
+            save_to = (params.pop('save_to', None) or '').strip()
+            shorts, des, summary = self._proj_delta_data(proj)
+            pname = str(proj.get('name') or '') or '项目'
+            out_dir = save_to or os.path.join(
+                str(proj.get('root') or os.path.dirname(str(project_path))), 'figures')
+
+            data, skipped = None, None
+            if k in _FIG_FROM_DELTA:
+                done = [(s, d) for s, d in zip(shorts, des) if d is not None]
+                if not done:
+                    skipped = '无已完成的 ΔE(需构型 + 清洁表面 + 参考全 DONE)'
+                elif k == 'delta_e_heatmap':
+                    data = {'rows': [pname], 'cols': [s for s, _ in done],
+                            'values': [[d for _, d in done]]}
+                else:
+                    data = {'adsorbates': [s for s, _ in done],
+                            'substrates': {pname: [d for _, d in done]}}
+            elif k in _FIG_LADDER:
+                if reaction_preset:
+                    fed, reason, ptitle = self._proj_fed_preset(
+                        proj, summary, reaction_preset)
+                else:
+                    fed, reason = self._proj_fed(proj, summary)
+                    ptitle = 'Li-S discharge path'
+                if fed is None:
+                    skipped = reason
+                else:
+                    data = {'paths': [{'name': pname,
+                                       'G': [st['G'] for st in fed['steps']]}],
+                            'step_labels': [st['label'] for st in fed['steps']],
+                            'pds_index': fed.get('pds_index')}
+                    params.setdefault('title', ptitle)
+            else:
+                skipped = '该预设暂不支持从项目数据一键出图'
+
+            if skipped is not None:
+                return {**empty, 'skipped': [{'kind': k, 'reason': skipped}]}
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, k + '.png')
+            files = fp.render_preset(k, data, out_path, **params)
+            prov = None
+            try:
+                prov = fp.preset_provenance(
+                    k, {'project': pname, 'source': 'delta_e_rows'}, params=params)
+            except Exception:                             # noqa: BLE001 溯源失败不挡出图
+                prov = None
+            return {'ok': True, 'files': list(files), 'skipped': [],
+                    'out_dir': out_dir, 'provenance': prov, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {**empty, 'ok': False, 'error': str(e)}
+
+    # ── 一键成稿包(Draft-Ready 收尾流水线) ────────────────────────────────────
+    def draft_ready(self, path, out):
+        """一键成稿包:SI zip + 三线表 + 口径稽核 + Methods → {'ok','summary','issues','products'}。
+
+        稽核不过/SI 缺关键输入仍产全套工件但 ok=False(DRAFT_READY.md 首行醒目);products 汇
+        总全部落盘文件供前端列出 + open_dir。
+        """
+        try:
+            proj = self._adsorption.load_project((path or '').strip())
+            if proj is None:
+                return {'ok': False, 'summary': None, 'issues': [], 'products': [],
+                        'issues_total': 0, 'summary_path': None, 'out_dir': None,
+                        'error': '项目不存在或 project.yaml 已被移动'}
+            o = (out or '').strip()
+            if not o:
+                return {'ok': False, 'summary': None, 'issues': [], 'products': [],
+                        'issues_total': 0, 'summary_path': None, 'out_dir': None,
+                        'error': '未指定成稿包输出目录'}
+            res = self._dp().draft_ready(proj, o)
+            report = res.get('report') or {}
+            products = []
+            si = report.get('si_package') or {}
+            if si.get('zip_path'):
+                products.append(si['zip_path'])
+            products += list((report.get('tables') or {}).get('files') or [])
+            products += list((report.get('methods') or {}).get('files') or [])
+            if res.get('summary_path'):
+                products.append(res['summary_path'])
+            return {'ok': bool(res.get('ok')), 'summary': res.get('summary'),
+                    'issues': list(res.get('issues') or []),
+                    'issues_total': int(res.get('issues_total', 0) or 0),
+                    'products': products, 'summary_path': res.get('summary_path'),
+                    'out_dir': o, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'summary': None, 'issues': [], 'products': [],
+                    'issues_total': 0, 'summary_path': None, 'out_dir': None,
+                    'error': str(e)}
+
+    # ── AI 助手:论文 → 规格表 → 计划 → 实例化(转发 ai_paper) ─────────────────
+    def ai_extract(self, source, transport=None):
+        """论文/文本 → 可编辑规格表(LLM 只抽文本 + 每格带出处;allow_external 门在引擎内)。
+
+        返回 {'ok','spec','issues','error'};transport 沿用 ai_analysis(测试注入假件离线可测)。
+        """
+        try:
+            res = self._aip().extract_spec(source, transport=transport)
+            return {'ok': bool(res.get('ok')), 'spec': res.get('spec'),
+                    'issues': list(res.get('issues') or []),
+                    'error': res.get('error')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'spec': None, 'issues': [], 'error': str(e)}
+
+    def ai_plan(self, spec):
+        """规格表 → 实例化计划(纯计划对象,不落盘)→ {'ok','plan','jobs_estimate','est_core_hours'}。
+
+        est_core_hours 经 dry-run instantiate 取机时预算闸估值(不写盘);warnings 透传计划告警。
+        """
+        try:
+            res = self._aip().plan_campaign(spec)
+            plan = res.get('plan') or {}
+            est = None
+            try:
+                dry = self._aip().instantiate(plan, '(dry-run)', dry_run=True)
+                est = ((dry.get('gates') or {}).get('budget') or {}).get(
+                    'estimated_core_hours')
+            except Exception:                             # noqa: BLE001 估值失败不挡计划
+                est = None
+            return {'ok': bool(res.get('ok')), 'plan': plan,
+                    'jobs_estimate': plan.get('jobs_estimate'),
+                    'est_core_hours': est,
+                    'warnings': list(plan.get('warnings') or []), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'plan': None, 'jobs_estimate': 0,
+                    'est_core_hours': None, 'warnings': [], 'error': str(e)}
+
+    def ai_instantiate(self, plan, out_root, opts=None):
+        """计划 → campaign(门禁序列:机时闸 + 单点先行 + 写盘 + 账本;全自动与交互共用)。
+
+        opts 透传 instantiate 的 confirm_token/budget_cap_hours/dry_run 等;成功且非 dry_run 则把
+        campaign 目录记入仪表盘发现表。返回 {'ok','created','campaign_dir','gates','pilot','awaiting'}。
+        """
+        try:
+            root = (out_root or '').strip()
+            if not root:
+                return {'ok': False, 'created': [], 'campaign_dir': None,
+                        'gates': {}, 'error': '未指定输出根目录'}
+            res = self._aip().instantiate(plan, root, **dict(opts or {}))
+            if res.get('campaign_dir') and not res.get('dry_run'):
+                self._register_campaign_dir(res['campaign_dir'])
+            return {'ok': bool(res.get('ok')), 'created': list(res.get('created') or []),
+                    'campaign_dir': res.get('campaign_dir'),
+                    'gates': res.get('gates') or {}, 'pilot': res.get('pilot'),
+                    'awaiting': res.get('awaiting'), 'error': res.get('error')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'created': [], 'campaign_dir': None,
+                    'gates': {}, 'error': str(e)}
+
+    # ── 多引擎适配(生成页引擎选择器) ──────────────────────────────────────────
+    _ENGINE_DISPLAY = {'vasp': 'VASP', 'cp2k': 'CP2K', 'gaussian': 'Gaussian',
+                       'castep': 'CASTEP'}
+    _ENGINE_ALIASES = {
+        'g16': 'gaussian', 'g09': 'gaussian', 'gaussian16': 'gaussian',
+        'materials_studio': 'castep', 'materials studio': 'castep',
+        'ms': 'castep', 'castep/ms': 'castep',
+    }
+    # 这是 Web/API 能力合同，不替代引擎实现。界面只据此展示已经接通“生成→登记→
+    # 提交→回收→能量/收敛解析”的任务和字段，避免把 VASP 专用选项套到其它软件。
+    _ENGINE_CAPABILITIES = {
+        'vasp': {
+            'support_level': 'full',
+            'support_label': '完整工作流',
+            'summary': '主引擎；覆盖完整 VASP 任务目录、四件套、托管与结果工具。',
+            'generic_tasks': None,       # None = 取当前工作模式的完整 task_keys
+            'boundaries': ['periodic', 'molecule'],
+            'fields': ['poscar', 'incar', 'potcar_library', 'calc_type'],
+            'input_contract': 'POSCAR / INCAR / POTCAR / KPOINTS',
+            'result_contract': '按 VASP 任务自动回收 OUTCAR、OSZICAR、vasprun.xml 等关键产物',
+            'limitations': [],
+        },
+        'cp2k': {
+            'support_level': 'file_workflow',
+            'support_label': '文件级工作流',
+            'summary': '生成 cp2k.inp、登记提交并解析 cp2k.out；软件与 GTH 数据文件需自备。',
+            'generic_tasks': ['relax', 'static', 'freq'],
+            'boundaries': ['periodic', 'molecule'],
+            'fields': ['poscar', 'task', 'functional', 'dispersion', 'cutoff_ry',
+                       'rel_cutoff_ry', 'kpoints', 'basis_set_file', 'potential_file',
+                       'periodic', 'spin', 'charge', 'multiplicity'],
+            'input_contract': 'POSCAR → cp2k.inp',
+            'result_contract': 'cp2k.out（总能与收敛状态）',
+            'limitations': [
+                'CUTOFF 是 GTH 密度网格截断（Ry），不能从 VASP ENCUT 换算。',
+                '当前通用适配只开放结构优化、单点能和频率；绝对能量不可跨引擎比较。',
+            ],
+        },
+        'gaussian': {
+            'support_level': 'file_workflow',
+            'support_label': '分子文件级工作流',
+            'summary': '孤立分子专用；生成 .gjf、登记提交并解析 .log。',
+            # 设置页只保留三种通用意图；TD/IRC/扫描/NMR/TS 等在 Gaussian 专属面板
+            # 的唯一任务下拉中选择，避免两个任务选择器互相覆盖。
+            'generic_tasks': ['relax', 'static', 'freq'],
+            'boundaries': ['molecule'],
+            'fields': ['molecule', 'gaussian_task', 'functional', 'basis', 'dispersion',
+                       'solvent', 'charge', 'multiplicity', 'resources'],
+            'input_contract': '分子结构 → Gaussian .gjf',
+            'result_contract': 'Gaussian .log（能量、收敛与频率证据）',
+            'limitations': [
+                '仅支持孤立分子/团簇；周期 slab 或 bulk 必须改用 VASP、CP2K 或 CASTEP。',
+                'VASP 平面波/PAW 与 Gaussian 高斯基组的绝对能量不可直接比较。',
+            ],
+        },
+        'castep': {
+            'support_level': 'file_workflow',
+            'support_label': '文件级工作流',
+            'summary': '生成 .cell/.param、登记提交并解析 .castep；CASTEP 许可与赝势需自备。',
+            'generic_tasks': ['relax', 'static', 'freq'],
+            'boundaries': ['periodic'],
+            'fields': ['poscar', 'task', 'functional', 'dispersion', 'cutoff_ev',
+                       'kpoints', 'periodic', 'spin', 'charge', 'multiplicity'],
+            'input_contract': 'POSCAR → CASTEP .cell + .param',
+            'result_contract': '.castep（总能与收敛状态）',
+            'limitations': [
+                '当前通用适配只开放结构优化、单点能和频率。',
+                'CASTEP 赝势与 VASP PAW 不同；截断能需独立收敛，绝对能量不可跨引擎比较。',
+            ],
+        },
+    }
+    _GENERIC_TASK_NAMES = {
+        'relax': '结构优化', 'static': '单点能', 'freq': '频率分析',
+    }
+
+    @classmethod
+    def _normalize_engine_key(cls, engine):
+        key = str(engine or '').strip().lower()
+        return cls._ENGINE_ALIASES.get(key, key)
+
+    def _engine_task_keys(self, engine, scenario=None):
+        """引擎在当前工作模式真正可走通的“本次计算”交集。"""
+        key = self._normalize_engine_key(engine)
+        cap = self._ENGINE_CAPABILITIES.get(key) or {}
+        generic = cap.get('generic_tasks')
+        if scenario is not None:
+            allowed = list(scenario.get('task_keys') or [])
+        else:
+            try:
+                allowed = [str(t.get('key')) for t in self._tc().list_catalog()]
+            except Exception:                         # noqa: BLE001 元数据降级不挡引擎清单
+                allowed = []
+        if generic is None:
+            return allowed
+        return [task for task in generic if not allowed or task in allowed]
+
+    def _engine_capability_view(self, engine, scenario=None):
+        key = self._normalize_engine_key(engine)
+        cap = copy.deepcopy(self._ENGINE_CAPABILITIES.get(key) or {})
+        task_keys = self._engine_task_keys(key, scenario)
+        names = dict(self._GENERIC_TASK_NAMES)
+        try:
+            names.update({str(t.get('key')): str(t.get('name_zh') or t.get('key'))
+                          for t in self._tc().list_catalog()})
+        except Exception:                             # noqa: BLE001 显示名可安全回退 key
+            pass
+        cap['task_keys'] = task_keys
+        cap['tasks'] = [{'key': task, 'name': names.get(task, task)} for task in task_keys]
+        if key == 'gaussian':
+            try:
+                cap['native_tasks'] = [
+                    {'key': task, 'name': row.get('name_zh', task),
+                     'note': row.get('note', '')}
+                    for task, row in self._gauss().GAUSSIAN_TASKS.items()
+                ]
+            except Exception:                         # noqa: BLE001 专属面板仍会自行加载任务
+                cap['native_tasks'] = []
+        return cap
+
+    def _active_engine(self, scenario, ui, registered):
+        visible = [e for e in (scenario.get('engines') or []) if e in registered]
+        requested = self._normalize_engine_key((ui or {}).get('active_engine'))
+        default = self._normalize_engine_key(
+            (scenario.get('defaults') or {}).get('engine') or 'vasp')
+        if requested in visible:
+            return requested
+        if default in visible:
+            return default
+        return visible[0] if visible else ('vasp' if 'vasp' in registered else '')
+
+    def engine_list(self, scenario_key=None):
+        """已注册引擎清单与 UI 能力合同（按工作模式严格标可见）。
+
+        VASP 为主引擎;CP2K/Gaussian/CASTEP 为文件级适配(实验性)。
+        给 scenario_key 时严格按工作模式 engines 白名单标 visible，默认引擎也取模式声明。
+        """
+        try:
+            names = self._eng().available_engines()
+            vis = None
+            default = 'vasp'
+            if scenario_key is not None:
+                sc = self._scenarios.get_scenario(scenario_key)
+                vis = set(sc.get('engines') or [])
+                default = str((sc.get('defaults') or {}).get('engine') or 'vasp')
+            engines = []
+            for n in names:
+                row = {'key': n, 'name': self._ENGINE_DISPLAY.get(n, n.upper()),
+                       'experimental': n != 'vasp',
+                       'visible': True if vis is None else (n in vis)}
+                row.update(self._engine_capability_view(n, sc if scenario_key is not None else None))
+                engines.append(row)
+            if default not in names or (vis is not None and default not in vis):
+                default = next((n for n in names if vis is None or n in vis), 'vasp')
+            return {'ok': True, 'engines': engines, 'default': default, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'engines': [], 'default': 'vasp', 'error': str(e)}
+
+    def engine_get(self):
+        """当前计算引擎；无效旧配置按工作模式默认值回退，不静默开放模式外引擎。"""
+        try:
+            cfg = self._config.load_config()
+            ui = self._config.get_ui_state(cfg)
+            scenario = self._scenarios.active_scenario(cfg)
+            registered = [self._normalize_engine_key(e)
+                          for e in self._eng().available_engines()]
+            active = self._active_engine(scenario, ui, registered)
+            requested = self._normalize_engine_key((ui or {}).get('active_engine'))
+            return {
+                'ok': True, 'engine': active,
+                'configured': requested == active and bool(requested),
+                'capability': self._engine_capability_view(active, scenario),
+                'error': None,
+            }
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'engine': 'vasp', 'configured': False,
+                    'capability': {}, 'error': str(e)}
+
+    def engine_set(self, engine):
+        """保存本次引擎，并把不受该引擎支持的旧计算类型收敛到真实可用默认值。"""
+        try:
+            key = self._normalize_engine_key(engine)
+            cfg = self._config.load_config()
+            ui = self._config.get_ui_state(cfg)
+            scenario = self._scenarios.active_scenario(cfg)
+            registered = [self._normalize_engine_key(e)
+                          for e in self._eng().available_engines()]
+            if key not in registered:
+                return {'ok': False, 'engine': None, 'active_calculation': None,
+                        'error': f'计算引擎 {key!r} 未注册或当前安装不可用'}
+            if key not in (scenario.get('engines') or []):
+                return {'ok': False, 'engine': None, 'active_calculation': None,
+                        'error': f'计算引擎 {key!r} 不适用于工作模式「{scenario.get("name", "")}」'}
+            allowed = self._engine_task_keys(key, scenario)
+            requested = str((ui or {}).get('active_calculation') or '')
+            preferred = str((scenario.get('defaults') or {}).get('active_calculation') or '')
+            active = requested if requested in allowed else preferred
+            if active not in allowed:
+                active = allowed[0] if allowed else ''
+            self._config.set_ui_state(active_engine=key, active_calculation=active)
+            return {'ok': True, 'engine': key, 'active_calculation': active,
+                    'capability': self._engine_capability_view(key, scenario), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'engine': None, 'active_calculation': None,
+                    'capability': {}, 'error': str(e)}
+
+    def _spec_from_params(self, mods, params):
+        """params → (CalcSpec, err|None)。结构取 params['structure'](内联文本)或 poscar 路径;
+
+        extras(Gaussian 分子面板透传:nproc/mem_gb/chk/basis/solvent/mixed_basis/gaussian_task/
+        td_nstates/irc_maxpoints/modredundant …)原样并入 spec.extras(见 CalcSpec.extras 契约)。
+        engine_generate/engine_preview 共用同一装配源。
+        """
+        params = dict(params or {})
+        structure = params.get('structure')
+        if not (isinstance(structure, str) and structure.strip()):
+            poscar = (params.get('poscar') or '').strip()
+            if not poscar or not os.path.isfile(poscar):
+                return None, '结构文件(POSCAR)不存在'
+            with open(poscar, 'r', encoding='utf-8', errors='replace') as f:
+                structure = f.read()
+        kpts = params.get('kpoints')
+        if isinstance(kpts, (list, tuple)) and len(kpts) >= 3:
+            try:
+                kpts = tuple(int(x) for x in kpts[:3])
+            except (TypeError, ValueError):
+                kpts = None
+        else:
+            kpts = None
+        cutoff = params.get('cutoff_ev')
+        spec = mods.CalcSpec(
+            structure=structure, task=(params.get('task') or 'relax'),
+            functional=(params.get('functional') or 'PBE'),
+            periodic=bool(params.get('periodic', True)),
+            dispersion=(params.get('dispersion') or None),
+            cutoff_ev=(float(cutoff) if cutoff not in (None, '') else None),
+            kpoints=kpts, spin=bool(params.get('spin', False)),
+            charge=int(params.get('charge') or 0),
+            multiplicity=int(params.get('multiplicity') or 1),
+            extras=dict(params.get('extras') or {}))
+        return spec, None
+
+    def engine_generate(self, engine, params, out_dir):
+        """非 VASP 引擎输入生成(文件级适配):简化参数表单 → CalcSpec → backend.generate_inputs。
+
+        params:{poscar(结构文件路径)|structure(内联文本),task,functional,cutoff_ev,
+        kpoints([a,b,c]|None),spin,charge,periodic,dispersion,multiplicity,extras(引擎私有透传,
+        Gaussian 分子面板参数走此)}。validate 的自洽问题并入 issues(不静默),生成失败兜 error。
+        生成成功后同时写标准 ``job.yaml`` 并登记台账，因此可直接到作业页提交。
+        返回 {'ok','files','warnings','issues','out_dir','registered','error'}。
+        """
+        try:
+            params = dict(params or {})
+            eng = (engine or '').strip()
+            engine_key = self._normalize_engine_key(eng)
+            out = (out_dir or '').strip()
+            if not eng:
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'registered': False, 'error': '未指定引擎'}
+            if not out:
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'registered': False, 'error': '未选输出目录'}
+            mods = self._eng()
+            registered_engines = [self._normalize_engine_key(e)
+                                  for e in mods.available_engines()]
+            if engine_key not in registered_engines or engine_key not in self._ENGINE_CAPABILITIES:
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'registered': False,
+                        'error': f'计算引擎 {engine_key!r} 未注册或无 Web 工作流能力合同'}
+            if engine_key == 'vasp':
+                return {
+                    'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                    'out_dir': None, 'registered': False,
+                    'error': ('VASP 请使用主工作流的四件套/专用任务生成器；'
+                              '通用 engine_generate 仅服务 CP2K、Gaussian 和 CASTEP，'
+                              '避免生成缺 POTCAR 且绕过 VASP 预检的重复入口。')}
+            task = str(params.get('task') or 'relax').strip().lower()
+            supported = self._engine_task_keys(engine_key)
+            if task not in supported:
+                names = '、'.join(self._GENERIC_TASK_NAMES.get(x, x) for x in supported)
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'registered': False,
+                        'error': (f'{self._ENGINE_DISPLAY.get(engine_key, engine_key)} 当前文件级工作流'
+                                  f'不支持任务 {task!r}；可选：{names}')}
+            params['task'] = task
+            # CP2K 的 CUTOFF/REL_CUTOFF 单位为 Ry，属于引擎私有参数；绝不能继续
+            # 借用通用 cutoff_ev（那会让用户误以为 VASP ENCUT 可直接换算）。
+            if engine_key == 'cp2k':
+                extras = dict(params.get('extras') or {})
+                for key in ('cutoff_ry', 'rel_cutoff_ry', 'basis_set_file',
+                            'potential_file'):
+                    if params.get(key) not in (None, ''):
+                        extras[key] = params[key]
+                params['extras'] = extras
+                params['cutoff_ev'] = None
+            spec, serr = self._spec_from_params(mods, params)
+            if serr:
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'registered': False, 'error': serr}
+            boundary = 'periodic' if bool(getattr(spec, 'periodic', True)) else 'molecule'
+            boundaries = self._ENGINE_CAPABILITIES[engine_key].get('boundaries') or []
+            if boundary not in boundaries:
+                label = '周期体系' if boundary == 'periodic' else '孤立分子/团簇'
+                allowed_labels = '、'.join('周期体系' if item == 'periodic' else '孤立分子/团簇'
+                                          for item in boundaries)
+                return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                        'out_dir': None, 'registered': False,
+                        'error': (f'{self._ENGINE_DISPLAY.get(engine_key, engine_key)} 当前适配不支持'
+                                  f'{label}；请选择：{allowed_labels}')}
+            issues = list(mods.validate(spec))
+            if engine_key == 'cp2k':
+                # CalcSpec 的 cutoff_ev 门禁服务于 VASP/CASTEP 平面波截断；CP2K 已由
+                # cutoff_ry 单独表达。保留真正的 CP2K 缺项提示，不输出错误单位建议。
+                issues = [x for x in issues if 'cutoff_ev' not in str(x)]
+                try:
+                    if float((getattr(spec, 'extras', {}) or {}).get('cutoff_ry', 0)) <= 0:
+                        issues.append('CP2K 周期计算应明确给出正数 CUTOFF（Ry），并独立做收敛测试。')
+                except (TypeError, ValueError):
+                    issues.append('CP2K CUTOFF（Ry）必须是正数。')
+            if engine_key == 'castep' and bool(getattr(spec, 'periodic', True)) \
+                    and getattr(spec, 'kpoints', None) is None:
+                issues.append('CASTEP 周期计算未指定 k 点网格；将回退 1×1×1，仅适合已验证的超胞。')
+            backend = mods.get_backend(engine_key)
+            os.makedirs(out, exist_ok=True)
+            res = backend.generate_inputs(spec, out)
+            files = list(res.get('files') or [])
+            warnings = list(res.get('warnings') or [])
+            generated_names = []
+            hashes = {}
+            for item in files:
+                name = os.path.basename(str(item or '').strip())
+                if not name or name in generated_names:
+                    continue
+                generated_names.append(name)
+                candidate = str(item)
+                if not os.path.isfile(candidate):
+                    candidate = os.path.join(out, name)
+                if os.path.isfile(candidate):
+                    hashes[name] = _sha256_file(candidate)
+
+            engine_key = self._ta().normalize_engine(engine_key)
+            output_files = self._ta().expected_engine_output_names(
+                engine_key, generated_names)
+            task_type = str(getattr(spec, 'task', None) or 'relax').strip().lower()
+            gaussian_task = str((getattr(spec, 'extras', {}) or {}).get(
+                'gaussian_task') or '').strip().lower()
+            if engine_key == 'gaussian' and gaussian_task:
+                task_type = {
+                    'freq': 'freq', 'opt_freq': 'freq', 'opt_ts': 'freq',
+                    'sp': 'static', 'td': 'static', 'nmr': 'static',
+                    'opt': 'relax', 'scan': 'relax', 'irc': 'relax',
+                }.get(gaussian_task, task_type)
+            if task_type not in ('relax', 'static', 'freq'):
+                warnings.append(
+                    f'多引擎任务 {task_type!r} 无标准清单类型，已按 static '
+                    '登记以便提交；原任务保留在 inputs.task。')
+                task_type = 'static'
+
+            structure = str(getattr(spec, 'structure', '') or '')
+            first_line = next((line.strip() for line in structure.splitlines()
+                               if line.strip()), '')
+            inputs = {
+                'engine': engine_key,
+                'task': str(getattr(spec, 'task', None) or 'relax'),
+                'functional': str(getattr(spec, 'functional', None) or ''),
+                'periodic': bool(getattr(spec, 'periodic', True)),
+                'spin': bool(getattr(spec, 'spin', False)),
+                'charge': int(getattr(spec, 'charge', 0) or 0),
+                'files': generated_names,
+                'output_files': output_files,
+                'sha256': hashes,
+                'structure_sha256': hashlib.sha256(
+                    structure.encode('utf-8')).hexdigest(),
+                'generator': 'engine_generate',
+            }
+            if gaussian_task:
+                inputs['gaussian_task'] = gaussian_task
+            source_poscar = str(params.get('poscar') or '').strip()
+            if source_poscar and os.path.isfile(source_poscar):
+                inputs['source_poscar'] = os.path.abspath(source_poscar)
+                inputs['source_poscar_sha256'] = _sha256_file(source_poscar)
+
+            registered = False
+            try:
+                calc_type = _norm_calc_type(
+                    params.get('calc_type')
+                    or ('slab' if bool(getattr(spec, 'periodic', True)) else 'molecule'))
+                m = self._manifest.new_manifest(
+                    job_id=(f'{os.path.basename(os.path.normpath(out))}-{engine_key}-'
+                            f'{time.strftime("%Y%m%d-%H%M%S")}'),
+                    system=first_line or os.path.basename(os.path.normpath(out)),
+                    task_type=task_type, calc_type=calc_type, inputs=inputs,
+                    warnings=warnings + [f'生成阶段自洽检查：{x}' for x in issues])
+                self._manifest.save_manifest(out, m)
+                self._ledger.register(out)
+                registered = True
+            except Exception as ex:                       # noqa: BLE001
+                warnings.append(f'job.yaml/台账写入失败（输入文件已保留）：{ex}')
+            return {'ok': True, 'files': files, 'warnings': warnings,
+                    'issues': issues, 'out_dir': out, 'registered': registered,
+                    'task_type': task_type, 'engine': engine_key, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'files': [], 'warnings': [], 'issues': [],
+                    'out_dir': None, 'registered': False, 'error': str(e)}
+
+    def engine_preview(self, engine, params):
+        """引擎输入实时预览(不落用户盘):CalcSpec → 输入全文文本 + 字符数(②预览区用)。
+
+        Gaussian 走 gaussian.preview(spec)(分子面板主用);其余引擎经临时目录 generate_inputs
+        回读首个产物文本。validate 自洽问题并入 issues。返回
+        {'ok','text','chars','warnings','issues','error'}。
+        """
+        try:
+            eng = self._normalize_engine_key(engine)
+            if not eng:
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [], 'error': '未指定引擎'}
+            mods = self._eng()
+            if eng not in [self._normalize_engine_key(e) for e in mods.available_engines()] \
+                    or eng not in self._ENGINE_CAPABILITIES:
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [], 'error': f'计算引擎 {eng!r} 未注册或无 Web 工作流能力合同'}
+            if eng == 'vasp':
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [],
+                        'error': 'VASP 预览请使用主四件套预览，不走非 VASP 通用适配器。'}
+            params = dict(params or {})
+            task = str(params.get('task') or 'relax').strip().lower()
+            if task not in self._engine_task_keys(eng):
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [], 'error': f'{eng} 当前适配不支持任务 {task!r}'}
+            params['task'] = task
+            if eng == 'cp2k':
+                extras = dict(params.get('extras') or {})
+                for key in ('cutoff_ry', 'rel_cutoff_ry', 'basis_set_file',
+                            'potential_file'):
+                    if params.get(key) not in (None, ''):
+                        extras[key] = params[key]
+                params['extras'] = extras
+                params['cutoff_ev'] = None
+            spec, serr = self._spec_from_params(mods, params)
+            if serr:
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [], 'error': serr}
+            boundary = 'periodic' if bool(getattr(spec, 'periodic', True)) else 'molecule'
+            if boundary not in (self._ENGINE_CAPABILITIES[eng].get('boundaries') or []):
+                return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                        'issues': [], 'error': f'{eng} 当前适配不支持 {boundary} 边界'}
+            issues = list(mods.validate(spec))
+            if eng == 'cp2k':
+                issues = [x for x in issues if 'cutoff_ev' not in str(x)]
+            eng_norm = eng
+            warnings: list = []
+            if eng_norm == 'gaussian':
+                text = self._gauss().preview(spec)
+            else:
+                tmp = tempfile.mkdtemp(prefix='vcs_engine_preview_')
+                try:
+                    res = mods.get_backend(eng).generate_inputs(spec, tmp)
+                    warnings = list(res.get('warnings') or [])
+                    files = list(res.get('files') or [])
+                    text = ''
+                    if files and os.path.isfile(files[0]):
+                        with open(files[0], 'r', encoding='utf-8', errors='replace') as f:
+                            text = f.read()
+                finally:
+                    import shutil
+                    shutil.rmtree(tmp, ignore_errors=True)
+            return {'ok': True, 'text': text, 'chars': len(text),
+                    'warnings': warnings, 'issues': issues, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'text': '', 'chars': 0, 'warnings': [],
+                    'issues': [], 'error': str(e)}
+
+    def gauss_tasks(self):
+        """Gaussian 任务种类全家桶(9 种)→ {'ok','tasks':[{key,name,note}],'error'}(②任务下拉)。"""
+        try:
+            tasks = self._gauss().GAUSSIAN_TASKS
+            out = [{'key': k, 'name': v.get('name_zh', k), 'note': v.get('note', '')}
+                   for k, v in tasks.items()]
+            return {'ok': True, 'tasks': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'tasks': [], 'error': str(e)}
+
+    def gauss_periodic_table(self):
+        """Gaussian 混合基组周期表数据源(1-86 号 + 类别 + 每元素基组建议)→ {'ok','table','error'}。"""
+        try:
+            pt = self._gauss().PERIODIC_TABLE_GROUPS
+            return {'ok': True, 'error': None, 'table': {
+                'note': pt.get('note', ''),
+                'categories': list(pt.get('categories') or []),
+                'elements': list(pt.get('elements') or [])}}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'table': None, 'error': str(e)}
+
+    def engine_nonequiv(self, src, dst):
+        """跨引擎方法不等价清单(不静默翻译)→ {'ok','report':[中文逐条],'error'}(生成页告警条)。"""
+        try:
+            report = self._eng().nonequivalence_report(src, dst)
+            return {'ok': True, 'report': list(report), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'report': [], 'error': str(e)}
+
+    # ── 结构查看/编辑器(结构建模页;api 只做 解析/写出/固定层 纯转换,注入可测) ─────
+    def _state_to_poscar(self, state, *, sd=None):
+        """编辑器 JS 状态 {elements,coords,lattice} → (POSCAR 文本, perm)。
+
+        按物种(首见序)分块以满足 VASP 计数契约;perm 为 state 原子序 → 写出序的映射,供固定层
+        标志回填。sd 给定(每 state 原子 bool,True=冻结)且有真值时写 Selective dynamics。
+        """
+        elements = list((state or {}).get('elements') or [])
+        coords = [list(c) for c in ((state or {}).get('coords') or [])]
+        lattice = [list(r) for r in ((state or {}).get('lattice') or [])]
+        if not elements or len(elements) != len(coords):
+            raise ValueError('结构状态无效(元素数与坐标数不一致)')
+        if len(lattice) != 3 or any(len(r) < 3 for r in lattice):
+            raise ValueError('晶格矢量须为 3×3')
+        uniq = []
+        for e in elements:
+            if e not in uniq:
+                uniq.append(e)
+        perm = [i for sp in uniq for i, e in enumerate(elements) if e == sp]
+        counts = [sum(1 for e in elements if e == sp) for sp in uniq]
+        use_sd = isinstance(sd, list) and any(bool(x) for x in sd)
+        lines = ['vcstudio structure editor', '1.0']
+        for r in lattice:
+            lines.append('  ' + ' '.join(f'{float(x):.10f}' for x in r[:3]))
+        lines.append('  ' + ' '.join(str(s) for s in uniq))
+        lines.append('  ' + ' '.join(str(c) for c in counts))
+        if use_sd:
+            lines.append('Selective dynamics')
+        lines.append('Cartesian')
+        for idx in perm:
+            x, y, z = coords[idx][:3]
+            row = f'  {float(x):.10f} {float(y):.10f} {float(z):.10f}'
+            if use_sd:
+                fixed = idx < len(sd) and bool(sd[idx])
+                row += '  ' + ('F F F' if fixed else 'T T T')
+            lines.append(row)
+        return '\n'.join(lines) + '\n', perm
+
+    @staticmethod
+    def _parse_sd_fixed(poscar_text):
+        """带 Selective dynamics 的 POSCAR → 每原子是否冻结(首标志 F)的 bool 列表(写出序)。"""
+        lines = poscar_text.splitlines()
+        if not (len(lines) > 7 and lines[7].strip()[:1].lower() == 's'):
+            return []
+        try:
+            natoms = sum(int(x) for x in lines[6].split())
+        except (ValueError, IndexError):
+            natoms = 0
+        out = []
+        for k in range(natoms):
+            idx = 9 + k
+            parts = lines[idx].split() if idx < len(lines) else []
+            out.append(len(parts) >= 6 and parts[3].strip().upper() == 'F')
+        return out
+
+    def struct_load(self, path):
+        """加载 POSCAR/CONTCAR → {'ok','struct':{elements,coords,lattice,natoms,formula},'vacuum'}。
+
+        纯解析(复用 structure_view.parse_positions);真空厚度经 slab_builder。缺文件/畸形 → error。
+        """
+        try:
+            p = (path or '').strip()
+            if not p or not os.path.isfile(p):
+                return {'ok': False, 'struct': None, 'vacuum': None,
+                        'error': '结构文件不存在'}
+            with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            parsed = self._sview.parse_positions(content)
+            elements = parsed['elements']
+            uniq = []
+            for e in elements:
+                if e not in uniq:
+                    uniq.append(e)
+            formula = ' '.join(f'{s}{sum(1 for e in elements if e == s)}' for s in uniq)
+            vac = None
+            try:
+                vac = round(self._slab_builder.vacuum_thickness(content), 3)
+            except Exception:                             # noqa: BLE001 真空计算失败不挡加载
+                vac = None
+            return {'ok': True, 'vacuum': vac,
+                    'struct': {'elements': elements, 'coords': parsed['coords'],
+                               'lattice': parsed['cell'], 'natoms': len(elements),
+                               'formula': formula},
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'struct': None, 'vacuum': None, 'error': str(e)}
+
+    def struct_save(self, state, path):
+        """编辑器状态 → POSCAR 落盘(Cartesian;state.fixed 有真值则写 Selective dynamics)。"""
+        try:
+            p = (path or '').strip()
+            if not p:
+                return {'ok': False, 'path': None, 'error': '未指定保存路径'}
+            sd = (state or {}).get('fixed')
+            text, _ = self._state_to_poscar(
+                state, sd=sd if isinstance(sd, list) else None)
+            os.makedirs(os.path.dirname(os.path.abspath(p)) or '.', exist_ok=True)
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(text)
+            return {'ok': True, 'path': p, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': None, 'error': str(e)}
+
+    def struct_fix_layers(self, state, n_layers):
+        """冻结最底 n 层(调 slab_builder.fix_bottom_layers)→ 每原子冻结 bool(state 序)+ 真空厚度。
+
+        n_layers ≤0 或 ≥ 总层数 → slab_builder 抛 ValueError,此处兜成 error。返回
+        {'ok','fixed':[bool...],'fixed_count','vacuum','error'}。
+        """
+        try:
+            n = int(n_layers)
+            text, perm = self._state_to_poscar(state)
+            new_text = self._slab_builder.fix_bottom_layers(text, n)
+            built = self._parse_sd_fixed(new_text)
+            fixed = [False] * len(perm)
+            for built_i, state_i in enumerate(perm):
+                if built_i < len(built):
+                    fixed[state_i] = built[built_i]
+            vac = None
+            try:
+                vac = round(self._slab_builder.vacuum_thickness(new_text), 3)
+            except Exception:                             # noqa: BLE001
+                vac = None
+            return {'ok': True, 'fixed': fixed,
+                    'fixed_count': sum(1 for x in fixed if x),
+                    'vacuum': vac, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'fixed': None, 'fixed_count': 0,
+                    'vacuum': None, 'error': str(e)}
+
+    def struct_vacuum(self, state):
+        """当前编辑器状态的 c 向真空层厚度(Å)→ {'ok','vacuum','error'}(编辑后实时刷新)。"""
+        try:
+            text, _ = self._state_to_poscar(state)
+            return {'ok': True,
+                    'vacuum': round(self._slab_builder.vacuum_thickness(text), 3),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'vacuum': None, 'error': str(e)}
+
+    # ── ①结构建模页·分子建模区(图片识别 → SMILES → 3D 建模 → 外部编辑器往返) ─────
+    _MOL_BOX = 15.0                                       # 分子装盒边长(Å;编辑器晶格 + 保存 POSCAR)
+
+    @staticmethod
+    def _mol_struct(elements, coords, formula):
+        """elements/coords + 分子式 → 编辑器 struct dict(立方盒晶格,便于 3D 渲染/POSCAR 导出)。"""
+        box = Api._MOL_BOX
+        return {'elements': list(elements), 'coords': [list(c) for c in coords],
+                'lattice': [[box, 0.0, 0.0], [0.0, box, 0.0], [0.0, 0.0, box]],
+                'natoms': len(list(elements)), 'formula': formula}
+
+    def mol_ocsr_probe(self):
+        """探测 DECIMER(图片 OCSR)可用性 → {'ok','available','detail','error'}(卡顶提示条)。"""
+        try:
+            r = self._mb().ocsr.probe()
+            return {'ok': True, 'available': bool(r.get('available')),
+                    'detail': r.get('detail', ''), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'available': False, 'detail': '', 'error': str(e)}
+
+    def mol_image_to_smiles(self, image_path):
+        """分子结构图片 → SMILES(DECIMER)→ {'ok','smiles','elapsed_ms','error'}。"""
+        try:
+            p = (image_path or '').strip()
+            if not p:
+                return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'error': '未选择图片文件'}
+            r = self._mb().ocsr.image_to_smiles(p)
+            return {'ok': bool(r.get('ok')), 'smiles': r.get('smiles', ''),
+                    'elapsed_ms': r.get('elapsed_ms', 0.0), 'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'error': str(e)}
+
+    def mol_image_b64_to_smiles(self, image_b64, suffix='.png'):
+        """剪贴板图片(base64,可带 data:image/...;base64, 前缀)→ 临时 PNG → DECIMER OCSR。
+
+        对齐 starpivot「粘贴图片」:前端 Ctrl+V 取剪贴板位图转 base64 直传,无需先存文件。
+        返回 {'ok','smiles','elapsed_ms','image_path','error'};image_path 为落盘的临时
+        图片(供复查/复用),识别失败原样透传引擎中文说明。
+        """
+        try:
+            s = (image_b64 or '').strip()
+            if not s:
+                return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0,
+                        'image_path': None, 'error': '剪贴板里没有图片数据'}
+            if s.lower().startswith('data:') and ',' in s:
+                s = s.split(',', 1)[1]                    # 剥 dataURL 前缀
+            try:
+                blob = base64.b64decode(s, validate=True)
+            except (binascii.Error, ValueError):
+                return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'image_path': None,
+                        'error': '图片数据不是合法 base64(请直接对分子结构截图后 Ctrl+V)'}
+            if len(blob) < 64:
+                return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'image_path': None,
+                        'error': '图片数据过小,疑非图片(请粘贴分子结构截图)'}
+            ext = str(suffix or '.png').lower()
+            if ext not in ('.png', '.jpg', '.jpeg'):
+                ext = '.png'
+            tmpdir = os.path.join(tempfile.gettempdir(), 'vcstudio_paste')
+            os.makedirs(tmpdir, exist_ok=True)
+            path = os.path.join(tmpdir, f'paste_{int(time.time() * 1000)}{ext}')
+            with open(path, 'wb') as f:
+                f.write(blob)
+            r = self._mb().ocsr.image_to_smiles(path)
+            return {'ok': bool(r.get('ok')), 'smiles': r.get('smiles', ''),
+                    'elapsed_ms': r.get('elapsed_ms', 0.0), 'image_path': path,
+                    'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'smiles': '', 'elapsed_ms': 0.0,
+                    'image_path': None, 'error': str(e)}
+
+    def mol_smiles_svg(self, smiles, width=420, height=300):
+        """SMILES → 2D 键线式 SVG(RDKit)→ {'ok','svg','error'}(结构图预览)。"""
+        try:
+            s = (smiles or '').strip()
+            if not s:
+                return {'ok': False, 'svg': '', 'error': 'SMILES 为空'}
+            r = self._mb().ocsr.smiles_svg(s, width=int(width or 420), height=int(height or 300))
+            return {'ok': bool(r.get('ok')), 'svg': r.get('svg', ''),
+                    'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'svg': '', 'error': str(e)}
+
+    def mol_smiles_to_3d(self, smiles, forcefield='auto'):
+        """SMILES → 3D 结构(RDKit ETKDG + MMFF/UFF)→ 编辑器 struct + 电荷/多重度提示。
+
+        返回 {'ok','struct','charge','multiplicity_hint','warnings','error'}。struct 载入现有编辑器。
+        """
+        try:
+            s = (smiles or '').strip()
+            if not s:
+                return {'ok': False, 'struct': None, 'charge': 0,
+                        'multiplicity_hint': None, 'warnings': [], 'error': 'SMILES 为空'}
+            r = self._mb().smiles3d.smiles_to_3d(s, forcefield=(forcefield or 'auto'))
+            if not r.get('ok'):
+                return {'ok': False, 'struct': None, 'charge': 0, 'multiplicity_hint': None,
+                        'warnings': list(r.get('warnings') or []), 'error': r.get('error')}
+            return {'ok': True, 'error': None,
+                    'struct': self._mol_struct(r['elements'], r['coords'], r['formula']),
+                    'charge': r.get('charge', 0),
+                    'multiplicity_hint': r.get('multiplicity_hint'),
+                    'warnings': list(r.get('warnings') or [])}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'struct': None, 'charge': 0, 'multiplicity_hint': None,
+                    'warnings': [], 'error': str(e)}
+
+    def mol_info(self, elements, coords=None, charge=0):
+        """分子属性(化学式/原子数/电子数/分子量/建议多重度)→ {'ok', …, 'error'}(属性面板)。"""
+        try:
+            els = list(elements or [])
+            if not els:
+                return {'ok': False, 'error': '无原子(先建模或载入结构)'}
+            r = self._mb().molinfo.mol_summary(els, coords, int(charge or 0))
+            out = {'ok': True, 'error': None}
+            out.update(r)
+            return out
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def mol_export_editor(self, elements, coords, fmt='xyz', workdir=None):
+        """把当前结构写成外部编辑器临时文件(固定名)→ {'ok','path','mtime','error'}(GaussView/Avogadro)。"""
+        try:
+            els = list(elements or [])
+            cds = [list(c) for c in (coords or [])]
+            r = self._mb().external_editor.export_for_editor(
+                els, cds, fmt=(fmt or 'xyz'), workdir=((workdir or '').strip() or None))
+            return {'ok': bool(r.get('ok')), 'path': r.get('path'),
+                    'mtime': r.get('mtime'), 'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': None, 'mtime': None, 'error': str(e)}
+
+    def mol_open_with(self, path, editor_exe=None):
+        """用外部编辑器(或平台默认)打开文件 → {'ok','error'}。editor_exe 空则走 xdg-open/startfile。"""
+        try:
+            p = (path or '').strip()
+            if not p:
+                return {'ok': False, 'error': '未指定文件路径'}
+            exe = (editor_exe or '').strip() or None
+            r = self._mb().external_editor.open_with(p, editor_exe=exe)
+            return {'ok': bool(r.get('ok')), 'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    def mol_check_reimport(self, path, last_mtime=None):
+        """比对外部编辑文件 mtime 判是否改动过 → {'ok','changed','mtime','error'}(自动检测轮询)。"""
+        try:
+            p = (path or '').strip()
+            if not p:
+                return {'ok': False, 'changed': False, 'mtime': None, 'error': '未指定文件路径'}
+            r = self._mb().external_editor.check_reimport(p, last_mtime)
+            return {'ok': True, 'changed': bool(r.get('changed')),
+                    'mtime': r.get('mtime'), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'changed': False, 'mtime': None, 'error': str(e)}
+
+    def mol_reimport(self, path):
+        """回读外部编辑结果(xyz/mol 纯手写解析)→ {'ok','struct','error'}(载入编辑器)。"""
+        try:
+            p = (path or '').strip()
+            if not p or not os.path.isfile(p):
+                return {'ok': False, 'struct': None, 'error': '编辑文件不存在'}
+            r = self._mb().external_editor.reimport(p)
+            if not r.get('ok'):
+                return {'ok': False, 'struct': None, 'error': r.get('error')}
+            els, cds = r['elements'], r['coords']
+            formula = self._mb().molinfo.formula(els)
+            return {'ok': True, 'error': None, 'struct': self._mol_struct(els, cds, formula)}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'struct': None, 'error': str(e)}
+
+    # ── ③提交页·快速批量提交 / 本机运行 / 文件管理 ─────────────────────────────────
+    def quick_submit_scan(self, paths, shared_incar=''):
+        """只读预检父目录下的 VASP 四件套/结构，不建作业。"""
+        try:
+            items = [str(p) for p in (paths or []) if str(p).strip()]
+            if not items:
+                return {'ok': False, 'items': [], 'summary': {}, 'error': '未选择输入文件或目录'}
+            result = dict(self._qs().scan_inputs(
+                items, shared_incar=str(shared_incar or '').strip()) or {})
+            result.setdefault('ok', True)
+            result.setdefault('items', [])
+            result.setdefault('summary', {})
+            result.setdefault('error', None)
+            return result
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'items': [], 'summary': {}, 'error': str(e)}
+
+    def quick_submit_build(self, files, out_root, job_prefix='', shared_incar='',
+                           lib_root='', calc_type='slab'):
+        """任意输入文件(.gjf/.com/.inp/.cell/VASP 目录)→ 逐个建轻量作业目录 + 入台账。
+
+        父目录会递归发现多个 VASP 作业；只有 POSCAR/CONTCAR 时可用
+        ``shared_incar`` + ``lib_root`` 批量生成 KPOINTS/POTCAR。返回
+        {'ok','jobs','skipped','preflight','error'}，hint 为该引擎的集群运行命令模板。
+        """
+        try:
+            fs = [str(f) for f in (files or []) if str(f).strip()]
+            root = (out_root or '').strip()
+            if not fs:
+                return {'ok': False, 'jobs': [], 'skipped': [], 'preflight': None,
+                        'error': '未选择任何输入文件'}
+            if not root:
+                return {'ok': False, 'jobs': [], 'skipped': [], 'preflight': None,
+                        'error': '未选输出根目录'}
+            qs = self._qs()
+            lib = str(lib_root or '').strip()
+            if not lib:
+                try:
+                    lib = str((self._config.load_config() or {}).get('potcar_lib_root') or '')
+                except Exception:                         # noqa: BLE001 设置不可读由 builder 报精确缺项
+                    lib = ''
+            res = qs.build_quick_jobs(
+                fs, root, job_prefix=(job_prefix or ''),
+                shared_incar=str(shared_incar or '').strip(),
+                lib_root=lib, calc_type=_norm_calc_type(calc_type))
+            if not res.get('ok'):
+                return {'ok': False, 'jobs': [], 'skipped': list(res.get('skipped') or []),
+                        'preflight': res.get('preflight'),
+                        'error': res.get('error') or '建作业失败'}
+            jobs = []
+            for j in (res.get('jobs') or []):
+                registered = True
+                try:
+                    self._ledger.register(j['dir'])
+                except Exception:                         # noqa: BLE001 登记失败不挡已建目录
+                    registered = False
+                jobs.append({'dir': j['dir'], 'name': j['name'], 'engine': j['engine'],
+                             'files': list(j.get('files') or []),
+                             'mode': j.get('mode') or 'copy',
+                             'warnings': list(j.get('warnings') or []),
+                             'hint': qs.submit_hint(j.get('engine', '')),
+                             'registered': registered})
+            return {'ok': True, 'jobs': jobs, 'skipped': list(res.get('skipped') or []),
+                    'preflight': res.get('preflight'), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'jobs': [], 'skipped': [], 'preflight': None,
+                    'error': str(e)}
+
+    def jobs_cancel_batch(self, dirs, name, password, trust_new=False):
+        """批量取消集群作业(逐作业 qdel/scancel + 回写 manifest FAILED/用户取消)。
+
+        返回 {'ok','cancelled':[job_id],'failed':[{job_id,reason}],'needs_trust','error'}。
+        """
+        try:
+            ds = [str(d) for d in (dirs or []) if str(d).strip()]
+            if not ds:
+                return {'ok': False, 'cancelled': [], 'failed': [],
+                        'needs_trust': False, 'error': '未选择要取消的作业'}
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            res = self._bo().cancel_batch(prof, ds, password=pw, trust_new=trust_new)
+            return {'ok': bool(res.get('ok')), 'cancelled': list(res.get('cancelled') or []),
+                    'failed': list(res.get('failed') or []),
+                    'needs_trust': bool(res.get('needs_trust')),
+                    **self._host_key_evidence(res), 'error': res.get('error')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'cancelled': [], 'failed': [],
+                    'needs_trust': False, 'error': str(e)}
+
+    _LOCAL_INPUT_EXTS = ('.gjf', '.com', '.inp', '.gau')
+
+    def _find_local_input(self, job_dir):
+        """作业目录内首个本机引擎输入文件(.gjf/.com/.inp/.gau);无 → None。"""
+        import glob
+        for ext in self._LOCAL_INPUT_EXTS:
+            cands = sorted(glob.glob(os.path.join(job_dir, '*' + ext)))
+            if cands:
+                return cands[0]
+        return None
+
+    def _build_local_cmd(self, job_dir, tmpl):
+        """命令模板 + 作业目录输入 → argv 列表。占位符 {input}/{output} 替换,否则末尾追加输入名。
+
+        缺 {input} 占位符也无可识别输入文件 → 直接按模板拆分(用户模板可自含输入)。
+        """
+        import shlex
+        inp = self._find_local_input(job_dir)
+        inp_base = os.path.basename(inp) if inp else ''
+        out_base = (os.path.splitext(inp_base)[0] + '.log') if inp_base else 'output.log'
+        if '{input}' in tmpl or '{output}' in tmpl:
+            filled = tmpl.replace('{input}', inp_base).replace('{output}', out_base)
+            return shlex.split(filled)
+        parts = shlex.split(tmpl)
+        if inp_base:
+            parts.append(inp_base)
+        return parts
+
+    def local_run_start(self, job_dir, cmd_template):
+        """本机启动作业(quick/gaussian):按命令模板 + 目录输入文件 → local_runner.start。
+
+        返回 {'ok','pid','cmd','error'}。cmd_template 为设置页存的本地软件命令(如 g16 或
+        'g16 {input} {output}')。
+        """
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'pid': None, 'cmd': [], 'error': '作业目录不存在'}
+            tmpl = (cmd_template or '').strip()
+            if not tmpl:
+                return {'ok': False, 'pid': None, 'cmd': [],
+                        'error': '未配置本机运行命令模板(请在设置页填写,如 g16)'}
+            cmd = self._build_local_cmd(d, tmpl)
+            if not cmd:
+                return {'ok': False, 'pid': None, 'cmd': [], 'error': '命令模板为空'}
+            lr = self._lr()
+            job = lr.LocalJob(cmd=cmd, cwd=d, log_file=os.path.join(d, 'local_run.log'))
+            res = lr.start(job)
+            return {'ok': bool(res.get('ok')), 'pid': res.get('pid'),
+                    'cmd': cmd, 'error': res.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'pid': None, 'cmd': [], 'error': str(e)}
+
+    def local_run_status(self, job_dir):
+        """查询本机作业状态 → {'ok','state','pid','exit_code','log_tail','error'}(轮询)。"""
+        try:
+            d = (job_dir or '').strip()
+            if not d:
+                return {'ok': False, 'state': 'NOT_STARTED', 'pid': None,
+                        'exit_code': None, 'log_tail': '', 'error': '未指定作业目录'}
+            r = self._lr().status(d)
+            return {'ok': True, 'state': r.get('state'), 'pid': r.get('pid'),
+                    'exit_code': r.get('exit_code'), 'log_tail': r.get('log_tail', ''),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'state': 'NOT_STARTED', 'pid': None,
+                    'exit_code': None, 'log_tail': '', 'error': str(e)}
+
+    def local_run_cancel(self, job_dir):
+        """停止本机作业(杀进程树/进程组)→ {'ok','error'}。"""
+        try:
+            d = (job_dir or '').strip()
+            if not d:
+                return {'ok': False, 'error': '未指定作业目录'}
+            r = self._lr().cancel(d)
+            return {'ok': bool(r.get('ok')), 'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    @staticmethod
+    def _sftp_is_dir(mode):
+        """SFTP st_mode → 是否目录(缺/异常 → False)。"""
+        import stat as _stat
+        try:
+            return bool(_stat.S_ISDIR(int(mode or 0)))
+        except (TypeError, ValueError):
+            return False
+
+    def remote_ls(self, name, password, remote_path='.', trust_new=False):
+        """列远端目录(SFTP listdir_attr)→ {'ok','path','entries':[{name,size,mtime,is_dir}],
+        'needs_trust','error'}(文件管理子卡)。"""
+        try:
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            rpath = (remote_path or '.').strip() or '.'
+            conn = self._conn()
+            try:
+                client, jump = conn.open_client(prof, pw, trust_new=trust_new)
+            except conn.ConnectError as e:
+                return {'ok': False, 'path': rpath, 'entries': [],
+                        'needs_trust': bool(getattr(e, 'needs_trust', False)),
+                        **self._host_key_evidence(e), 'error': str(e)}
+            try:
+                sftp = client.open_sftp()
+                attrs = sftp.listdir_attr(rpath)
+                entries = []
+                for a in attrs:
+                    entries.append({
+                        'name': getattr(a, 'filename', ''),
+                        'size': int(getattr(a, 'st_size', 0) or 0),
+                        'mtime': int(getattr(a, 'st_mtime', 0) or 0),
+                        'is_dir': self._sftp_is_dir(getattr(a, 'st_mode', 0))})
+                sftp.close()
+            finally:
+                conn.close_quiet(client, jump)
+            entries.sort(key=lambda e: (not e['is_dir'], e['name'].lower()))
+            return {'ok': True, 'path': rpath, 'entries': entries,
+                    'needs_trust': False, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': remote_path, 'entries': [],
+                    'needs_trust': False, 'error': str(e)}
+
+    def remote_fetch_file(self, name, password, remote_path, local_dir, trust_new=False):
+        """下载远端单个文件到本地目录(SFTP get)→ {'ok','local_path','needs_trust','error'}。"""
+        try:
+            rpath = (remote_path or '').strip()
+            ldir = (local_dir or '').strip()
+            if not rpath:
+                return {'ok': False, 'local_path': None, 'needs_trust': False,
+                        'error': '未指定远端文件'}
+            if not ldir:
+                return {'ok': False, 'local_path': None, 'needs_trust': False,
+                        'error': '未指定本地保存目录'}
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            os.makedirs(ldir, exist_ok=True)
+            local_path = os.path.join(ldir, os.path.basename(rpath.rstrip('/')))
+            conn = self._conn()
+            try:
+                client, jump = conn.open_client(prof, pw, trust_new=trust_new)
+            except conn.ConnectError as e:
+                return {'ok': False, 'local_path': None,
+                        'needs_trust': bool(getattr(e, 'needs_trust', False)),
+                        **self._host_key_evidence(e), 'error': str(e)}
+            try:
+                sftp = client.open_sftp()
+                sftp.get(rpath, local_path)
+                sftp.close()
+            finally:
+                conn.close_quiet(client, jump)
+            return {'ok': True, 'local_path': local_path, 'needs_trust': False, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'local_path': None, 'needs_trust': False, 'error': str(e)}
+
+    # ── ⑤波函数分析页(外部工具探测 / 分析 / 渲染 / 极值) ──────────────────────────
+    _WAVEFN_TOOL_KEYS = ('multiwfn', 'vmd', 'gaussview', 'gaussian')
+    _TOOL_WHICH = {'gaussview': ('gview', 'gview.exe', 'GaussView'),
+                   'gaussian': ('g16', 'g09', 'g16.exe', 'g09.exe')}
+
+    def _tool_paths(self):
+        """config.tool_paths(外部工具路径记忆)→ dict(缺 → {})。"""
+        try:
+            tp = self._config.load_config().get('tool_paths')
+            return dict(tp) if isinstance(tp, dict) else {}
+        except Exception:                                 # noqa: BLE001
+            return {}
+
+    def _probe_which(self, key, exe):
+        """gaussview/gaussian 简易探测(给定路径 isfile 直用,否则候选名 PATH 查)→ probe dict。"""
+        import shutil
+        if exe and os.path.isfile(exe):
+            return {'available': True, 'path': exe, 'detail': f'使用指定路径:{exe}'}
+        for cand in ((exe,) if exe else ()) + self._TOOL_WHICH.get(key, ()):
+            found = shutil.which(cand)
+            if found:
+                return {'available': True, 'path': found, 'detail': f'在 PATH 找到:{found}'}
+        label = 'GaussView' if key == 'gaussview' else '本地 Gaussian(g16/g09)'
+        return {'available': False, 'path': None,
+                'detail': f'未找到 {label}:请在上方填写可执行文件路径,或将其加入 PATH。'}
+
+    def wavefn_probe(self, tools=None):
+        """探测波函数分析外部工具(Multiwfn/VMD/GaussView/本地 Gaussian)→
+        {'ok','tools':{key:{available,path,detail}},'error'}。"""
+        try:
+            paths = self._tool_paths()
+            want = [str(t).lower() for t in tools] if tools else list(self._WAVEFN_TOOL_KEYS)
+            out = {}
+            for key in want:
+                exe = (paths.get(key) or '').strip() or None
+                if key == 'multiwfn':
+                    out[key] = self._mw().probe(exe)
+                elif key == 'vmd':
+                    out[key] = self._vmd_().probe(exe)
+                elif key in ('gaussview', 'gaussian'):
+                    out[key] = self._probe_which(key, exe)
+                else:
+                    out[key] = {'available': False, 'path': None,
+                                'detail': f'未知工具 {key!r}'}
+            return {'ok': True, 'tools': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'tools': {}, 'error': str(e)}
+
+    def wavefn_scenes(self):
+        """波函数分析项(Multiwfn)+ 可视化场景(VMD)目录 → {'ok','analyses','scenes','error'}(chips)。"""
+        try:
+            analyses = [{'key': k, 'name': v.get('name', k), 'note': v.get('note', '')}
+                        for k, v in self._mw().ANALYSES.items()]
+            scenes = [{'key': k, 'name': v.get('name', k),
+                       'files': list(v.get('files') or ()), 'note': v.get('note', '')}
+                      for k, v in self._vmd_().SCENES.items()]
+            return {'ok': True, 'analyses': analyses, 'scenes': scenes, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'analyses': [], 'scenes': [], 'error': str(e)}
+
+    def wavefn_run(self, wavefn_file, analyses, params=None, exe=None, workdir=None):
+        """本机逐项跑 Multiwfn 分析 → {'ok','results':[{analysis,ok,outputs,stdout_tail,elapsed_s,
+        script,extrema?,error}],'error'}。Multiwfn 缺失 → 各项 error + 可复制 stdin 脚本(script)。"""
+        try:
+            wf = (wavefn_file or '').strip()
+            keys = [str(a).strip() for a in (analyses or []) if str(a).strip()]
+            if not wf:
+                return {'ok': False, 'results': [], 'error': '未选择波函数文件'}
+            if not keys:
+                return {'ok': False, 'results': [], 'error': '未选择分析项'}
+            paths = self._tool_paths()
+            mw_exe = (exe or paths.get('multiwfn') or '').strip() or None
+            wd = (workdir or '').strip() or None
+            mw = self._mw()
+            p = dict(params or {})
+            results = []
+            for k in keys:
+                r = mw.run(wf, k, exe=mw_exe, workdir=wd, params=p)
+                entry = {'analysis': k, 'ok': bool(r.get('ok')),
+                         'outputs': list(r.get('outputs') or []),
+                         'stdout_tail': r.get('stdout_tail', ''),
+                         'elapsed_s': r.get('elapsed_s', 0.0),
+                         'script': r.get('script', ''), 'error': r.get('error') or None}
+                if k in ('esp_extrema', 'alie_extrema') and r.get('stdout_tail'):
+                    try:
+                        entry['extrema'] = mw.extrema_parse(r['stdout_tail'])
+                    except Exception:                     # noqa: BLE001 解析失败不挡该项返回
+                        pass
+                results.append(entry)
+            return {'ok': any(e['ok'] for e in results), 'results': results, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'results': [], 'error': str(e)}
+
+    def wavefn_run_remote(self, wavefn_file, analyses, name, password, remote_dir,
+                          remote_exe='Multiwfn', trust_new=False, params=None):
+        """(实验性)远程集群跑 Multiwfn:上传波函数 → 远端逐项执行 → 取回 stdout。
+
+        返回 {'ok','results':[{analysis,ok,stdout_tail,error}],'experimental':True,'needs_trust','error'}。
+        任一步失败给中文说明。复杂路径(产物取回/大文件)后续版本完善。
+        """
+        try:
+            import shlex
+            wf = (wavefn_file or '').strip()
+            keys = [str(a).strip() for a in (analyses or []) if str(a).strip()]
+            rdir = (remote_dir or '').strip()
+            if not wf or not os.path.isfile(wf):
+                return {'ok': False, 'results': [], 'experimental': True,
+                        'needs_trust': False, 'error': '波函数文件不存在'}
+            if not keys:
+                return {'ok': False, 'results': [], 'experimental': True,
+                        'needs_trust': False, 'error': '未选择分析项'}
+            if not rdir:
+                return {'ok': False, 'results': [], 'experimental': True,
+                        'needs_trust': False, 'error': '未指定远端工作目录'}
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            conn = self._conn()
+            mw = self._mw()
+            rexe = (remote_exe or 'Multiwfn').strip() or 'Multiwfn'
+            try:
+                client, jump = conn.open_client(prof, pw, trust_new=trust_new)
+            except conn.ConnectError as e:
+                return {'ok': False, 'results': [], 'experimental': True,
+                        'needs_trust': bool(getattr(e, 'needs_trust', False)),
+                        **self._host_key_evidence(e), 'error': str(e)}
+            results = []
+            try:
+                sftp = client.open_sftp()
+                base = os.path.basename(wf)
+                remote_wf = rdir.rstrip('/') + '/' + base
+                sftp.put(wf, remote_wf)
+                for k in keys:
+                    spec = mw.ANALYSES.get(k)
+                    if spec is None:
+                        results.append({'analysis': k, 'ok': False, 'stdout_tail': '',
+                                        'error': f'未知分析项 {k!r}'})
+                        continue
+                    try:
+                        script = spec['stdin_script'](dict(params or {}))
+                    except ValueError as e:
+                        results.append({'analysis': k, 'ok': False, 'stdout_tail': '',
+                                        'error': str(e)})
+                        continue
+                    script_name = f'_wfn_{k}.txt'
+                    with sftp.open(rdir.rstrip('/') + '/' + script_name, 'w') as f:
+                        f.write(script)
+                    cmd = (f'cd {shlex.quote(rdir)} && {rexe} '
+                           f'{shlex.quote(base)} < {script_name}')
+                    _in, out, _err = client.exec_command(cmd, timeout=1800)
+                    text = out.read().decode('utf-8', errors='replace')
+                    code = out.channel.recv_exit_status()
+                    tail = '\n'.join(text.splitlines()[-40:])
+                    results.append({'analysis': k, 'ok': code == 0, 'stdout_tail': tail,
+                                    'error': None if code == 0 else f'远端退出码 {code}'})
+                sftp.close()
+            finally:
+                conn.close_quiet(client, jump)
+            return {'ok': any(r.get('ok') for r in results), 'results': results,
+                    'experimental': True, 'needs_trust': False, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'results': [], 'experimental': True,
+                    'needs_trust': False, 'error': str(e)}
+
+    def wavefn_render(self, scene, files, out_png, params=None, exe=None):
+        """VMD 批渲染一个可视化场景 → {'ok','png','tcl','stdout_tail','error'}。VMD 缺失 → 回传 tcl。"""
+        try:
+            sc = (scene or '').strip()
+            if not sc:
+                return {'ok': False, 'png': None, 'tcl': '', 'error': '未选择渲染场景'}
+            outp = (out_png or '').strip()
+            if not outp:
+                return {'ok': False, 'png': None, 'tcl': '', 'error': '未指定输出 PNG 路径'}
+            vmd_exe = (exe or self._tool_paths().get('vmd') or '').strip() or None
+            r = self._vmd_().render(sc, dict(files or {}), outp,
+                                    exe=vmd_exe, params=dict(params or {}))
+            return {'ok': bool(r.get('ok')), 'png': r.get('png'), 'tcl': r.get('tcl', ''),
+                    'stdout_tail': r.get('stdout_tail', ''), 'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'png': None, 'tcl': '', 'error': str(e)}
+
+    def wavefn_extrema(self, wavefn_file, kind='esp_extrema', exe=None, workdir=None):
+        """查询分子表面极值点(ESP/ALIE)→ {'ok','minima','maxima','script','error'}。
+
+        跑 Multiwfn 定量分子表面分析并解析极小/极大点(反应位点);Multiwfn 缺失 → 回传 stdin 脚本。
+        """
+        try:
+            wf = (wavefn_file or '').strip()
+            if not wf:
+                return {'ok': False, 'minima': [], 'maxima': [], 'script': '',
+                        'error': '未选择波函数文件'}
+            k = (kind or 'esp_extrema').strip()
+            if k not in ('esp_extrema', 'alie_extrema'):
+                return {'ok': False, 'minima': [], 'maxima': [], 'script': '',
+                        'error': f'不支持的极值类型 {k!r}(仅 esp_extrema/alie_extrema)'}
+            mw_exe = (exe or self._tool_paths().get('multiwfn') or '').strip() or None
+            mw = self._mw()
+            r = mw.run(wf, k, exe=mw_exe, workdir=((workdir or '').strip() or None))
+            ex = mw.extrema_parse(r.get('stdout_tail', '')) if r.get('stdout_tail') \
+                else {'minima': [], 'maxima': []}
+            return {'ok': bool(r.get('ok')), 'minima': list(ex.get('minima') or []),
+                    'maxima': list(ex.get('maxima') or []), 'script': r.get('script', ''),
+                    'error': r.get('error') or None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'minima': [], 'maxima': [], 'script': '', 'error': str(e)}
+
+    def wavefn_bcp(self, wavefn_file, exe=None, workdir=None):
+        """AIM 临界点表:跑 aim_cp 并解析 CPprop.txt → 结构化 BCP 列表(编号/类型/ρ/键能)。
+
+        返回 {'ok','cps':[{index,type,xyz_angst,rho,v,bond_energy_kcal}],'cpprop_path',
+        'script','note','error'}。键能仅对 (3,-1) 给 **Espinosa 经验估算** E≈V(r)/2
+        (kcal/mol,面向氢键等弱相互作用;共价键不适用,note 注明口径,绝不假精确)。
+        Multiwfn 缺失 → 回传 stdin 脚本;产物缺失/解析为空 → 诚实报错。
+        """
+        try:
+            wf = (wavefn_file or '').strip()
+            if not wf:
+                return {'ok': False, 'cps': [], 'cpprop_path': None, 'script': '',
+                        'note': None, 'error': '未选择波函数文件'}
+            mw = self._mw()
+            parser = getattr(mw, 'cpprop_parse', None)
+            if not callable(parser):
+                return {'ok': False, 'cps': [], 'cpprop_path': None, 'script': '',
+                        'note': None,
+                        'error': '引擎待扩展:multiwfn_driver 无 cpprop_parse(请更新 vcstudio)'}
+            mw_exe = (exe or self._tool_paths().get('multiwfn') or '').strip() or None
+            r = mw.run(wf, 'aim_cp', exe=mw_exe, workdir=((workdir or '').strip() or None))
+            if not r.get('ok'):
+                return {'ok': False, 'cps': [], 'cpprop_path': None,
+                        'script': r.get('script', ''), 'note': None,
+                        'error': r.get('error') or 'AIM 拓扑分析失败'}
+            cpp = next((p for p in (r.get('outputs') or [])
+                        if str(p).lower().endswith('cpprop.txt')), None)
+            if not cpp or not os.path.isfile(cpp):
+                return {'ok': False, 'cps': [], 'cpprop_path': None, 'script': '',
+                        'note': None,
+                        'error': 'AIM 完成但未找到 CPprop.txt 产物(版本导出名差异?请查工作目录)'}
+            with open(cpp, encoding='utf-8', errors='replace') as f:
+                cps = parser(f.read())
+            if not cps:
+                return {'ok': False, 'cps': [], 'cpprop_path': cpp, 'script': '',
+                        'note': None,
+                        'error': 'CPprop.txt 未解析出临界点(版本格式差异,请把样例反馈给我们)'}
+            return {'ok': True, 'cps': cps, 'cpprop_path': cpp, 'script': '',
+                    'note': ('键能为 Espinosa 经验估算 E≈V(r)/2(换算 kcal/mol),面向氢键等'
+                             '弱相互作用 BCP;共价键不适用,发表引用请注明口径。'),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'cps': [], 'cpprop_path': None, 'script': '',
+                    'note': None, 'error': str(e)}
+
+    # ── 外部工具路径(设置页 / 波函数页 / 外部编辑器卡 共用记忆) ──────────────────
+    def tool_paths_get(self):
+        """读外部工具路径记忆 → {'ok','paths':{key:path},'error'}。"""
+        try:
+            return {'ok': True, 'paths': self._tool_paths(), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'paths': {}, 'error': str(e)}
+
+    def tool_paths_set(self, paths):
+        """合并更新外部工具路径记忆到 config.tool_paths → {'ok','paths','error'}(空串=清除该键值)。"""
+        try:
+            incoming = dict(paths or {})
+            cfg = self._config.load_config()
+            tp = dict(cfg.get('tool_paths') or {})
+            for k, v in incoming.items():
+                key = str(k).strip()
+                if not key:
+                    continue
+                tp[key] = (str(v).strip() if v is not None else '')
+            cfg['tool_paths'] = tp
+            self._config.save_config(cfg)
+            return {'ok': True, 'paths': tp, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'paths': {}, 'error': str(e)}
+
+    # ── ④结果分析页·AIMD 派生(从完成弛豫作业一键派生 AIMD 作业) ────────────────────
+    def derive_aimd(self, job_dir, ensemble='nvt', temp_k=300.0, temp_end_k=None,
+                    steps=10000, potim_fs=1.0, encut=None, out_root=None):
+        """从完成弛豫的作业目录派生 AIMD 作业(NVT/NVE)→ 入台账。命名 {原名}_aimd。
+
+        返回 {'ok','job_dir','changes','warnings','error'}。系综非法/缺 INCAR → ok=False + 中文 error。
+        """
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'job_dir': None, 'changes': [],
+                        'warnings': [], 'error': '作业目录不存在'}
+            base = os.path.basename(os.path.normpath(d))
+            parent = (out_root or '').strip() or os.path.dirname(os.path.normpath(d))
+            out_dir = os.path.join(parent, f'{base}_aimd')
+            kw = dict(ensemble=(ensemble or 'nvt'), temp_k=float(temp_k),
+                      steps=int(steps), potim_fs=float(potim_fs))
+            if temp_end_k not in (None, ''):
+                kw['temp_end_k'] = float(temp_end_k)
+            if encut not in (None, ''):
+                kw['encut'] = float(encut)
+            res = self._aimd_().build_aimd_job(d, out_dir, **kw)
+            if not res.get('ok'):
+                return {'ok': False, 'job_dir': None, 'changes': [],
+                        'warnings': list(res.get('warnings') or []), 'error': res.get('error')}
+            warnings = list(res.get('warnings') or [])
+            try:
+                self._ledger.register(res['job_dir'])
+            except Exception as e:                        # noqa: BLE001
+                warnings.append(f'台账登记失败(不影响已派生目录):{e}')
+            return {'ok': True, 'job_dir': res['job_dir'],
+                    'changes': list(res.get('changes') or []),
+                    'warnings': warnings, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'job_dir': None, 'changes': [],
+                    'warnings': [], 'error': str(e)}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 一、全 DFT 任务目录(②生成输入页):计算类型目录 + U 建议 + 派生分发 + 任务解析
+    # ══════════════════════════════════════════════════════════════════════════
+    # 计算类型 key → estatic build_static_job 的 purpose(电子结构静态派生一族)。
+    # 注意:'chgdiff' 不在此表——差分电荷不是单个静态,而是 AB/A/B 三冻结几何静态,
+    # 单独走 chgdiff.build_chgdiff_jobs(见 derive_task 的 chgdiff 分支),名副其实。
+    _DERIVE_ELECTRONIC = {'static': 'esp', 'dos_pdos': 'pdos', 'bader': 'bader',
+                          'elf': 'elf'}
+
+    @staticmethod
+    def _task_badge(builder_ref):
+        """按 builder_ref 分类任务性质徽标:作业生成 / 结果计算器 / INCAR 顾问(P2 卡片区分)。
+
+        - INCAR 顾问:incar_builder 系(如 vaspsol_keys 只给键、不建作业);
+        - 结果计算器:从已完成作业算标量的纯函数(surface_energy / binding_energy / formation_energy);
+        - 作业生成:其余(建作业目录/系列的 builder,create_project 等)。
+        """
+        ref = str(builder_ref or '')
+        mod, _, func = ref.partition(':')
+        if 'incar_builder' in mod:
+            return 'INCAR 顾问'
+        if func in ('surface_energy', 'binding_energy', 'formation_energy'):
+            return '结果计算器'
+        return '作业生成'
+
+    def task_catalog(self, scenario_key=None, active_calculation=None, engine=None):
+        """计算类型目录(五分类 23 项)→ {'ok','categories','tasks':[{key,name_zh,category,
+        description,requires,outputs,figure,builder_ref,kind_badge}],'error'}。前端据此渲染卡片
+        网格与参数表单;kind_badge 按 builder_ref 分「作业生成/结果计算器/INCAR 顾问」区分。
+
+        engine 缺省保持 VASP 完整目录的兼容行为；显式指定非 VASP 引擎时只返回该
+        文件级适配真正接通的 relax/static/freq，且改写为对应引擎的输入/结果合同。
+        """
+        try:
+            tc = self._tc()
+            rows = tc.list_catalog()
+            sc = None
+            if scenario_key:
+                sc = self._scenarios.get_scenario(str(scenario_key))
+                allowed = set(sc.get('task_keys') or [])
+                rows = [t for t in rows if t.get('key') in allowed]
+            engine_key = self._normalize_engine_key(engine or 'vasp')
+            if engine_key not in self._ENGINE_CAPABILITIES:
+                return {'ok': False, 'categories': [], 'tasks': [],
+                        'engine': engine_key,
+                        'error': f'未知计算引擎 {engine_key!r}'}
+            if engine is not None:
+                supported = set(self._engine_task_keys(engine_key, sc))
+                rows = [t for t in rows if t.get('key') in supported]
+            if active_calculation:
+                rows = [t for t in rows if t.get('key') == str(active_calculation)]
+            tasks = []
+            cap_view = self._engine_capability_view(engine_key, sc)
+            for t in rows:
+                cap = self._ta().capability(t['key'])
+                non_vasp = engine_key != 'vasp'
+                engine_name = self._ENGINE_DISPLAY.get(engine_key, engine_key.upper())
+                tasks.append({
+                    'key': t['key'], 'name_zh': t.get('name_zh', t['key']),
+                    'category': t.get('category', ''),
+                    'description': t.get('description', ''),
+                    'requires': (cap_view.get('input_contract', '') if non_vasp
+                                 else t.get('requires', '')),
+                    'outputs': (cap_view.get('result_contract', '') if non_vasp
+                                else t.get('outputs', '')),
+                    'figure': t.get('figure'),
+                    'builder_ref': t.get('builder_ref', ''),
+                    'kind_badge': ('引擎输入生成' if non_vasp
+                                   else self._task_badge(t.get('builder_ref', ''))),
+                    'analysis_status': cap['analysis_status'],
+                    'report_supported': cap['report_supported'],
+                    'next_action': (f'在生成输入页填写 {engine_name} 专属字段，生成并纳管后到任务页提交。'
+                                    if non_vasp else cap['next_action']),
+                    'engine': engine_key,
+                })
+            categories = [c for c in tc.CATEGORIES
+                          if any(t.get('category') == c for t in rows)]
+            return {'ok': True, 'categories': categories,
+                    'tasks': tasks, 'engine': engine_key,
+                    'capability': cap_view, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'categories': [], 'tasks': [],
+                    'engine': self._normalize_engine_key(engine or 'vasp'),
+                    'capability': {}, 'error': str(e)}
+
+    def task_capabilities(self):
+        """全部 23 类任务的分析/报告能力矩阵，供 UI 如实显示可用程度。"""
+        try:
+            matrix = self._ta().capability_matrix()
+            return {'ok': True, 'capabilities': matrix, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'capabilities': {}, 'error': str(e)}
+
+    def u_suggest(self, elements):
+        """DFT+U 建议表:按元素查 U 库 → {'ok','suggestions':[{element,u,l,orbital,source,note}],
+        'missing':[库内无经验 U 的元素],'incar_keys':LDAU 系列键(按输入序),'error'}。
+
+        库内未登记的元素**不编造 U**(计入 missing);incar_keys 供「应用到 INCAR」直接写入。
+        """
+        try:
+            els = [str(e).strip() for e in (elements or []) if str(e).strip()]
+            ul = self._ul()
+            sugg = list(ul.suggest_u(els))
+            have = {s['element'] for s in sugg}
+            keys = {}
+            try:
+                keys = ul.ldau_keys(sugg, els)
+            except Exception:                             # noqa: BLE001 键组装失败不挡建议表
+                keys = {}
+            return {'ok': True, 'suggestions': sugg,
+                    'missing': [e for e in els if e not in have],
+                    'incar_keys': keys, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'suggestions': [], 'missing': [],
+                    'incar_keys': {}, 'error': str(e)}
+
+    def _derive_ret(self, key, dirs, changes, warnings, *, series=None, extra=None):
+        """派生统一返回:逐目录入台账(失败并入 warnings,不撤销已生成目录)。"""
+        warns = list(warnings or [])
+        for d in dirs:
+            try:
+                self._ledger.register(d)
+            except Exception as e:                        # noqa: BLE001
+                warns.append(f'台账登记失败({os.path.basename(str(d))}):{e}')
+        out = {'ok': True, 'key': key, 'job_dirs': [str(d) for d in dirs],
+               'series': series, 'changes': list(changes or []),
+               'warnings': warns, 'error': None}
+        if extra:
+            out.update(extra)
+        return out
+
+    @staticmethod
+    def _series_dirs(res):
+        """系列 build 返回 → (dirs 列表, series 视图)。"""
+        series = list(res.get('series') or [])
+        dirs = [s.get('dir') for s in series if s.get('dir')]
+        return dirs, series
+
+    def derive_task(self, key, src_dir, params=None):
+        """按计算类型 key 从源作业目录派生下一步作业(分发到对应 builder)→ 入台账。
+
+        支持:cellopt / static / dos_pdos / bader / chgdiff / elf / bands / eos /
+        workfunction / dimer / freq / aimd / conv_encut / conv_kmesh / conv_vacuum /
+        conv_thickness。返回 {'ok','key','job_dirs':[...],'series':[...]|None,'changes',
+        'warnings','error'}。不可派生的 key(如吸附能项目/表面能计算器)→ ok=False + 中文说明。
+        """
+        try:
+            k = str(key or '').strip()
+            d = (src_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'key': k, 'job_dirs': [], 'series': None,
+                        'changes': [], 'warnings': [], 'error': '源作业目录不存在'}
+            p = dict(params or {})
+            base = os.path.basename(os.path.normpath(d))
+            parent = (p.get('out_root') or '').strip() or os.path.dirname(
+                os.path.normpath(d))
+
+            if k == 'cellopt':
+                out_dir = os.path.join(parent, f'{base}_cellopt')
+                res = self._co().build_cellopt_job(
+                    d, out_dir, bump_encut=bool(p.get('bump_encut', True)))
+                return self._derive_ret(k, [res['out_dir']], res.get('changes'),
+                                        res.get('warnings'))
+            if k == 'vaspsol':
+                from vcstudio.generate import vaspsol_pair
+                res = vaspsol_pair.build_pair(
+                    d, parent, eb_k=float(p.get('eb_k', 78.4) or 78.4))
+                return self._derive_ret(
+                    k, res['job_dirs'], res.get('changes'), res.get('warnings'),
+                    extra={'pair_id': res['pair_id'],
+                           'vacuum_dir': res['vacuum_dir'],
+                           'solvent_dir': res['solvent_dir'],
+                           'eb_k': res['eb_k']})
+            if k in self._DERIVE_ELECTRONIC:
+                out_dir = os.path.join(parent, f'{base}_{k}')
+                res = self._es().build_static_job(
+                    d, out_dir, purpose=self._DERIVE_ELECTRONIC[k])
+                return self._derive_ret(k, [res['out_dir']], res.get('changes'),
+                                        res.get('warnings'))
+            if k == 'chgdiff':
+                # 差分电荷:名副其实拆 AB/A/B 三冻结几何静态(此前误接单静态,拿不到 Δρ)。
+                idx = p.get('adsorbate_indices') or p.get('indices')
+                ads = [int(i) for i in idx] if idx else []
+                if not ads:
+                    return {'ok': False, 'key': k, 'job_dirs': [], 'series': None,
+                            'changes': [], 'warnings': [],
+                            'error': ('差分电荷需指定吸附质原子序号(1 起,对齐 POSCAR),'
+                                      '据此拆 AB/仅表面 A/仅吸附质 B 三冻结几何静态;'
+                                      '请在参数里填「吸附质原子序号」。')}
+                out_root = os.path.join(parent, f'{base}_chgdiff')
+                res = self._chg().build_chgdiff_jobs(d, out_root, ads)
+                dirs = [str(v) for v in (res.get('dirs') or {}).values()]
+                changes = [f'差分电荷三静态已拆:{", ".join(os.path.basename(x) for x in dirs)}'
+                           f'(AB 全原子 / A 仅表面 / B 仅吸附质,同冻结几何)']
+                warns = []
+                for r in (res.get('results') or {}).values():
+                    warns += list((r or {}).get('warnings') or [])
+                return self._derive_ret(k, dirs, changes, warns,
+                                        extra={'chgdiff_dirs': res.get('dirs')})
+            if k == 'bands':
+                out_dir = os.path.join(parent, f'{base}_bands')
+                res = self._bd().build_bands_job(
+                    d, out_dir, lattice=(p.get('lattice') or None),
+                    npoints=int(p.get('npoints', 40) or 40))
+                return self._derive_ret(k, [res['out_dir']], res.get('changes'),
+                                        res.get('warnings'),
+                                        extra={'lattice': res.get('lattice')})
+            if k == 'workfunction':
+                out_dir = os.path.join(parent, f'{base}_wf')
+                res = self._wf().build_workfunction_job(
+                    d, out_dir, add_dipole=str(p.get('add_dipole', 'auto')))
+                return self._derive_ret(k, [res['out_dir']], res.get('changes'),
+                                        res.get('warnings'),
+                                        extra={'dipole': res.get('dipole')})
+            if k == 'dimer':
+                out_dir = os.path.join(parent, f'{base}_dimer')
+                kw = {}
+                if p.get('amplitude') not in (None, ''):
+                    kw['amplitude'] = float(p['amplitude'])
+                if p.get('displaced_poscar'):
+                    kw['displaced_poscar'] = str(p['displaced_poscar'])
+                res = self._dm().build_dimer_job(d, out_dir, **kw)
+                return self._derive_ret(k, [res['out_dir']], res.get('changes'),
+                                        res.get('warnings'),
+                                        extra={'modecar_method': res.get('modecar_method')})
+            if k == 'eos':
+                out_root = os.path.join(parent, f'{base}_eos')
+                kw = {}
+                if p.get('scales'):
+                    kw['scales'] = [float(x) for x in p['scales']]
+                res = self._eos_().build_eos_series(d, out_root, **kw)
+                dirs, series = self._series_dirs(res)
+                return self._derive_ret(k, dirs, [], res.get('warnings'), series=series)
+            if k in ('conv_encut', 'conv_kmesh', 'conv_vacuum', 'conv_thickness'):
+                return self._derive_conv(k, d, parent, base, p)
+            if k == 'freq':
+                r = self.derive_freq(d, out_root=parent)
+                return {'ok': r['ok'], 'key': k,
+                        'job_dirs': [r['job_dir']] if r.get('job_dir') else [],
+                        'series': None, 'changes': r.get('changes') or [],
+                        'warnings': r.get('warnings') or [], 'error': r.get('error')}
+            if k == 'aimd':
+                r = self.derive_aimd(
+                    d, ensemble=str(p.get('ensemble', 'nvt')),
+                    temp_k=float(p.get('temp_k', 300.0) or 300.0),
+                    temp_end_k=p.get('temp_end_k'), steps=int(p.get('steps', 10000) or 10000),
+                    potim_fs=float(p.get('potim_fs', 1.0) or 1.0),
+                    encut=p.get('encut'), out_root=parent)
+                return {'ok': r['ok'], 'key': k,
+                        'job_dirs': [r['job_dir']] if r.get('job_dir') else [],
+                        'series': None, 'changes': r.get('changes') or [],
+                        'warnings': r.get('warnings') or [], 'error': r.get('error')}
+            return {'ok': False, 'key': k, 'job_dirs': [], 'series': None,
+                    'changes': [], 'warnings': [],
+                    'error': f'任务类型 {k!r} 不支持一键派生(如吸附能项目/表面能计算器请走专用流程)'}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'key': str(key), 'job_dirs': [], 'series': None,
+                    'changes': [], 'warnings': [], 'error': str(e)}
+
+    def _derive_conv(self, k, d, parent, base, p):
+        """收敛扫描系列派生(encut/kmesh/vacuum/thickness):默认值兜底,系列各作业入台账。
+
+        conv_thickness(v3.2.2 接通,Backlog #2):源作业 job.yaml 若带金属 slab 建模配方
+        (inputs.recipe,来自 metal_slab_build),据其构造 slab_builder_fn 再生不同层数 →
+        系列真生成;SAC 配方 → 「单层无层厚」针对性说明;无配方 → conv_scan 默认诚实
+        note(裸 CONTCAR 无米勒面信息)。note 并入 warnings + extra 透传,0 作业绝不假成功。
+        """
+        cs = self._cs()
+        out_root = os.path.join(parent, f'{base}_{k}')
+        if k == 'conv_encut':
+            vals = [int(x) for x in (p.get('values') or [])] or None
+            res = (cs.build_encut_series(d, out_root, values=vals) if vals
+                   else cs.build_encut_series(d, out_root))
+        elif k == 'conv_kmesh':
+            meshes = p.get('meshes') or [[3, 3, 1], [5, 5, 1], [7, 7, 1]]
+            res = cs.build_kmesh_series(d, out_root, meshes)
+        elif k == 'conv_vacuum':
+            vacs = [float(x) for x in (p.get('vacuums') or [10, 12, 15, 18])]
+            res = cs.build_vacuum_series(d, out_root, vacs)
+        else:  # conv_thickness:job.yaml 有 metal_slab 配方 → 真再生;无/不适用 → 诚实说明
+            layers = [int(x) for x in (p.get('layers') or [3, 4, 5])]
+            builder_fn, why = self._thickness_builder_from_job(d)
+            res = cs.build_slab_thickness_series(d, out_root, layers,
+                                                 slab_builder_fn=builder_fn)
+            if builder_fn is None and why:
+                res = dict(res)
+                res['note'] = why                         # 针对性说明盖过通用 note
+        dirs, series = self._series_dirs(res)
+        warns = list(res.get('warnings') or [])
+        note = res.get('note')
+        # note(层厚需从建 slab 流程发起)不吞掉:并入 warnings,并单列 extra 供前端判 warn。
+        if note and note not in warns:
+            warns.append(note)
+        return self._derive_ret(k, dirs, [], warns, series=series,
+                                extra={'note': note})
+
+    # ── 输入读取小工具(NEB / 计算器共用;优先 CONTCAR) ─────────────────────────
+    @staticmethod
+    def _read_struct_text(job_dir):
+        """作业目录结构文本:优先 CONTCAR(已弛豫),回落 POSCAR;都无 → None。"""
+        for name in ('CONTCAR', 'POSCAR'):
+            p = os.path.join(job_dir, name)
+            if os.path.isfile(p):
+                try:
+                    with open(p, encoding='utf-8', errors='replace') as f:
+                        return f.read()
+                except OSError:
+                    return None
+        return None
+
+    @staticmethod
+    def _read_named_text(job_dir, name):
+        """读作业目录下指定文件文本;缺文件/读失败 → None。"""
+        p = os.path.join(job_dir, name)
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding='utf-8', errors='replace') as f:
+                    return f.read()
+            except OSError:
+                return None
+        return None
+
+    @staticmethod
+    def _fmt_incar_value(v):
+        """INCAR 值格式化:bool→.TRUE./.FALSE.,float→紧凑,其余原样。"""
+        if isinstance(v, bool):
+            return '.TRUE.' if v else '.FALSE.'
+        if isinstance(v, float):
+            return f'{v:g}'
+        return str(v)
+
+    @classmethod
+    def _incar_lines_from(cls, keys):
+        """INCAR 键 dict → ['KEY = VALUE', ...](供预览/追加)。"""
+        return [f'{k} = {cls._fmt_incar_value(v)}' for k, v in (keys or {}).items()]
+
+    @staticmethod
+    def _species_counts(text):
+        """POSCAR/CONTCAR 文本 → {元素: 计数} dict;解析失败 → {}。"""
+        try:
+            from vcstudio.generate.poscar import parse_poscar_species
+            syms, counts = parse_poscar_species(text)
+            out = {}
+            for s, c in zip(syms or [], counts or []):
+                out[s] = out.get(s, 0) + int(c)
+            return out
+        except Exception:                                 # noqa: BLE001
+            return {}
+
+    @staticmethod
+    def _neb_endpoint_energy(job_dir):
+        """端点最终能量：OSZICAR E0 优先，退 OUTCAR sigma→0/vasprun.xml。"""
+        oszicar = os.path.join(job_dir, 'OSZICAR')
+        if os.path.isfile(oszicar):
+            energy = None
+            try:
+                with open(oszicar, encoding='utf-8', errors='replace') as handle:
+                    for line in handle:
+                        match = re.search(r'\bE0=\s*([-+0-9.Ee]+)', line)
+                        if match:
+                            energy = float(match.group(1))
+            except (OSError, ValueError):
+                energy = None
+            if energy is not None and math.isfinite(energy):
+                return energy, 'OSZICAR:E0'
+        outcar = os.path.join(job_dir, 'OUTCAR')
+        if os.path.isfile(outcar):
+            energy = None
+            try:
+                with open(outcar, encoding='utf-8', errors='replace') as handle:
+                    for line in handle:
+                        match = re.search(
+                            r'energy\(sigma->0\)\s*=\s*([-+0-9.Ee]+)', line)
+                        if match:
+                            energy = float(match.group(1))
+            except (OSError, ValueError):
+                energy = None
+            if energy is not None and math.isfinite(energy):
+                return energy, 'OUTCAR:energy(sigma->0)'
+        vasprun = os.path.join(job_dir, 'vasprun.xml')
+        if os.path.isfile(vasprun):
+            try:
+                from pathlib import Path
+                from vcstudio.project import result_import
+                parsed = result_import._parse_vasprun(Path(vasprun))
+                facts = parsed if isinstance(parsed, dict) else {}
+                energy = facts.get('energy_e0_eV')
+                if (isinstance(energy, (int, float)) and not isinstance(energy, bool)
+                        and math.isfinite(float(energy))):
+                    return float(energy), str(
+                        facts.get('energy_source') or 'vasprun.xml:e_0_energy')
+            except Exception:                             # noqa: BLE001
+                pass
+        return None, None
+
+    def _attach_neb_endpoint_evidence(self, job_dir, start_dir, end_dir, n_images):
+        """把已算端点的真实输出带入 00/N+1，并将哈希/能量来源写入 manifest。"""
+        import shutil
+
+        root = os.path.abspath(job_dir)
+        pairs = (('start', os.path.abspath(start_dir), '00'),
+                 ('end', os.path.abspath(end_dir), f'{int(n_images) + 1:02d}'))
+        records, warnings = {}, []
+        copied_total = 0
+        for role, source, frame in pairs:
+            destination = os.path.join(root, frame)
+            record = {'role': role, 'source_dir': source, 'target_frame': frame,
+                      'files': [], 'energy_e0_eV': None, 'energy_source': None,
+                      'trusted': False, 'source_state': None}
+            if not os.path.isdir(destination):
+                warnings.append(f'NEB {frame} image 目录不存在，无法写入端点证据。')
+                records[role] = record
+                continue
+            for name in ('OSZICAR', 'OUTCAR', 'vasprun.xml'):
+                src = os.path.join(source, name)
+                dst = os.path.join(destination, name)
+                if os.path.isfile(dst):
+                    same = False
+                    if os.path.isfile(src):
+                        try:
+                            same = _sha256_file(src) == _sha256_file(dst)
+                        except OSError:
+                            same = False
+                    if not same:
+                        backup = (f'{dst}.vcstudio-{time.time_ns()}.'
+                                  'endpoint.bak')
+                        os.replace(dst, backup)
+                        warnings.append(
+                            f'{frame}/{name} 旧证据已可恢复备份为 {os.path.basename(backup)}。')
+                if not os.path.isfile(src):
+                    continue
+                if not os.path.isfile(dst):
+                    shutil.copy2(src, dst)
+                stat = os.stat(dst)
+                record['files'].append({
+                    'name': name, 'sha256': _sha256_file(dst), 'size': stat.st_size,
+                    'source': src,
+                })
+                copied_total += 1
+
+            energy, energy_source = self._neb_endpoint_energy(destination)
+            try:
+                source_manifest = self._manifest.load_manifest(source) or {}
+            except Exception:                             # noqa: BLE001
+                source_manifest = {}
+            if not isinstance(source_manifest, dict):
+                source_manifest = {}
+            record['source_state'] = source_manifest.get('state')
+            if energy is not None:
+                record['energy_e0_eV'] = energy
+                record['energy_source'] = f'copied:{energy_source}'
+                evidence_name = energy_source.split(':', 1)[0]
+                record['trusted'] = any(
+                    item.get('name') == evidence_name and item.get('sha256')
+                    for item in record['files'])
+            else:
+                results = source_manifest.get('results') or {}
+                value = results.get('energy_e0_eV') if isinstance(results, dict) else None
+                declared_source = (str(results.get('energy_source') or '').strip()
+                                   if isinstance(results, dict) else '')
+                if (source_manifest.get('state') == 'DONE' and declared_source
+                        and isinstance(value, (int, float)) and not isinstance(value, bool)
+                        and math.isfinite(float(value))):
+                    record['energy_e0_eV'] = float(value)
+                    record['energy_source'] = f'source_manifest:{declared_source}'
+                    record['source_job_id'] = source_manifest.get('job_id')
+                    record['trusted'] = bool(record['source_job_id'])
+            if record['energy_e0_eV'] is None:
+                label = '始态' if role == 'start' else '末态'
+                warnings.append(
+                    f'{label} {frame} 未找到可复核能量：'
+                    '请在源目录保留 OSZICAR/OUTCAR，或先将已收敛结果导入台账。')
+            elif not record['trusted']:
+                label = '始态' if role == 'start' else '末态'
+                warnings.append(
+                    f'{label} {frame} 能量缺少文件哈希或源 job_id，未标记为可信；'
+                    '分析器不会用它补齐能垒。')
+            records[role] = record
+
+        # 真 neb_builder 会先落标准清单；外部构建器若无清单，则不伪造。
+        try:
+            manifest_value = self._manifest.load_manifest(root)
+            if isinstance(manifest_value, dict):
+                inputs = dict(manifest_value.get('inputs') or {})
+                inputs['neb_endpoints'] = records
+                manifest_value['inputs'] = inputs
+                self._manifest.save_manifest(root, manifest_value)
+        except Exception as ex:                           # noqa: BLE001
+            warnings.append(f'NEB 端点证据写入 job.yaml 失败：{ex}')
+        return records, copied_total, warnings
+
+    # ── P0-1 NEB 过渡态接通(始/末态目录 → 标准 NEB 目录树) ──────────────────────
+    # 注:nimages/out_root 为位置或关键字参(非 keyword-only)——前端经 pywebview 桥按位置
+    # 传参,keyword-only 会断桥;与 gen_run/wavefn_run 等 JS 面向方法同口径。
+    def derive_neb(self, start_dir, end_dir, nimages=5, out_root=None):
+        """NEB 过渡态接通:始/末态目录 → neb_builder.build_neb_dir(插值 + 多 image 目录树)→ 入台账。
+
+        - start_dir/end_dir:已弛豫的初/末态作业目录(读 CONTCAR 优先、否则 POSCAR)。
+        - INCAR 取自 start_dir(否则 end_dir);两者皆缺 → 中文错误(NEB 须用户电子学设置)。
+        - POTCAR:start_dir 有则透传其路径,否则 build 侧告警、提交前补齐。
+        返回 {'ok','job_dir','n_images','changes','warnings','error'}。端点不一致/插值重叠等 →
+        error(引擎 ValueError 冒泡),绝不假成功。
+        """
+        try:
+            s = (start_dir or '').strip()
+            e = (end_dir or '').strip()
+            if not s or not os.path.isdir(s):
+                return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                        'warnings': [], 'error': '始态作业目录不存在'}
+            if not e or not os.path.isdir(e):
+                return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                        'warnings': [], 'error': '末态作业目录不存在'}
+            ini = self._read_struct_text(s)
+            fin = self._read_struct_text(e)
+            if not ini:
+                return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                        'warnings': [], 'error': '始态目录缺 CONTCAR/POSCAR,无法作 NEB 初态'}
+            if not fin:
+                return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                        'warnings': [], 'error': '末态目录缺 CONTCAR/POSCAR,无法作 NEB 末态'}
+            incar = self._read_named_text(s, 'INCAR') or self._read_named_text(e, 'INCAR')
+            if not incar:
+                return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                        'warnings': [],
+                        'error': 'NEB 须用户 INCAR(始/末态目录均无 INCAR);请先在始态目录放置 INCAR'}
+            try:
+                n = int(nimages)
+            except (TypeError, ValueError):
+                n = 5
+            base = os.path.basename(os.path.normpath(s))
+            parent = (out_root or '').strip() or os.path.dirname(os.path.normpath(s))
+            out_dir = os.path.join(parent, f'{base}_neb')
+            potcar_path = os.path.join(s, 'POTCAR')
+            potcar_fn = potcar_path if os.path.isfile(potcar_path) else None
+            res = self._neb().build_neb_dir(
+                out_dir, ini, fin, incar, n_images=n, potcar_fn=potcar_fn)
+            warns = list(res.get('warnings') or [])
+            endpoint_evidence, copied_count, endpoint_warnings = \
+                self._attach_neb_endpoint_evidence(res['job_dir'], s, e, res['n_images'])
+            warns.extend(endpoint_warnings)
+            try:
+                self._ledger.register(res['job_dir'])
+            except Exception as ex:                       # noqa: BLE001
+                warns.append(f'台账登记失败(不影响已生成 NEB 目录):{ex}')
+            changes = [f'已生成标准 NEB 目录树:00 初态 + {res["n_images"]} 个中间 image + 末态,'
+                       f'根目录共享 INCAR/POTCAR/KPOINTS(INCAR 只补不改补齐 IMAGES/SPRING 等)']
+            if copied_count:
+                changes.append(f'已带入 {copied_count} 份初/末态能量证据并记录 SHA256。')
+            return {'ok': True, 'job_dir': res['job_dir'], 'n_images': res['n_images'],
+                    'changes': changes, 'warnings': warns,
+                    'endpoint_evidence': endpoint_evidence, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'job_dir': None, 'n_images': 0, 'changes': [],
+                    'warnings': [], 'error': str(e)}
+
+    # ── P0-2 形成能/结合能计算器 ───────────────────────────────────────────────
+    # 位置或关键字参(非 keyword-only):前端经 pywebview 桥按位置传参,keyword-only 会断桥。
+    def formation_binding_calc(self, sac_dir, substrate_dir=None,
+                               atom_energies=None, chem_pots=None):
+        """形成能/结合能计算器:DONE/完整性/方法闸 → references 计算 + σ。
+
+        - sac_dir:单原子催化剂(SAC)作业目录(读 OSZICAR 末 E0 作 E_sac,读 CONTCAR/POSCAR 组成)。
+        - substrate_dir:含空位、未嵌金属的基底作业目录(E_substrate);Eb 与 Ef 都相对它。
+        - atom_energies:{元素: 孤立原子能量 eV}(结合能用金属原子能;缺 → 无法算 Eb 的中文提示)。
+        - chem_pots:{元素: 化学势 μ eV/atom}(形成能用;counts 取 SAC−基底 组成差)。
+        返回 {'ok','e_sac','e_substrate','metal','counts','binding_energy','formation_energy',
+        'sigma','stable','stability_note','hints','warnings','error'}。缺量只提示、绝不编造。
+        """
+        try:
+            from vcstudio.project import energy_gate
+
+            sd = (sac_dir or '').strip()
+            if not sd or not os.path.isdir(sd):
+                return {'ok': False, 'e_sac': None, 'e_substrate': None, 'metal': None,
+                        'counts': {}, 'binding_energy': None, 'formation_energy': None,
+                        'sigma': None, 'stable': None, 'stability_note': None,
+                        'hints': [], 'warnings': [], 'method_check': None,
+                        'error': 'SAC 作业目录不存在'}
+            e_sac, sac_manifest, completion_notes = energy_gate.validate_done_energy(
+                sd, 'SAC 作业', self._manifest)
+            refs = self._refs()
+            hints, warnings, completion_evidence = [], [], list(completion_notes)
+            sac_counts = self._species_counts(self._read_struct_text(sd) or '')
+
+            # 基底能量 + 组成
+            e_sub, sub_counts, sub_manifest = None, {}, None
+            sub = (substrate_dir or '').strip()
+            if sub and os.path.isdir(sub):
+                e_sub, sub_manifest, sub_notes = energy_gate.validate_done_energy(
+                    sub, '基底作业', self._manifest)
+                completion_evidence.extend(sub_notes)
+                sub_counts = self._species_counts(self._read_struct_text(sub) or '')
+            elif sub:
+                raise ValueError('基底作业目录不存在')
+
+            method_check = None
+            if sub_manifest is not None:
+                method_check = energy_gate.compare_methods([
+                    energy_gate.method_record(sd, sac_manifest, 'SAC'),
+                    energy_gate.method_record(sub, sub_manifest, '基底'),
+                ], require_same_kpoints=True)
+                warnings.extend(method_check['warnings'])
+                if method_check['status'] == 'incompatible':
+                    return {'ok': False, 'e_sac': e_sac, 'e_substrate': e_sub,
+                            'metal': None, 'counts': {}, 'binding_energy': None,
+                            'formation_energy': None, 'sigma': None, 'stable': None,
+                            'stability_note': None, 'hints': [], 'warnings': warnings,
+                            'method_check': method_check, 'evidence': completion_evidence,
+                            'error': '方法不一致，能量不可直接相减：'
+                                     + '；'.join(method_check['issues'])}
+
+            # 组成差 counts(SAC − 基底);金属 = 差值为正且在 atom_energies 中的元素
+            delta = {}
+            if sac_counts and sub_counts:
+                for el in set(sac_counts) | set(sub_counts):
+                    d = sac_counts.get(el, 0) - sub_counts.get(el, 0)
+                    if d != 0:
+                        delta[el] = d
+            ae = {}
+            for k, v in (atom_energies or {}).items():
+                try:
+                    ae[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
+            if ae:
+                warnings.append('孤立原子能量为手工输入；请确认其泛函、赝势、ENCUT 和自旋口径与 SAC 一致')
+            added = [el for el, d in delta.items() if d > 0 and el in ae]
+            metal = None
+            if len(added) == 1:
+                metal = added[0]
+            elif added:
+                metal = added[0]
+            elif len(ae) == 1:
+                metal = next(iter(ae))
+
+            # 结合能 Eb + σ 稳定性
+            eb, sigma, stable, stab_note = None, None, None, None
+            if e_sub is None and sub:
+                pass                                       # 已在上面提示
+            elif not sub:
+                hints.append('结合能需基底作业(含空位、未嵌金属)的能量;请选「基底作业目录」。')
+            elif not ae:
+                hints.append('结合能需金属孤立原子能量;请填「金属原子能量」(元素→eV)。')
+            elif metal is None:
+                hints.append('无法判定嵌入的金属元素(SAC 与基底组成差不明确);'
+                             '请确认所选作业,或让金属原子能量只含目标金属。')
+            else:
+                eb = refs.binding_energy(e_sac, e_sub, ae[metal])
+                try:
+                    ecoh = refs.cohesive_energy(metal)
+                    verdict = refs.stability_verdict(eb, ecoh)
+                    sigma, stable, stab_note = verdict['sigma'], verdict['stable'], verdict['note']
+                except ValueError as ve:
+                    hints.append(f'稳定性 σ 需金属内聚能:{ve}')
+
+            # 形成能 Ef(以基底为参考,counts 取组成差,μ 取 chem_pots)
+            ef = None
+            cp = {}
+            for k, v in (chem_pots or {}).items():
+                try:
+                    cp[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
+            if cp:
+                warnings.append('化学势为手工输入参考；请确认其参考态与本次 DFT 方法口径一致')
+            if e_sub is None:
+                if not sub:
+                    hints.append('形成能需参考态(基底)作业能量;请选基底作业目录。')
+            elif not delta:
+                hints.append('形成能需 SAC 与基底的组成差(判掺入/移除的物种);'
+                             '请确认两作业结构可解析组成。')
+            elif not cp:
+                hints.append('形成能需各变动物种的化学势 μ(eV/atom);请填「化学势」。')
+            else:
+                try:
+                    ef = refs.formation_energy(e_sac, e_sub, cp, delta)
+                except ValueError as ve:
+                    hints.append(f'形成能:{ve}')
+
+            result = {'ok': (eb is not None) or (ef is not None),
+                      'e_sac': e_sac, 'e_substrate': e_sub, 'metal': metal,
+                      'counts': delta, 'binding_energy': eb, 'formation_energy': ef,
+                      'sigma': sigma, 'stable': stable, 'stability_note': stab_note,
+                      'hints': hints, 'warnings': warnings, 'method_check': method_check,
+                      'evidence': completion_evidence, 'error': None}
+            if result['ok']:
+                try:
+                    from vcstudio.project import special_report
+                    evidence_dirs = [sd] + ([sub] if sub else [])
+                    result['report_file'] = special_report.write(
+                        '形成能 / 结合能报告', result, evidence_dirs,
+                        os.path.join(sd, 'vcstudio-formation-binding-report.html'))
+                except Exception as report_error:         # noqa: BLE001
+                    result['report_file'] = None
+                    warnings.append(f'报告生成失败：{report_error}')
+            else:
+                result['report_file'] = None
+            return result
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'e_sac': None, 'e_substrate': None, 'metal': None,
+                    'counts': {}, 'binding_energy': None, 'formation_energy': None,
+                    'sigma': None, 'stable': None, 'stability_note': None,
+                    'hints': [], 'warnings': [], 'method_check': None, 'error': str(e)}
+
+    # ── P0-4 差分电荷合成(三作业 CHGCAR → CHGDIFF.vasp + 面平均) ──────────────────
+    def compute_chgdiff(self, ab_dir, a_dir, b_dir, out_dir=None):
+        """差分电荷合成:三作业 CHGCAR → chgdiff.compute_chgdiff 出 CHGDIFF.vasp + 面平均 Δρ̄(z)。
+
+        返回 {'ok','out','max','min','n_grid','profile':{'z','rho','axis'},'error'}。
+        任一 CHGCAR 缺失/网格或晶格不一致/原子数不守恒 → 中文 error(引擎硬校验冒泡),不静默错算。
+        """
+        try:
+            from vcstudio.project import energy_gate
+
+            paths = {}
+            method_records = []
+            warnings = []
+            for tag, dd in (('AB', ab_dir), ('A', a_dir), ('B', b_dir)):
+                d = (dd or '').strip()
+                if not d or not os.path.isdir(d):
+                    return {'ok': False, 'out': None, 'max': None, 'min': None,
+                            'n_grid': 0, 'profile': {}, 'error': f'{tag} 作业目录不存在'}
+                cp = os.path.join(d, 'CHGCAR')
+                if not os.path.isfile(cp):
+                    return {'ok': False, 'out': None, 'max': None, 'min': None,
+                            'n_grid': 0, 'profile': {},
+                            'error': f'{tag} 作业目录缺 CHGCAR;差分电荷需三体系各自自洽 CHGCAR,'
+                                     '请先跑完三个静态作业。'}
+                _energy, job_manifest, completion_notes = \
+                    energy_gate.validate_done_energy(d, f'{tag} 作业', self._manifest)
+                warnings.extend(completion_notes)
+                method_records.append(
+                    energy_gate.method_record(d, job_manifest, tag))
+                paths[tag] = cp
+            method_check = energy_gate.compare_methods(
+                method_records, require_same_kpoints=True)
+            warnings.extend(method_check['warnings'])
+            if method_check['status'] == 'incompatible':
+                return {'ok': False, 'out': None, 'max': None, 'min': None,
+                        'n_grid': 0, 'profile': {}, 'warnings': warnings,
+                        'method_check': method_check, 'report_file': None,
+                        'error': 'AB/A/B 方法不一致，差分电荷不可相减：'
+                                 + '；'.join(method_check['issues'])}
+            out = (out_dir or '').strip() or os.path.dirname(paths['AB'])
+            os.makedirs(out, exist_ok=True)
+            out_path = os.path.join(out, 'CHGDIFF.vasp')
+            chg = self._chg()
+            res = chg.compute_chgdiff(paths['AB'], paths['A'], paths['B'], out_path)
+            profile = {}
+            try:
+                profile = chg.plane_averaged(out_path, 'z')
+            except Exception:                             # noqa: BLE001 面平均失败不挡主产物
+                profile = {}
+            result = {'ok': True, 'out': res['out'], 'max': res['max'],
+                      'min': res['min'], 'n_grid': res['n_grid'], 'profile': profile,
+                      'warnings': warnings, 'method_check': method_check, 'error': None}
+            try:
+                from vcstudio.project import special_report
+                result['report_file'] = special_report.write(
+                    '差分电荷报告', result,
+                    [(ab_dir or '').strip(), (a_dir or '').strip(), (b_dir or '').strip()],
+                    os.path.join(out, 'vcstudio-charge-difference-report.html'))
+            except Exception as report_error:             # noqa: BLE001
+                result['report_file'] = None
+                warnings.append(f'报告生成失败：{report_error}')
+            return result
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'out': None, 'max': None, 'min': None, 'n_grid': 0,
+                    'profile': {}, 'warnings': [], 'method_check': None,
+                    'report_file': None, 'error': str(e)}
+
+    # ── P0-3 VASPsol 隐式溶剂化预览(将写入的键 + 补丁编译 warning) ─────────────────
+    def vaspsol_preview(self, eb_k=78.4, enabled=True):
+        """VASPsol 隐式溶剂化预览:incar_builder.vaspsol_keys → 将写入的 INCAR 键 + 补丁编译 warning。
+
+        返回 {'ok','keys','incar_lines','warning','error'}。供②生成页「高级」区在勾选前后展示
+        (标准 VASP 无 VASPsol 会**静默**给真空结果的陷阱一并提醒,绝不假装已溶剂化)。
+        """
+        try:
+            ib = self._ib()
+            keys = ib.vaspsol_keys(bool(enabled), eb_k=float(eb_k))
+            return {'ok': True, 'keys': keys, 'incar_lines': self._incar_lines_from(keys),
+                    'warning': getattr(ib, 'VASPSOL_ADVISORY', ''), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'keys': {}, 'incar_lines': [], 'warning': '', 'error': str(e)}
+
+    def vaspsol_pair_calc(self, vacuum_dir, solvent_dir, out_path=None):
+        """校验同几何真空/溶剂配对，计算 ΔE_solv 并原子写可追溯 HTML 报告。"""
+        try:
+            from vcstudio.project import vaspsol
+            result = vaspsol.write_report(
+                str(vacuum_dir or '').strip(), str(solvent_dir or '').strip(),
+                str(out_path).strip() if out_path else None)
+            result['error'] = None
+            return result
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e), 'report_file': None}
+
+    # ── ④结果分析页·任务解析(按 task_type 自动解析 + 出图) ──────────────────────
+    @staticmethod
+    def _osz_energy(job_dir):
+        """OSZICAR 末态自洽能 E0 → float|None(未跑完/缺文件 → None)。"""
+        try:
+            p = os.path.join(job_dir, 'OSZICAR')
+            if not os.path.isfile(p):
+                return None
+            e = None
+            with open(p, encoding='utf-8', errors='replace') as f:
+                for ln in f:
+                    if 'E0=' in ln:
+                        try:
+                            e = float(ln.split('E0=')[1].split()[0])
+                        except (IndexError, ValueError):
+                            pass
+            return e
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _poscar_volume(job_dir):
+        """CONTCAR/POSCAR 晶胞体积(Å³)，复用完整 VASP 缩放语义解析。"""
+        try:
+            from vcstudio.generate.poscar import read_cell_vectors
+
+            for name in ('CONTCAR', 'POSCAR'):
+                p = os.path.join(job_dir, name)
+                if not os.path.isfile(p):
+                    continue
+                with open(p, encoding='utf-8', errors='replace') as handle:
+                    a = read_cell_vectors(handle.read())
+                det = (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+                       - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+                       + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
+                return abs(det)
+            return None
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _outcar_efermi(job_dir):
+        """OUTCAR 费米能 E-fermi → float|None。"""
+        try:
+            import re as _re
+            p = os.path.join(job_dir, 'OUTCAR')
+            if not os.path.isfile(p):
+                return None
+            ef = None
+            with open(p, encoding='utf-8', errors='replace') as f:
+                for ln in f:
+                    if 'E-fermi' in ln:
+                        m = _re.search(r'E-fermi\s*:\s*([-\d.]+)', ln)
+                        if m:
+                            ef = float(m.group(1))
+            return ef
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    def _infer_task_kind(self, d):
+        """从 manifest task_type 或目录内容推断 23 类任务；未知时不猜成 VASP。"""
+        try:
+            m = self._manifest.load_manifest(d)
+            tt = str((m or {}).get('task_type') or '').lower()
+            key = self._ta().normalize_task_key(tt)
+            if self._ta().capability(key).get('known'):
+                return key
+        except Exception:                                 # noqa: BLE001
+            pass
+        try:
+            subs = [x for x in os.listdir(d) if os.path.isdir(os.path.join(d, x))]
+        except OSError:
+            subs = []
+        if any(x.startswith('eos_') for x in subs):
+            return 'eos'
+        if any(x.split('_')[0] in ('encut', 'kmesh', 'vac', 'thick', 'slab') for x in subs):
+            return 'conv_encut'
+        if any(x.isdigit() and len(x) == 2 for x in subs):
+            return 'neb'
+        if os.path.isfile(os.path.join(d, 'LOCPOT')):
+            return 'workfunction'
+        if os.path.isfile(os.path.join(d, 'EIGENVAL')):
+            return 'bands'
+        if os.path.isfile(os.path.join(d, 'XDATCAR')):
+            return 'aimd'
+        if os.path.isfile(os.path.join(d, 'ACF.dat')):
+            return 'bader'
+        if os.path.isfile(os.path.join(d, 'ELFCAR')):
+            return 'elf'
+        if os.path.isfile(os.path.join(d, 'DOSCAR')):
+            return 'dos_pdos'
+        return ''
+
+    def _analysis_envelope(self, result, key):
+        """给旧解析器返回补统一 capability 字段，保持既有 result/figure 契约。"""
+        cap = self._ta().capability(key)
+        out = dict(result or {})
+        out.setdefault('kind', cap.get('task_key') or key or None)
+        out['supported'] = cap.get('analysis_status') not in ('unsupported', 'dedicated')
+        out['analysis_status'] = cap.get('analysis_status', 'unsupported')
+        out['report_supported'] = bool(cap.get('report_supported'))
+        out['next_action'] = cap.get('next_action', '')
+        return out
+
+    def analyze_task(self, job_dir, kind=None):
+        """统一任务解析：按 23 类能力矩阵分发；未接解析器时返回明确下一步，不编结果。"""
+        try:
+            d = (job_dir or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'kind': None, 'result': None, 'figure': None,
+                        'summary': '', 'files': [], 'error': '作业目录不存在'}
+            engine = self._ta().job_engine(d)
+            if engine not in ('vasp', 'gaussian', 'cp2k', 'castep'):
+                return {'ok': False, 'kind': None, 'result': None, 'figure': None,
+                        'summary': '', 'files': [], 'supported': False,
+                        'analysis_status': 'unsupported', 'report_supported': False,
+                        'next_action': '请在 job.yaml inputs.engine 中选择已接入引擎。',
+                        'error': f'未接入计算引擎：{engine}'}
+            raw = (kind or '').strip().lower() or self._infer_task_kind(d)
+            if not raw and engine != 'vasp':
+                raw = self._ta().engine_task_key(d)
+            k = self._ta().normalize_task_key(raw)
+            cap = self._ta().capability(k)
+            if not cap.get('known'):
+                return {'ok': False, 'kind': k or None, 'result': None, 'figure': None,
+                        'summary': '', 'files': [], 'supported': False,
+                        'analysis_status': 'unsupported', 'report_supported': False,
+                        'next_action': cap.get('next_action', ''),
+                        'error': '无法识别任务类型；请在设置页选择本次计算类型。'}
+            route = cap['route']
+            # 非 VASP 作业统一走自己的主输出解析器；禁止因为用户选了
+            # relax/static/freq 而去读取不存在的 OSZICAR/OUTCAR。
+            if engine != 'vasp':
+                out = self._ta().analyze_engine_outputs(d, engine=engine, task_key=k)
+            elif route == 'conv':
+                out = self._analyze_conv(d)
+                out['kind'] = 'conv' if raw == 'conv' else k
+            elif route == 'eos':
+                out = self._analyze_eos(d)
+            elif route == 'bands':
+                out = self._analyze_bands(d)
+            elif route == 'workfunction':
+                out = self._analyze_workfunction(d)
+            elif route == 'dos':
+                out = self._ta().analyze_dos(d)
+            elif route == 'bader':
+                out = self._ta().analyze_bader(d)
+            elif route == 'chgdiff':
+                out = self._ta().analyze_chgdiff(d)
+            elif route == 'generic':
+                out = self._ta().analyze_vasp_outputs(d, k)
+            elif route == 'freq':
+                out = self._ta().analyze_frequency(d)
+            elif route == 'aimd':
+                out = self._ta().analyze_aimd(d)
+            elif route == 'neb':
+                out = self._ta().analyze_neb(d)
+            elif route == 'artifact':
+                out = self._ta().inspect_artifacts(d, k)
+            else:  # 专用多作业/参考态计算器，不能对单目录伪造结果
+                out = {'ok': False, 'kind': k, 'result': None, 'figure': None,
+                       'summary': '', 'files': [],
+                       'error': f'{k} 需要专用多作业流程，不能从一个目录独立得出结论。'}
+            return self._analysis_envelope(out, k)
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'kind': None, 'result': None, 'figure': None,
+                    'summary': '', 'files': [], 'error': str(e)}
+
+    def task_report(self, job_dir, save_to, kind=None):
+        """为任意已登记任务生成带文件指纹的报告；解析失败会原样写入而非隐藏。"""
+        try:
+            d = (job_dir or '').strip()
+            out = (save_to or '').strip()
+            if not d or not os.path.isdir(d):
+                return {'ok': False, 'file': None, 'analysis': None,
+                        'error': '作业目录不存在'}
+            if not out:
+                return {'ok': False, 'file': None, 'analysis': None,
+                        'error': '未指定报告路径'}
+            analysis = self.analyze_task(d, kind=kind)
+            key = self._ta().normalize_task_key(kind or analysis.get('kind'))
+            saved = self._ta().write_trace_report(d, analysis, out, task_key=key)
+            return {'ok': True, 'file': saved, 'analysis': analysis,
+                    'analysis_ok': bool(analysis.get('ok')), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'file': None, 'analysis': None, 'error': str(e)}
+
+    def _analyze_conv(self, d):
+        subs = sorted(os.path.join(d, x) for x in os.listdir(d)
+                      if os.path.isdir(os.path.join(d, x))
+                      and x.split('_')[0] in ('encut', 'kmesh', 'vac', 'thick', 'slab'))
+        dirs = subs or [d]
+        cs = self._cs()
+        res = cs.analyze_series(dirs)
+        fig = None
+        try:
+            pts = [p for p in (res.get('points') or []) if p.get('energy') is not None]
+            if pts:
+                out_png = os.path.join(d, 'convergence.png')
+                cs.conv_plot(pts, out_png, converged_at=res.get('converged_at'))
+                fig = out_png
+        except Exception:                                 # noqa: BLE001 出图失败不挡解析
+            fig = None
+        return {'ok': True, 'kind': 'conv', 'result': res, 'figure': fig,
+                'summary': res.get('note', ''),
+                'files': [fig] if fig else [], 'error': None}
+
+    def _analyze_eos(self, d):
+        subs = sorted(os.path.join(d, x) for x in os.listdir(d)
+                      if os.path.isdir(os.path.join(d, x)) and x.startswith('eos_'))
+        dirs = subs or [d]
+        vols, ens = [], []
+        for jd in dirs:
+            v, e = self._poscar_volume(jd), self._osz_energy(jd)
+            if v is not None and e is not None:
+                vols.append(v)
+                ens.append(e)
+        if len(vols) < 3:
+            return {'ok': False, 'kind': 'eos', 'result': None, 'figure': None,
+                    'summary': '', 'files': [],
+                    'error': f'EOS 拟合需 ≥3 个含体积/能量的作业(现有 {len(vols)} 个,尚未跑完?)'}
+        eos = self._eos_()
+        fit = eos.fit_birch_murnaghan(vols, ens)
+        fig = None
+        try:
+            out_png = os.path.join(d, 'eos.png')
+            eos.eos_plot([{'volume': v, 'energy': e} for v, e in zip(vols, ens)],
+                         fit, out_png)
+            fig = out_png
+        except Exception:                                 # noqa: BLE001
+            fig = None
+        summary = (f"V0 = {fit.get('v0'):.3f} Å³,E0 = {fit.get('e0'):.4f} eV,"
+                   f"B0 = {fit.get('b0_gpa'):.1f} GPa,B0' = {fit.get('b0_prime'):.2f},"
+                   f"R² = {fit.get('r2'):.4f}") if fit else ''
+        return {'ok': True, 'kind': 'eos', 'result': fit, 'figure': fig,
+                'summary': summary, 'files': [fig] if fig else [], 'error': None}
+
+    def _analyze_bands(self, d):
+        src = None
+        for name in ('EIGENVAL', 'vasprun.xml'):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                src = open(p, encoding='utf-8', errors='replace').read()
+                break
+        if src is None:
+            return {'ok': False, 'kind': 'bands', 'result': None, 'figure': None,
+                    'summary': '', 'files': [], 'error': '未找到 EIGENVAL / vasprun.xml'}
+        bp = self._bp()
+        ef = self._outcar_efermi(d)
+        data = bp.parse_bands(src, efermi=ef)
+        gap = data.get('gap') or {}
+        fig = None
+        try:
+            out_png = os.path.join(d, 'band.png')
+            bp.band_plot(data, out_png, efermi=ef)
+            fig = out_png
+        except Exception:                                 # noqa: BLE001
+            fig = None
+        if gap.get('metal'):
+            summary = '金属性(无带隙)。'
+        elif gap.get('value') is not None:
+            summary = (f"带隙 = {gap['value']:.3f} eV"
+                       f"({'直接' if gap.get('direct') else '间接'}带隙)。")
+        else:
+            summary = gap.get('note', '未能判定带隙。')
+        return {'ok': True, 'kind': 'bands', 'result': {'gap': gap}, 'figure': fig,
+                'summary': summary, 'files': [fig] if fig else [], 'error': None}
+
+    def _analyze_workfunction(self, d):
+        locpot = os.path.join(d, 'LOCPOT')
+        if not os.path.isfile(locpot):
+            return {'ok': False, 'kind': 'workfunction', 'result': None, 'figure': None,
+                    'summary': '', 'files': [], 'error': '未找到 LOCPOT'}
+        wf = self._wf()
+        ef = self._outcar_efermi(d)
+        if ef is None:
+            return {'ok': False, 'kind': 'workfunction', 'result': None, 'figure': None,
+                    'summary': '', 'files': [], 'error': '未能从 OUTCAR 读到费米能 E-fermi'}
+        planar = wf.parse_locpot_planar(locpot)
+        res = wf.work_function(planar['v_planar'], planar['z'], ef)
+        fig = None
+        try:
+            out_png = os.path.join(d, 'work_function.png')
+            wf.wf_plot(planar['v_planar'], planar['z'], ef, out_png,
+                       vacuum_level=res.get('vacuum_level'), phi=res.get('phi'))
+            fig = out_png
+        except Exception:                                 # noqa: BLE001
+            fig = None
+        phi = res.get('phi')
+        summary = (f"功函数 φ = {phi:.3f} eV(真空能级 {res.get('vacuum_level'):.3f} eV,"
+                   f"E_F = {ef:.3f} eV)。") if phi is not None else res.get('note', '')
+        return {'ok': True, 'kind': 'workfunction', 'result': res, 'figure': fig,
+                'summary': summary, 'files': [fig] if fig else [], 'error': None}
+
+    def surface_energy_calc(self, slab_dir, bulk_dir, e_bulk_per_atom=None, area=None):
+        """表面能计算器:选 slab + bulk 作业 → γ (J/m²)。面积从 slab POSCAR 自动算。
+
+        slab/bulk 都必须通过 DONE + 干净收尾闸，已知方法冲突拒绝大数相减。
+        e_bulk_per_atom 缺省时由 bulk 作业能量与原子数现算;area 缺省时由 slab POSCAR
+        的 a×b 叉积面积算。返回 {'ok','gamma_jm2','area_a2','e_slab','n_slab','e_bulk_per_atom',
+        'note','error'}。
+        """
+        try:
+            from vcstudio.project import energy_gate
+
+            sd = (slab_dir or '').strip()
+            if not sd or not os.path.isdir(sd):
+                return {'ok': False, 'gamma_jm2': None, 'warnings': [],
+                        'method_check': None, 'error': 'slab 作业目录不存在'}
+            e_slab, slab_manifest, completion_notes = energy_gate.validate_done_energy(
+                sd, 'slab 作业', self._manifest)
+            warnings, completion_evidence = [], list(completion_notes)
+            n_slab = self._poscar_natoms(self._read_poscar_text(sd))
+            if not n_slab:
+                return {'ok': False, 'gamma_jm2': None, 'warnings': warnings,
+                        'method_check': None, 'error': '无法从 slab POSCAR 读原子数'}
+            se = self._se()
+            if area in (None, ''):
+                area = se.area_from_poscar(self._read_poscar_text(sd))
+            e_bpa = e_bulk_per_atom
+            method_check = None
+            if e_bpa in (None, ''):
+                bd = (bulk_dir or '').strip()
+                if not bd or not os.path.isdir(bd):
+                    return {'ok': False, 'gamma_jm2': None, 'warnings': warnings,
+                            'method_check': None,
+                            'error': 'bulk 作业目录不存在(或直接填体相每原子能)'}
+                e_bulk, bulk_manifest, bulk_notes = energy_gate.validate_done_energy(
+                    bd, 'bulk 作业', self._manifest)
+                completion_evidence.extend(bulk_notes)
+                n_bulk = self._poscar_natoms(self._read_poscar_text(bd))
+                if not n_bulk:
+                    return {'ok': False, 'gamma_jm2': None, 'warnings': warnings,
+                            'method_check': None,
+                            'error': 'bulk 作业无可解析能量/原子数'}
+                method_check = energy_gate.compare_methods([
+                    energy_gate.method_record(sd, slab_manifest, 'slab'),
+                    energy_gate.method_record(bd, bulk_manifest, 'bulk'),
+                ], require_same_kpoints=False)
+                warnings.extend(method_check['warnings'])
+                if method_check['status'] == 'incompatible':
+                    return {'ok': False, 'gamma_jm2': None, 'warnings': warnings,
+                            'method_check': method_check,
+                            'error': '方法不一致，表面能的大数相减不可比：'
+                                     + '；'.join(method_check['issues'])}
+                e_bpa = e_bulk / n_bulk
+            else:
+                try:
+                    e_bpa = float(e_bpa)
+                except (TypeError, ValueError):
+                    return {'ok': False, 'gamma_jm2': None, 'warnings': warnings,
+                            'method_check': None, 'error': '体相每原子能不是有效数字'}
+                if not math.isfinite(e_bpa):
+                    return {'ok': False, 'gamma_jm2': None, 'warnings': warnings,
+                            'method_check': None, 'error': '体相每原子能非有限数'}
+                method_check = {'status': 'unverified', 'issues': [],
+                                'warnings': ['体相每原子能为手工输入，无 bulk job.yaml '
+                                             '可核对 DONE/泛函/ENCUT/POTCAR/K 点口径'],
+                                'checked_fields': 0, 'labels': ['slab', '手工体相能']}
+                warnings.extend(method_check['warnings'])
+            result = se.surface_energy(float(e_slab), int(n_slab), float(e_bpa), float(area))
+            gamma = float(result['gamma_jm2'])
+            warnings.extend(list(result.get('warnings') or []))
+            response = {'ok': True, 'gamma_jm2': gamma,
+                        'gamma_evA2': float(result['gamma_evA2']), 'area_a2': float(area),
+                        'e_slab': float(e_slab), 'n_slab': int(n_slab),
+                        'e_bulk_per_atom': float(e_bpa),
+                        'warnings': warnings, 'method_check': method_check,
+                        'evidence': completion_evidence,
+                        'note': result.get('note') or
+                        f'γ = (E_slab − N·E_bulk)/2A = {gamma:.4f} J/m²', 'error': None}
+            try:
+                from vcstudio.project import special_report
+                evidence_dirs = [sd] + ([(bulk_dir or '').strip()]
+                                        if (bulk_dir or '').strip() else [])
+                response['report_file'] = special_report.write(
+                    '表面能报告', response, evidence_dirs,
+                    os.path.join(sd, 'vcstudio-surface-energy-report.html'))
+            except Exception as report_error:             # noqa: BLE001
+                response['report_file'] = None
+                warnings.append(f'报告生成失败：{report_error}')
+            return response
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'gamma_jm2': None, 'warnings': [],
+                    'method_check': None, 'error': str(e)}
+
+    @staticmethod
+    def _read_poscar_text(job_dir):
+        for name in ('CONTCAR', 'POSCAR'):
+            p = os.path.join(job_dir, name)
+            if os.path.isfile(p):
+                return open(p, encoding='utf-8', errors='replace').read()
+        return ''
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 二、一键出图管线接线:活动模板 + 溶剂化复合物 + 出图偏好
+    # ══════════════════════════════════════════════════════════════════════════
+    def campaign_templates(self):
+        """计算活动模板清单 → {'ok','templates':[{key,name_zh,description,figures_scenario,
+        n_stages,analyses}],'error'}(①结构建模 SAC 矩阵卡下拉)。"""
+        try:
+            tpl = self._ct().list_templates()
+            out = [{'key': k, 'name_zh': v.get('name_zh', k),
+                    'description': v.get('description', ''),
+                    'figures_scenario': v.get('figures_scenario'),
+                    'n_stages': v.get('n_stages', 0),
+                    'analyses': list(v.get('analyses') or [])}
+                   for k, v in tpl.items()]
+            return {'ok': True, 'templates': out, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'templates': [], 'error': str(e)}
+
+    def campaign_instantiate(self, template_key, matrix_spec, out_root, title=None):
+        """据模板 + 体系矩阵生成全链 DAG(落 campaign)→ 入仪表盘发现表。
+
+        返回 {'ok','campaign_dir','stages','n_jobs','estimate','figures_scenario','error'}。
+        """
+        try:
+            root = (out_root or '').strip()
+            if not root:
+                return {'ok': False, 'campaign_dir': None, 'error': '未指定输出根目录'}
+            spec = dict(matrix_spec or {})
+            if not (spec.get('systems') or []):
+                return {'ok': False, 'campaign_dir': None,
+                        'error': '体系矩阵至少需要一个 system(体系/催化剂)'}
+            res = self._ct().instantiate(str(template_key or ''), spec, root,
+                                         title=(title or None))
+            cdir = res.get('campaign_dir')
+            if cdir:
+                self._register_campaign_dir(cdir)
+            return {'ok': True, 'campaign_dir': cdir, 'stages': res.get('stages') or {},
+                    'n_jobs': res.get('n_jobs', 0), 'estimate': res.get('estimate') or {},
+                    'figures_scenario': res.get('figures_scenario'), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'campaign_dir': None, 'error': str(e)}
+
+    def solvent_presets(self):
+        """溶剂配比预设清单 → {'ok','presets':[{key,recipe,label}],'error'}(溶剂化小卡下拉)。"""
+        try:
+            sv = self._sv()
+            presets = [{'key': k, 'recipe': [[nm, n] for nm, n in v],
+                        'label': '、'.join(f'{n}×{nm}' for nm, n in v)}
+                       for k, v in sv.SOLVENT_PRESETS.items()]
+            return {'ok': True, 'presets': presets, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'presets': [], 'error': str(e)}
+
+    def build_solvated(self, core='Li2S3', solvents='lis_electrolyte', box=18.0,
+                       min_sep=2.5, seed=42, save_to=None):
+        """组装显式溶剂化复合物(核 + 溶剂 → 立方盒 POSCAR)→ {'ok','poscar','n_atoms','note',
+        'saved_to','error'}。solvents 可为预设 key 或 [[名,个数],...];save_to 给了则落盘。"""
+        try:
+            sv = self._sv()
+            if isinstance(solvents, (list, tuple)) and not isinstance(solvents, str):
+                recipe = [(str(nm), int(cnt)) for nm, cnt in solvents]
+            else:
+                recipe = str(solvents)
+            res = sv.build_solvated_complex(
+                core=str(core or 'Li2S3'), solvents=recipe,
+                box=float(box), min_sep=float(min_sep), seed=int(seed))
+            saved = None
+            dest = (save_to or '').strip()
+            if dest:
+                with open(dest, 'w', encoding='utf-8') as f:
+                    f.write(res['poscar'])
+                saved = dest
+            # 另写一份到临时 POSCAR,供前端「载入编辑器」经 struct_load 读取
+            temp_path = None
+            try:
+                fd, temp_path = tempfile.mkstemp(prefix='vcs_solv_', suffix='_POSCAR')
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    f.write(res['poscar'])
+            except Exception:                             # noqa: BLE001 临时文件失败不致命
+                temp_path = None
+            return {'ok': True, 'poscar': res['poscar'], 'n_atoms': res.get('n_atoms'),
+                    'note': res.get('note', ''), 'saved_to': saved,
+                    'temp_path': temp_path, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'poscar': None, 'n_atoms': 0, 'note': '',
+                    'saved_to': None, 'error': str(e)}
+
+    _JOURNAL_STYLES = ('nature', 'acs', 'prb')
+
+    def figure_prefs_get(self):
+        """出图偏好读:期刊风格 / 自动出图开关 / 多面板开关(config ui.*,带默认)。"""
+        try:
+            ui = self._config.get_ui_state()
+        except Exception:                                 # noqa: BLE001
+            ui = {}
+        js = str((ui or {}).get('journal_style') or 'nature').lower()
+        return {'ok': True,
+                'journal_style': js if js in self._JOURNAL_STYLES else 'nature',
+                'auto_figures': bool((ui or {}).get('auto_figures', True)),
+                'multi_panel': bool((ui or {}).get('multi_panel', True)),
+                'error': None}
+
+    def figure_prefs_save(self, journal_style=None, auto_figures=None, multi_panel=None):
+        """保存出图偏好到 config ui.*(None 字段不改;非法期刊回落 nature)。"""
+        try:
+            kv = {}
+            if journal_style is not None:
+                js = str(journal_style).lower()
+                kv['journal_style'] = js if js in self._JOURNAL_STYLES else 'nature'
+            if auto_figures is not None:
+                kv['auto_figures'] = bool(auto_figures)
+            if multi_panel is not None:
+                kv['multi_panel'] = bool(multi_panel)
+            self._config.set_ui_state(**kv)
+            return {'ok': True, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'error': str(e)}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 三、AI 助手三能力:数据对照 / 材料变体 / 论文草稿
+    # ══════════════════════════════════════════════════════════════════════════
+    def ai_extract_tables(self, source, transport=None):
+        """论文正文 → 结构化文献数据表(LLM 只誊抄 + 确定性校验)→ {'ok','tables':[{label,kind,
+        columns,rows:[{system,species,value_ev,page_hint}]}],'error'}。仅供对照,绝不回流计算。"""
+        try:
+            text = (source or '')
+            if not str(text).strip():
+                return {'ok': False, 'tables': [], 'error': '未提供论文文本'}
+            res = self._pd().extract_data_tables(str(text), transport=transport)
+            return {'ok': bool(res.get('ok')), 'tables': list(res.get('tables') or []),
+                    'error': res.get('error')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'tables': [], 'error': str(e)}
+
+    def _project_computed(self, proj):
+        """项目 → 计算侧对照集 [{system,species,quantity:'E_ads',value}](取各物种最稳 ΔE)。"""
+        rows = (self._adsorption.delta_e_rows(proj) or {}).get('rows') or []
+        name = str(proj.get('name') or '')
+        out = []
+        for r in rows:
+            if r.get('is_most_stable') and r.get('delta_e') is not None:
+                out.append({'system': name, 'species': r.get('species') or r.get('name'),
+                            'quantity': 'E_ads', 'value': float(r['delta_e'])})
+        return out
+
+    def ai_compare(self, project_path, reference):
+        """项目计算值 × 文献参考(体系×物种×量对齐)→ MAE/RMSE/最差3项/对照表(纯确定性)。
+
+        reference 为 ai_extract_tables 的 tables(或已归一参考集)。返回 {'ok','n','mae','rmse',
+        'worst','pairs','unmatched','summary','error'};无对齐项 ok=True 但 n=0 + 说明。
+        """
+        try:
+            proj = self._adsorption.load_project((project_path or '').strip())
+            if proj is None:
+                return {'ok': False, 'n': 0, 'error': '项目不存在或 project.yaml 已移动'}
+            pd = self._pd()
+            ref = reference
+            if isinstance(reference, list):
+                ref = pd.build_reference_dataset(reference)
+            elif isinstance(reference, dict) and 'entries' not in reference:
+                ref = pd.build_reference_dataset(reference.get('tables') or [])
+            computed = self._project_computed(proj)
+            cmp = pd.compare_with_computed(ref, computed)
+            return {'ok': True, 'n': cmp.get('n', 0), 'mae': cmp.get('mae'),
+                    'rmse': cmp.get('rmse'), 'worst': list(cmp.get('worst') or []),
+                    'pairs': list(cmp.get('pairs') or []),
+                    'unmatched': list(cmp.get('unmatched') or []),
+                    'summary': cmp.get('summary_zh', ''), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'n': 0, 'error': str(e)}
+
+    def ai_write_validation(self, project_path, reference, out=None):
+        """把文献对照写成 validation.md(项目 report/ 下或指定路径)→ {'ok','path','n','error'}。"""
+        try:
+            proj = self._adsorption.load_project((project_path or '').strip())
+            if proj is None:
+                return {'ok': False, 'path': None, 'error': '项目不存在或 project.yaml 已移动'}
+            pd = self._pd()
+            ref = reference
+            if isinstance(reference, list):
+                ref = pd.build_reference_dataset(reference)
+            elif isinstance(reference, dict) and 'entries' not in reference:
+                ref = pd.build_reference_dataset(reference.get('tables') or [])
+            cmp = pd.compare_with_computed(ref, self._project_computed(proj))
+            md = pd.mae_report_md(cmp)
+            dest = (out or '').strip()
+            if not dest:
+                root = proj.get('root') or os.path.dirname((project_path or '').strip())
+                rdir = os.path.join(root, 'report')
+                os.makedirs(rdir, exist_ok=True)
+                dest = os.path.join(rdir, 'validation.md')
+            with open(dest, 'w', encoding='utf-8') as f:
+                f.write(md)
+            return {'ok': True, 'path': dest, 'n': cmp.get('n', 0), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': None, 'error': str(e)}
+
+    def ai_variants(self, spec, budget_cap_hours=None):
+        """材料变体推荐:母版规格表 → 变体列表 + 分批预算 + 可喂 sac_matrix 的矩阵谱。
+
+        返回 {'ok','variants':[{kind,from,to,metal,template,parent,priority,rationale_zh}],
+        'matrix_spec':{metals,templates},'plan':{n_jobs,estimate_hours,batches,note},'error'}。
+        """
+        try:
+            va = self._va()
+            sugg = va.suggest_variants(spec or {})
+            variants = list(sugg.get('variants') or [])
+            cap = None if budget_cap_hours in (None, '') else float(budget_cap_hours)
+            plan = va.variant_campaign_plan(variants, budget_cap_hours=cap)
+            return {'ok': True, 'variants': variants,
+                    'matrix_spec': sugg.get('matrix_spec') or {'metals': [], 'templates': []},
+                    'plan': plan, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'variants': [], 'matrix_spec': {},
+                    'plan': {}, 'error': str(e)}
+
+    def ai_manuscript(self, project_path, fmt='markdown', reference=None):
+        """生成论文骨架:Methods 全自动 + Results 逐图数据句 + 占位待补 → 诚实展示自动/占位比。
+
+        返回 {'ok','path','md_path','docx_path','docx_available','sections','stats':{auto,
+        placeholder,total,auto_ratio},'note','error'}。fmt='docx' 时缺 python-docx 降级只出 .md。
+        """
+        try:
+            proj = self._adsorption.load_project((project_path or '').strip())
+            if proj is None:
+                return {'ok': False, 'path': None, 'error': '项目不存在或 project.yaml 已移动'}
+            comparison = None
+            if reference is not None:
+                cr = self.ai_compare(project_path, reference)
+                if cr.get('ok') and cr.get('n'):
+                    comparison = {'pairs': cr.get('pairs'), 'mae': cr.get('mae'),
+                                  'rmse': cr.get('rmse'), 'n': cr.get('n'),
+                                  'worst': cr.get('worst'), 'unmatched': cr.get('unmatched'),
+                                  'summary_zh': cr.get('summary')}
+            md = self._md()
+            res = md.build_manuscript(proj, comparison=comparison,
+                                      fmt=str(fmt or 'markdown'))
+            stats = {}
+            try:
+                stats = md.draft_stats(res.get('md_path') or res.get('path'))
+            except Exception:                             # noqa: BLE001 统计失败不挡产物
+                stats = {}
+            return {'ok': bool(res.get('ok')), 'path': res.get('path'),
+                    'md_path': res.get('md_path'), 'docx_path': res.get('docx_path'),
+                    'docx_available': bool(res.get('docx_available')),
+                    'sections': list(res.get('sections') or []),
+                    'placeholders_count': res.get('placeholders_count'),
+                    'stats': stats, 'note': res.get('note'), 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'path': None, 'error': str(e)}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 四、starpivot 细节对齐:依赖状态/安装 + 概览核时 + 波函数分组/散点/远程渲染
+    # ══════════════════════════════════════════════════════════════════════════
+    # 可后台 pip 安装的组件白名单(避免任意包注入;pip 为真实包名序列)
+    _DEPS_INSTALLABLE = {
+        'rdkit': {'pip': ('rdkit',), 'note': '分子建模(SMILES↔3D、2D 键线式)'},
+        'decimer': {'pip': ('decimer',),
+                    'note': '图片识别 OCSR(含 TensorFlow 模型,约数百 MB)'},
+        'matplotlib': {'pip': ('matplotlib', 'numpy'), 'note': '论文级出图引擎'},
+        'python-docx': {'pip': ('python-docx',), 'note': '论文骨架导出 .docx'},
+        'pypdf': {'pip': ('pypdf',), 'note': 'PDF 论文文本提取'},
+    }
+    _FROZEN_DEPS_INSTALL_ERROR = (
+        '当前运行的是单文件 EXE，不能在运行时安装 Python 依赖。'
+        '单文件 EXE 中 sys.executable 指向软件本身，用它执行 pip 会重新打开本软件；'
+        '即使改用外部 Python 安装，新包也不会可靠地进入已冻结的 EXE。'
+        '请使用已内置所需组件的完整版 EXE，或在源码 Python 环境安装依赖后重新打包。'
+    )
+
+    @staticmethod
+    def _runtime_deps_install_supported():
+        """运行时 pip 只对源码 Python 环境开放。
+
+        PyInstaller/Nuitka 冻结态的 ``sys.executable`` 是应用程序而不是
+        Python 解释器；且单文件包的 import 集合在构建时已确定。
+        """
+        return not bool(getattr(sys, 'frozen', False))
+
+    @staticmethod
+    def _pkg_present(name):
+        try:
+            import importlib.util
+            return importlib.util.find_spec(name) is not None
+        except Exception:                                 # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _dependency_command(pip_names, *, frozen=None):
+        """Return a copyable pip command for PowerShell / the current terminal.
+
+        In source mode the exact interpreter running VCStudio is used so users do not
+        accidentally install into another Python.  A frozen executable has no usable
+        Python interpreter of its own; ``py`` is therefore shown only as a clearly
+        labelled *source-environment* command by :meth:`deps_status`.
+        """
+        frozen = bool(getattr(sys, 'frozen', False)) if frozen is None else bool(frozen)
+        executable = 'py' if frozen else str(sys.executable)
+        windows_path = bool(re.match(r'^[A-Za-z]:[\\/]', executable))
+        if windows_path:
+            # PowerShell parses a quoted executable path as a string unless the
+            # call operator is present.  The dialog explicitly targets PowerShell,
+            # so emit a command users can paste without editing.
+            executable = f'& "{executable}"'
+        elif any(ch.isspace() for ch in executable):
+            executable = f'"{executable}"'
+        return executable + ' -m pip install ' + ' '.join(str(x) for x in pip_names)
+
+    def deps_status(self):
+        """依赖状态汇总(侧栏依赖状态区)→ {'ok','deps':[{key,name,available,detail,installable,
+        note}],'runtime_install_supported','runtime_install_note','error'}。RDKit/DECIMER/matplotlib
+        按 import 探测;Multiwfn/VMD 走各自 probe。"""
+        try:
+            deps = []
+            install_supported = self._runtime_deps_install_supported()
+            py = [('rdkit', 'RDKit', 'rdkit'), ('decimer', 'DECIMER', 'decimer'),
+                  ('matplotlib', 'matplotlib', 'matplotlib'),
+                  ('python-docx', 'python-docx', 'docx'), ('pypdf', 'pypdf', 'pypdf')]
+            for key, name, mod in py:
+                ok = self._pkg_present(mod)
+                note = self._DEPS_INSTALLABLE.get(key, {}).get('note', '')
+                pip_names = list(self._DEPS_INSTALLABLE.get(key, {}).get('pip', ()))
+                if not install_supported and not ok:
+                    note += '；单文件 EXE 需在打包时内置此组件'
+                deps.append({'key': key, 'name': name, 'available': ok,
+                             'detail': '已安装' if ok else '未安装',
+                             'installable': (install_supported and
+                                             key in self._DEPS_INSTALLABLE),
+                             'pip': pip_names,
+                             'install_command': self._dependency_command(
+                                 pip_names, frozen=not install_supported),
+                             'command_applies_to_current_app': install_supported,
+                             'note': note})
+            paths = self._tool_paths()
+            for key, name, probe in (('multiwfn', 'Multiwfn', self._mw),
+                                     ('vmd', 'VMD', self._vmd_)):
+                try:
+                    pr = probe().probe((paths.get(key) or '').strip() or None)
+                except Exception as e:                    # noqa: BLE001
+                    pr = {'available': False, 'detail': str(e)}
+                deps.append({'key': key, 'name': name,
+                             'available': bool(pr.get('available')),
+                             'detail': pr.get('detail', ''), 'installable': False,
+                             'pip': [], 'install_command': '',
+                             'command_applies_to_current_app': False,
+                             'note': '外部程序,请在波函数页填路径或加入 PATH'})
+            return {'ok': True, 'deps': deps,
+                    'runtime_install_supported': install_supported,
+                    'runtime_install_note': (None if install_supported
+                                             else self._FROZEN_DEPS_INSTALL_ERROR),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'deps': [], 'runtime_install_supported': False,
+                    'runtime_install_note': None, 'error': str(e)}
+
+    @staticmethod
+    def _default_deps_runner(pip_names, log_path):
+        """默认后台 pip 安装器:Popen 输出重定向到日志文件。"""
+        if getattr(sys, 'frozen', False):
+            # 双重防线:即使调用方绕过 deps_install，也绝不能把当前
+            # EXE 当成 python.exe 再启动。
+            raise RuntimeError(Api._FROZEN_DEPS_INSTALL_ERROR)
+        import subprocess
+        logf = open(log_path, 'w', encoding='utf-8')
+        try:
+            return subprocess.Popen([sys.executable, '-m', 'pip', 'install', *pip_names],
+                                    stdout=logf, stderr=subprocess.STDOUT)
+        finally:
+            # Popen 已把文件句柄交给子进程；父进程不应在整个下载
+            # 期间额外占用日志文件(也避免 Popen 启动失败时泄漏)。
+            logf.close()
+
+    def deps_install(self, pkgs):
+        """后台安装依赖组件(白名单内)→ 启动 pip 子进程,进度经 deps_install_status 轮询。
+
+        返回 {'ok','started','pkgs','pip','rejected','log_path','error'}。非白名单组件计入 rejected。
+        """
+        try:
+            allow = self._DEPS_INSTALLABLE
+            req = [str(p).strip() for p in (pkgs or []) if str(p).strip()]
+            picks = [p for p in req if p in allow]
+            rejected = [p for p in req if p not in allow]
+            if not picks:
+                return {'ok': False, 'started': False, 'pkgs': [], 'pip': [],
+                        'rejected': rejected, 'log_path': None,
+                        'error': '未选择可安装的组件(可选:' + '、'.join(sorted(allow)) + ')'}
+            if not self._runtime_deps_install_supported():
+                return {'ok': False, 'started': False, 'pkgs': [], 'pip': [],
+                        'rejected': rejected, 'log_path': None,
+                        'error': self._FROZEN_DEPS_INSTALL_ERROR}
+            if self._deps_job is not None:
+                proc = self._deps_job.get('proc')
+                if proc is not None and proc.poll() is None:
+                    return {'ok': False, 'started': False, 'pkgs': [], 'pip': [],
+                            'rejected': rejected, 'log_path': self._deps_job.get('log_path'),
+                            'error': '已有安装任务进行中,请等待完成或稍后再试'}
+            pip_names = []
+            for p in picks:
+                pip_names += list(allow[p]['pip'])
+            log_path = os.path.join(tempfile.gettempdir(),
+                                    f'vcstudio_deps_{int(time.time())}.log')
+            runner = self._deps_runner or self._default_deps_runner
+            proc = runner(pip_names, log_path)
+            self._deps_job = {'proc': proc, 'log_path': log_path, 'pkgs': picks,
+                              'pip': pip_names, 'started_at': time.time()}
+            return {'ok': True, 'started': True, 'pkgs': picks, 'pip': pip_names,
+                    'rejected': rejected, 'log_path': log_path, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'started': False, 'pkgs': [], 'pip': [],
+                    'rejected': [], 'log_path': None, 'error': str(e)}
+
+    def deps_install_status(self):
+        """轮询后台安装进度 → {'ok','active','running','done','returncode','log_tail','pkgs','error'}。
+
+        无任务 → active=False;done 且 returncode==0 视为成功(前端据此刷新 deps_status)。
+        """
+        try:
+            job = self._deps_job
+            if not job:
+                return {'ok': True, 'active': False, 'running': False, 'done': False,
+                        'returncode': None, 'log_tail': '', 'pkgs': [], 'error': None}
+            proc = job.get('proc')
+            rc = proc.poll() if proc is not None else None
+            running = rc is None
+            tail = ''
+            try:
+                if os.path.isfile(job['log_path']):
+                    txt = open(job['log_path'], encoding='utf-8', errors='replace').read()
+                    tail = '\n'.join(txt.splitlines()[-40:])
+            except Exception:                             # noqa: BLE001
+                tail = ''
+            return {'ok': True, 'active': True, 'running': running, 'done': not running,
+                    'returncode': rc, 'log_tail': tail, 'pkgs': list(job.get('pkgs') or []),
+                    'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'active': False, 'running': False, 'error': str(e)}
+
+    def overview_stats(self):
+        """概览页核时四卡:近30天作业数 / 近30天核时(估算)/ 剩余核时 / 实时监控状态。
+
+        作业数与 30 天窗口取台账 created_at;核时/剩余取 campaign 预算(cap − 估算已花)。
+        返回 {'ok','jobs_30d','jobs_total','core_hours_30d','remaining_core_hours',
+        'budget_cap','monitor':{running,queued,active,status},'error'}。全程 try/except 降级。
+        """
+        try:
+            import datetime
+            entries = list(self._ledger.load_all())
+            now = time.time()
+            cutoff = now - 30 * 86400
+            jobs_total = len(entries)
+            jobs_30d, running, queued = 0, 0, 0
+            for _d, m in entries:
+                if not m:
+                    continue
+                st = m.get('state')
+                if st == 'RUNNING':
+                    running += 1
+                elif st in ('QUEUED', 'SUBMITTED', 'UPLOADED'):
+                    queued += 1
+                ca = m.get('created_at')
+                if ca:
+                    try:
+                        ts = datetime.datetime.fromisoformat(str(ca)).timestamp()
+                        if ts >= cutoff:
+                            jobs_30d += 1
+                    except (ValueError, TypeError):
+                        pass
+            if jobs_30d == 0 and not any((m or {}).get('created_at') for _d, m in entries):
+                jobs_30d = jobs_total          # 无时间戳则回退用总数(不误报 0)
+            cap_total, spent = 0.0, 0.0
+            try:
+                camps = self.campaign_list()
+                for c in (camps.get('campaigns') or []):
+                    bud = c.get('budget') or {}
+                    cap = bud.get('cap')
+                    est = float(bud.get('estimated') or 0.0)
+                    states = c.get('states') or {}
+                    n_tasks = int(c.get('n_tasks') or 0)
+                    done = int(states.get('completed') or 0)
+                    frac = (done / n_tasks) if n_tasks else 0.0
+                    spent += est * frac
+                    if cap not in (None, ''):
+                        cap_total += float(cap)
+            except Exception:                             # noqa: BLE001
+                pass
+            remaining = round(cap_total - spent, 2) if cap_total else None
+            # v3.3.0 实耗核时(与上面的"预算估算已花"并列,口径独立:时间戳×提交核数)
+            used_30d, usage_unknown_n = None, 0
+            try:
+                u = self._usage().usage_stats(entries, days=30,
+                                              profile_cores_by_name=self._profile_cores())
+                used_30d = u.get('core_hours')
+                usage_unknown_n = len(u.get('unknown') or [])
+            except Exception:                             # noqa: BLE001 统计失败不挡概览
+                pass
+            active = running + queued
+            status = ('运行中' if running else ('排队中' if queued else '空闲'))
+            return {'ok': True, 'jobs_30d': jobs_30d, 'jobs_total': jobs_total,
+                    'core_hours_30d': round(spent, 2),
+                    'used_core_hours_30d': used_30d,
+                    'usage_unknown_n': usage_unknown_n,
+                    'remaining_core_hours': remaining,
+                    'budget_cap': round(cap_total, 2) if cap_total else None,
+                    'monitor': {'running': running, 'queued': queued, 'active': active,
+                                'status': status}, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'jobs_30d': 0, 'jobs_total': 0, 'core_hours_30d': 0.0,
+                    'remaining_core_hours': None, 'budget_cap': None,
+                    'monitor': {}, 'error': str(e)}
+
+    def usage_stats(self, days=30):
+        """近 N 天实耗核时明细(诚实口径:RUNNING→终态时间戳 × 提交核数)。
+
+        返回 {'ok','days','core_hours','jobs':[逐作业含 core_hours/basis/running],
+        'jobs_counted','running_jobs','unknown':[缺数据作业+原因],'note','error'}。
+        缺核数/缺时间戳的作业不计入总数、单列原因,绝不编数。
+        """
+        try:
+            r = self._usage().usage_stats(
+                list(self._ledger.load_all()), days=int(days or 30),
+                profile_cores_by_name=self._profile_cores())
+            return {'ok': True, **r, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'days': int(days or 30), 'core_hours': 0.0, 'jobs': [],
+                    'jobs_counted': 0, 'running_jobs': 0, 'unknown': [], 'note': '',
+                    'error': str(e)}
+
+    # ── 波函数页:分析项分组菜单(单一事实源 = 引擎 multiwfn_driver.ANALYSES) ──
+    # v3.2.2:ELF-LOL/ADCH/性质汇总/Fukui-CDFT 四项已自 api 层 _EXTRA_ANALYSES 迁入引擎
+    # 注册表(菜单流字节不变);api 不再自带 stdin 脚本,菜单与执行均以引擎为准——
+    # 远程分析(wavefn_run_remote 走 ANALYSES)也因此自动获得这四项。
+
+    # 分析项分组(对齐 starpivot:常用 / 实空间与截面 / 弱相互作用 / 其它)
+    _WAVEFN_GROUPS = (
+        ('常用', ('esp_extrema', 'density_cube', 'esp_cube', 'homo_lumo_cube')),
+        ('实空间与截面', ('elf_lol_section', 'alie', 'alie_extrema', 'adch_charge')),
+        ('弱相互作用', ('nci_rdg', 'igmh', 'iri')),
+        ('其它', ('aim_cp', 'property_summary', 'fukui_cdft')),
+    )
+
+    def wavefn_analyses(self):
+        """波函数分析项分组菜单(单一事实源:引擎 ANALYSES)→ {'ok','groups':[{group,items:[{key,
+        name,note,source,outputs}]}],'error'}。source 恒为 engine(四补充项 v3.2.2 已迁入引擎);
+        引擎缺某项 → 菜单诚实少该项(不虚列点不动的卡)。其它组收未分组项。"""
+        try:
+            eng = dict(self._mw().ANALYSES)
+            merged = {}
+            for k, v in eng.items():
+                merged[k] = {'key': k, 'name': v.get('name', k), 'note': v.get('note', ''),
+                             'outputs': list(v.get('outputs') or ()), 'source': 'engine'}
+            placed, groups = set(), []
+            for gname, keys in self._WAVEFN_GROUPS:
+                items = [merged[k] for k in keys if k in merged]
+                for it in items:
+                    placed.add(it['key'])
+                if items:
+                    groups.append({'group': gname, 'items': items})
+            leftover = [merged[k] for k in merged if k not in placed]
+            if leftover:
+                other = next((g for g in groups if g['group'] == '其它'), None)
+                if other:
+                    other['items'].extend(leftover)
+                else:
+                    groups.append({'group': '其它', 'items': leftover})
+            return {'ok': True, 'groups': groups, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'groups': [], 'error': str(e)}
+
+    def wavefn_run_extra(self, wavefn_file, analyses, params=None, exe=None, workdir=None):
+        """跑补充分析四项(elf_lol_section/adch_charge/property_summary/fukui_cdft)——兼容入口。
+
+        v3.2.2 起四项在引擎 multiwfn_driver.ANALYSES 注册表,本方法直接按引擎 run() 执行
+        (语义等价 wavefn_run;保留本方法兼容旧前端路由与 Fukui 面板直连)。注入的引擎若无
+        该项(旧版引擎),按项返回「引擎待扩展」中文说明,绝不假成功。返回
+        {'ok','results':[{analysis,ok,outputs,stdout_tail,elapsed_s,script,error}],'error'}。
+        """
+        try:
+            wf = (wavefn_file or '').strip()
+            keys = [str(a).strip() for a in (analyses or []) if str(a).strip()]
+            if not wf:
+                return {'ok': False, 'results': [], 'error': '未选择波函数文件'}
+            if not keys:
+                return {'ok': False, 'results': [], 'error': '未选择分析项'}
+            mw = self._mw()
+            registry = dict(getattr(mw, 'ANALYSES', None) or {})
+            mw_exe = (exe or self._tool_paths().get('multiwfn') or '').strip() or None
+            wd = (workdir or '').strip() or None
+            p = dict(params or {})
+            results = []
+            for k in keys:
+                if k not in registry:
+                    results.append({'analysis': k, 'ok': False, 'outputs': [],
+                                    'stdout_tail': '', 'script': '', 'elapsed_s': 0.0,
+                                    'error': (f'引擎待扩展:multiwfn_driver.ANALYSES 无分析项 '
+                                              f'{k!r}(引擎版本过旧,请更新 vcstudio)')})
+                    continue
+                try:
+                    r = mw.run(wf, k, exe=mw_exe, workdir=wd, params=p)
+                    results.append({'analysis': k, 'ok': bool(r.get('ok')),
+                                    'outputs': list(r.get('outputs') or []),
+                                    'stdout_tail': r.get('stdout_tail', ''),
+                                    'elapsed_s': r.get('elapsed_s', 0.0),
+                                    'script': r.get('script', ''),
+                                    'error': r.get('error') or None})
+                except Exception as e:                    # noqa: BLE001
+                    results.append({'analysis': k, 'ok': False, 'outputs': [],
+                                    'stdout_tail': '', 'script': '', 'elapsed_s': 0.0,
+                                    'error': str(e)})
+            return {'ok': any(r['ok'] for r in results), 'results': results, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'results': [], 'error': str(e)}
+
+    @staticmethod
+    def _parse_cube_values(path):
+        """.cub/.cube → (n_atoms, (nx,ny,nz), 扁平体数据 float 列表)。解析失败 → (0,(0,0,0),[])。"""
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                lines = f.read().splitlines()
+            if len(lines) < 6:
+                return 0, (0, 0, 0), []
+            natoms = int(float(lines[2].split()[0]))
+            nx = int(float(lines[3].split()[0]))
+            ny = int(float(lines[4].split()[0]))
+            nz = int(float(lines[5].split()[0]))
+            data_start = 6 + abs(natoms)
+            vals = []
+            for ln in lines[data_start:]:
+                for tok in ln.split():
+                    try:
+                        vals.append(float(tok))
+                    except ValueError:
+                        pass
+            return abs(natoms), (nx, ny, nz), vals
+        except Exception:                                 # noqa: BLE001
+            return 0, (0, 0, 0), []
+
+    def wavefn_scatter(self, func1_cube, func2_cube, kind='nci', max_points=3000, out_png=None):
+        """NCI/IRI 散点(RDG-sign(λ2)ρ):读两 cube 配对采样 → {'ok','kind','points':[{x,y}],
+        'n','png','error'}。func1=sign(λ2)ρ(x)、func2=RDG(y);前端可 echarts 渲染,给 out_png 则
+        经 native_charts 另出 PNG(缺 matplotlib 则跳过,points 仍返回)。"""
+        try:
+            f1 = (func1_cube or '').strip()
+            f2 = (func2_cube or '').strip()
+            if not f1 or not os.path.isfile(f1):
+                return {'ok': False, 'kind': kind, 'points': [], 'n': 0, 'png': None,
+                        'error': 'sign(λ2)ρ cube(func1)不存在'}
+            if not f2 or not os.path.isfile(f2):
+                return {'ok': False, 'kind': kind, 'points': [], 'n': 0, 'png': None,
+                        'error': 'RDG cube(func2)不存在'}
+            _n1, _d1, xs = self._parse_cube_values(f1)
+            _n2, _d2, ys = self._parse_cube_values(f2)
+            n = min(len(xs), len(ys))
+            if n == 0:
+                return {'ok': False, 'kind': kind, 'points': [], 'n': 0, 'png': None,
+                        'error': '两 cube 无可解析体数据'}
+            step = max(1, n // int(max_points or 3000))
+            points = []
+            for i in range(0, n, step):
+                x, y = xs[i], ys[i]
+                if abs(x) <= 0.05 and 0.0 <= y <= 2.0:   # NCI 典型窗口
+                    points.append({'x': round(x, 5), 'y': round(y, 5)})
+            png = None
+            dest = (out_png or '').strip()
+            if dest and points:
+                try:
+                    nc = self._nc()
+                    xs2 = [p['x'] for p in points]
+                    ys2 = [p['y'] for p in points]
+                    got = nc.scaling_relation(
+                        xs2, ys2, dest, xlabel=r'sign($\lambda_2$)$\rho$ (a.u.)',
+                        ylabel='RDG', fit=False)
+                    png = got[0] if isinstance(got, (list, tuple)) and got else dest
+                except Exception:                         # noqa: BLE001 出图失败不挡数据
+                    png = None
+            return {'ok': True, 'kind': kind, 'points': points, 'n': len(points),
+                    'png': png, 'error': None}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'kind': kind, 'points': [], 'n': 0, 'png': None,
+                    'error': str(e)}
+
+    def wavefn_render_remote(self, scene, files, name, password, remote_dir,
+                             remote_exe='vmd', trust_new=False, params=None):
+        """(实验性)远程集群渲染波函数场景:上传 cube/结构 → 远端 VMD Tachyon → 下载 PNG。
+
+        返回 {'ok','png'(本地),'tcl','experimental':True,'needs_trust','error'}。任一步失败给
+        中文说明;大文件/复杂路径后续完善。VMD 缺 tcl 时回传脚本供手动渲染。
+        """
+        try:
+            import shlex
+            sc = (scene or '').strip()
+            rdir = (remote_dir or '').strip()
+            fmap = dict(files or {})
+            if not sc:
+                return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                        'needs_trust': False, 'error': '未选择渲染场景'}
+            if not rdir:
+                return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                        'needs_trust': False, 'error': '未指定远端工作目录'}
+            vmd = self._vmd_()
+            spec = vmd.SCENES.get(sc)
+            if spec is None:
+                return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                        'needs_trust': False, 'error': f'未知场景 {sc!r}'}
+            for role in (spec.get('files') or ()):
+                lp = (fmap.get(role) or '').strip()
+                if not lp or not os.path.isfile(lp):
+                    return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                            'needs_trust': False, 'error': f'渲染文件「{role}」不存在'}
+            prof, pw, err = self._resolve(name, password)
+            if err:
+                return err
+            conn = self._conn()
+            rexe = (remote_exe or 'vmd').strip() or 'vmd'
+            remote_files = {}
+            for role, lp in fmap.items():
+                remote_files[role] = rdir.rstrip('/') + '/' + os.path.basename(lp)
+            remote_out = rdir.rstrip('/') + '/' + sc + '.png'
+            try:
+                tcl = spec['build'](remote_files, remote_out, dict(params or {}))
+            except Exception as e:                        # noqa: BLE001
+                return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                        'needs_trust': False, 'error': f'场景脚本生成失败:{e}'}
+            try:
+                client, jump = conn.open_client(prof, pw, trust_new=trust_new)
+            except conn.ConnectError as e:
+                return {'ok': False, 'png': None, 'tcl': tcl, 'experimental': True,
+                        'needs_trust': bool(getattr(e, 'needs_trust', False)),
+                        **self._host_key_evidence(e), 'error': str(e)}
+            local_png = None
+            try:
+                sftp = client.open_sftp()
+                for role, lp in fmap.items():
+                    sftp.put(lp, remote_files[role])
+                tcl_remote = rdir.rstrip('/') + '/_vcs_scene.tcl'
+                with sftp.open(tcl_remote, 'w') as f:
+                    f.write(tcl)
+                cmd = (f'cd {shlex.quote(rdir)} && {rexe} -dispdev text -eofexit '
+                       f'-e _vcs_scene.tcl')
+                _in, out, _err = client.exec_command(cmd, timeout=1800)
+                code = out.channel.recv_exit_status()
+                tail = '\n'.join(out.read().decode('utf-8', errors='replace')
+                                 .splitlines()[-40:])
+                if code == 0:
+                    first = next(iter(fmap.values()))
+                    local_png = os.path.join(os.path.dirname(first), sc + '_remote.png')
+                    try:
+                        sftp.get(remote_out, local_png)
+                    except Exception:                     # noqa: BLE001 下载失败仅记
+                        local_png = None
+                sftp.close()
+            finally:
+                conn.close_quiet(client, jump)
+            ok = local_png is not None and os.path.isfile(local_png)
+            return {'ok': ok, 'png': local_png, 'tcl': tcl, 'experimental': True,
+                    'needs_trust': False,
+                    'error': None if ok else ('远端渲染完成但未取回 PNG(退出码/网络问题):' + tail
+                                              if code == 0 else f'远端 VMD 退出码 {code};{tail}')}
+        except Exception as e:                            # noqa: BLE001
+            return {'ok': False, 'png': None, 'tcl': '', 'experimental': True,
+                    'needs_trust': False, 'error': str(e)}

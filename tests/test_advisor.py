@@ -47,7 +47,7 @@ def test_dipole_rules():
     assert 'LDIPOL_WITHOUT_DIPOL' in _names(w)             # P2:无 DIPOL
     ok = advisor.advise({'ENCUT': 500, 'LDIPOL': True, 'IDIPOL': 3, 'DIPOL': '0.5 0.5 0.45'})
     assert 'LDIPOL_WITHOUT_IDIPOL' not in _names(ok)
-    # 有吸附组态但完全没配偶极 → P1 提示
+    # 有吸附构型但完全没配偶极 → P1 提示
     w2 = advisor.advise({'ENCUT': 500}, has_configs=True)
     assert 'ADS_SLAB_NO_DIPOLE' in _names(w2)
     assert 'ADS_SLAB_NO_DIPOLE' not in _names(
@@ -69,6 +69,49 @@ def test_o2_nupdown_p2_and_priority_order():
     assert 'O2_NUPDOWN' in _names(w)
     pris = [p for p, _, _ in w]
     assert pris == sorted(pris)                            # P0 在前
+
+
+def test_nsw_zero_only_in_ads_context():
+    # 吸附上下文(有 configs)+ NSW 缺失/≤0 → 单点告警
+    assert 'NSW_ZERO' in _names(advisor.advise({'ENCUT': 500}, has_configs=True))
+    assert 'NSW_ZERO' in _names(advisor.advise({'ENCUT': 500, 'NSW': 0}, has_configs=True))
+    assert 'NSW_ZERO' not in _names(
+        advisor.advise({'ENCUT': 500, 'NSW': 100}, has_configs=True))
+    # 无 configs(单纯静态单点是合法用途)→ 不报
+    assert 'NSW_ZERO' not in _names(advisor.advise({'ENCUT': 500}))
+
+
+def test_no_ediffg_when_relaxing():
+    assert 'NO_EDIFFG' in _names(advisor.advise({'ENCUT': 500, 'NSW': 100}))
+    assert 'NO_EDIFFG' not in _names(
+        advisor.advise({'ENCUT': 500, 'NSW': 100, 'EDIFFG': -0.02}))
+    assert 'NO_EDIFFG' not in _names(advisor.advise({'ENCUT': 500}))   # 单点无需力判据
+
+
+def test_no_dispersion_for_ads_and_molecule():
+    assert 'NO_DISPERSION' in _names(advisor.advise({'ENCUT': 500}, has_configs=True))
+    assert 'NO_DISPERSION' in _names(advisor.advise({'ENCUT': 500}, gas=_GAS_O2))
+    assert 'NO_DISPERSION' not in _names(
+        advisor.advise({'ENCUT': 500, 'IVDW': 12}, has_configs=True))
+    assert 'NO_DISPERSION' not in _names(          # vdW-DF 泛函(LUSE_VDW)亦算已启用
+        advisor.advise({'ENCUT': 500, 'LUSE_VDW': True}, has_configs=True))
+    assert 'NO_DISPERSION' not in _names(advisor.advise({'ENCUT': 500}))  # 纯 bulk 不报
+
+
+def test_vacuum_too_thin_slab():
+    thin = 't\n1.0\n10 0 0\n0 10 0\n0 0 12\nC\n2\nCartesian\n0 0 0\n0 0 2\n'   # 真空 10<12
+    assert 'VACUUM_TOO_THIN' in _names(
+        advisor.advise({'ENCUT': 500}, calc_type='slab', poscar_text=thin))
+    thick = 't\n1.0\n10 0 0\n0 10 0\n0 0 30\nC\n2\nCartesian\n0 0 0\n0 0 2\n'  # 真空 28
+    assert 'VACUUM_TOO_THIN' not in _names(
+        advisor.advise({'ENCUT': 500}, calc_type='slab', poscar_text=thick))
+    # 非 slab / 无 POSCAR → 不查(向后兼容,老调用不传即跳过)
+    assert 'VACUUM_TOO_THIN' not in _names(
+        advisor.advise({'ENCUT': 500}, calc_type='molecule', poscar_text=thin))
+    assert 'VACUUM_TOO_THIN' not in _names(advisor.advise({'ENCUT': 500}, calc_type='slab'))
+    # 坏 POSCAR 不抛(顾问 warn-only 兜底),仍返回列表
+    assert isinstance(advisor.advise({'ENCUT': 500}, calc_type='slab',
+                                     poscar_text='garbage'), list)
 
 
 def test_create_project_returns_advisories(tmp_path):

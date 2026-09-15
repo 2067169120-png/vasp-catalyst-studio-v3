@@ -7,11 +7,18 @@ M1 子命令:`gen` —— POSCAR + 用户 INCAR → VASP 输入四件套。
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import sys
 
 from vcstudio.generate.job_builder import build_job_dir
 from vcstudio.generate.potcar import PotcarError
+
+_PYWEBVIEW_HINT = (
+    '错误: 未安装 pywebview(Web 界面依赖)。请先安装:\n'
+    '    pip install pywebview\n'
+    '  (Windows 还需微软 Edge WebView2 Evergreen 运行时)\n'
+    '或改用旧版 tkinter 界面:vcs gui --legacy')
 
 
 def cmd_gen(args) -> int:
@@ -59,9 +66,30 @@ def cmd_gen(args) -> int:
     return 0
 
 
-def cmd_gui(args) -> int:
+def _launch_web_gui() -> int:
+    """启动默认 Web GUI(pywebview + gui_web)。缺 pywebview → 中文安装提示,返回 1。
+
+    先探测 webview 是否可导入(find_spec,不真 import,便于 mock 测试),缺失即给
+    可操作提示并退出;就绪则委托 gui_web.__main__.main(内含窗口创建/启动兜底)。
+    """
+    if importlib.util.find_spec('webview') is None:
+        print(_PYWEBVIEW_HINT, file=sys.stderr)
+        return 1
+    from vcstudio.gui_web.__main__ import main as web_main
+    return web_main()
+
+
+def _launch_legacy_gui() -> int:
+    """启动旧版 tkinter GUI(vcs gui --legacy)。"""
     from vcstudio.gui.app import main as gui_main
     return gui_main()
+
+
+def cmd_gui(args) -> int:
+    """默认起 Web 界面;--legacy 走旧 tkinter。"""
+    if getattr(args, 'legacy', False):
+        return _launch_legacy_gui()
+    return _launch_web_gui()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -81,7 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument('--lib-root', default=None, help='POTCAR 库根(覆盖 config)')
     g.set_defaults(func=cmd_gen)
 
-    gui_p = sub.add_parser('gui', help='打开图形界面(生成 + 集群配置)')
+    gui_p = sub.add_parser('gui', help='打开图形界面(默认 Web;--legacy 用旧 tkinter)')
+    gui_p.add_argument('--legacy', action='store_true',
+                       help='使用旧版 tkinter 界面(默认启动 Web 界面)')
     gui_p.set_defaults(func=cmd_gui)
     return parser
 

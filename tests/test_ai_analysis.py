@@ -46,7 +46,7 @@ def test_analyze_happy_with_fake_transport():
             'caveats': ['no ZPE'], 'confidence': 'high'})}}]}
         return 200, json.dumps(reply).encode()
 
-    out = ai.analyze({'x': 1}, api_key='k', transport=fake)
+    out = ai.analyze({'x': 1}, api_key='k', transport=fake, allow_external=True)
     assert out['ok'] and out['analysis_zh'] == '吸附强度 S8 最强'
     assert out['caveats'] == ['no ZPE'] and out['confidence'] == 'high'
     assert seen['body']['temperature'] == 0.2                    # 低温事实性
@@ -55,9 +55,17 @@ def test_analyze_happy_with_fake_transport():
 
 def test_analyze_no_key_degrades(monkeypatch):
     monkeypatch.setattr(ai, 'load_api_key', lambda: None)   # 隔离 keyring(机器上可能存了真 key)
-    out = ai.analyze({'x': 1}, api_key=None,
+    out = ai.analyze({'x': 1}, api_key=None, allow_external=True,
                      transport=lambda *a: (_ for _ in ()).throw(AssertionError))
     assert not out['ok'] and 'API key' in out['error']
+
+
+def test_analyze_skipped_when_external_disabled():
+    # 联网门控默认关闭:未开启则不外发项目数据,返回 skipped 指引,transport 绝不触发
+    out = ai.analyze({'x': 1}, api_key='k', allow_external=False,
+                     transport=lambda *a: (_ for _ in ()).throw(AssertionError('不应外发')))
+    assert not out['ok'] and out.get('skipped') is True
+    assert '设置页' in out['error'] and '导出提示词包' in out['error']
 
 
 def test_analyze_http_error_retries_then_fails():
@@ -67,7 +75,7 @@ def test_analyze_http_error_retries_then_fails():
         calls.append(1)
         return 429, b'rate limited'
 
-    out = ai.analyze({'x': 1}, api_key='k', transport=bad)
+    out = ai.analyze({'x': 1}, api_key='k', transport=bad, allow_external=True)
     assert not out['ok'] and 'HTTP 429' in out['error'] and len(calls) == 4  # 重试预算(网关抖动)
 
 
@@ -84,7 +92,7 @@ def test_analyze_strips_rejected_params_and_extracts_fenced_json():
         import json as j
         return 200, j.dumps({'choices': [{'message': {'content': content}}]}).encode()
 
-    out = ai.analyze({'x': 1}, api_key='k', transport=gw)
+    out = ai.analyze({'x': 1}, api_key='k', transport=gw, allow_external=True)
     assert out['ok'] and out['analysis_zh'] == 'zh' and out['confidence'] == 'high'
     assert len(calls) == 2 and 'temperature' not in calls[-1]   # 剥参后第二次成功
 
@@ -100,7 +108,7 @@ def test_analyze_bad_json_degrades():
     def weird(url, body, headers, timeout):
         return 200, b'{"choices": [{"message": {"content": "not json"}}]}'
 
-    out = ai.analyze({'x': 1}, api_key='k', transport=weird)
+    out = ai.analyze({'x': 1}, api_key='k', transport=weird, allow_external=True)
     assert not out['ok'] and '解析失败' in out['error']
 
 
@@ -111,6 +119,58 @@ def test_catalyst_context_heuristics():
     assert 'transition-metal surface' in ai.catalyst_context(['Pt'])
     assert ai.catalyst_context(['Si', 'O']) == '' or 'oxide' in ai.catalyst_context(['Si', 'O'])
     assert ai.catalyst_context([]) == ''
+    # catalyst_context 只在 payload 含电子结构数据(dos/bader)时才注入
     p = ai.build_payload(project_name='p', delta_rows=[], incar_summary={},
-                         slab_elements=['Zn', 'N', 'C'])
+                         slab_elements=['Zn', 'N', 'C'], dos={'d_band_center': -1.2})
     assert 'catalyst_context' in p and 'd-orbital' in p['catalyst_context']
+
+
+def test_build_payload_gates_electronic_context():
+    """无 dos/bader → 不注入 catalyst_context;有 → 注入。"""
+    p_plain = ai.build_payload(project_name='p', delta_rows=_ROWS, incar_summary={},
+                               slab_elements=['Mo', 'S'])
+    assert 'catalyst_context' not in p_plain and 'dos' not in p_plain
+    p_bader = ai.build_payload(project_name='p', delta_rows=_ROWS, incar_summary={},
+                               slab_elements=['Mo', 'S'], bader={'charge_M': 0.3})
+    assert 'catalyst_context' in p_bader and p_bader['bader'] == {'charge_M': 0.3}
+
+
+def test_prompt_gates_d_band_language():
+    """payload 无 dos/bader → 提示词不含 d 带诱导语,反而明示仅基于能量;有则放行。"""
+    p_plain = ai.build_payload(project_name='p', delta_rows=_ROWS, incar_summary={},
+                               slab_elements=['Mo', 'S'])
+    prompt_plain = ai.build_prompt(p_plain)
+    assert 'you MAY discuss d-band-center' not in prompt_plain          # 诱导语缺席
+    assert 'do NOT infer' in prompt_plain and 'ONLY energies' in prompt_plain
+
+    p_elec = ai.build_payload(project_name='p', delta_rows=_ROWS, incar_summary={},
+                              slab_elements=['Mo', 'S'], dos={'d_band_center': -1.5})
+    prompt_elec = ai.build_prompt(p_elec)
+    assert 'you MAY discuss d-band-center' in prompt_elec               # 有依据才放行
+
+
+def test_prompt_preset_from_config(monkeypatch):
+    """config llm.prompt_preset 生效;缺失则回落内置发刊级默认。"""
+    monkeypatch.setattr(ai, '_config_llm', lambda: {'prompt_preset': 'CUSTOM_PRESET_XYZ'})
+    prompt = ai.build_prompt(ai.build_payload(project_name='p', delta_rows=_ROWS,
+                                              incar_summary={}))
+    assert 'CUSTOM_PRESET_XYZ' in prompt
+    monkeypatch.setattr(ai, '_config_llm', lambda: {})
+    assert 'FOUR explicit parts' in ai.build_prompt(
+        ai.build_payload(project_name='p', delta_rows=_ROWS, incar_summary={}))
+
+
+def test_probe_ok_and_http_error():
+    """连通性探测:200 → ok;非 200 → 错误含状态码;不外发项目数据。"""
+    ok = ai.probe(api_key='k', base_url='http://x', model='m',
+                  transport=lambda url, body, headers, timeout: (200, b'{}'))
+    assert ok['ok'] is True
+    bad = ai.probe(api_key='k', transport=lambda *a: (401, b'unauthorized'))
+    assert bad['ok'] is False and '401' in bad['error']
+
+
+def test_probe_no_key(monkeypatch):
+    monkeypatch.setattr(ai, 'load_api_key', lambda: None)   # 隔离 keyring(机器上可能存了真 key)
+    bad = ai.probe(api_key=None,
+                   transport=lambda *a: (_ for _ in ()).throw(AssertionError('不应发请求')))
+    assert bad['ok'] is False and '密钥' in bad['error']

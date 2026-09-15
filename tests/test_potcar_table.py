@@ -43,6 +43,12 @@ def test_unregistered_element_still_raises():
         variant('Xx')
 
 
-def test_magnetic_defaults_unchanged():
-    # 扩表不引入新的默认磁性元素(方法学不漂移)
-    assert MAGNETIC_ELEMENTS == {'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni'}
+def test_magnetic_elements_is_per_element_moment_dict():
+    # 变更(科学防错包 任务5):MAGNETIC_ELEMENTS 由集合改为 {元素: 初猜比矩μB} dict,
+    # 供 build_magmom 差异化取矩(3d/4d/5d/4f 磁矩量级不同,统一 5μB 是粗糙初猜)。
+    assert MAGNETIC_ELEMENTS == {
+        'V': 3, 'Cr': 5, 'Mn': 5, 'Fe': 4, 'Co': 3, 'Ni': 2, 'Cu': 1,
+        'Mo': 3, 'W': 2, 'Ce': 1, 'Gd': 7,
+    }
+    # dict 成员判定仍按键工作(has_magnetic/validate 依赖此语义,不破)
+    assert 'Fe' in MAGNETIC_ELEMENTS and 'Zn' not in MAGNETIC_ELEMENTS

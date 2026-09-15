@@ -17,13 +17,18 @@ from typing import Optional
 
 from vcstudio.generate import potcar
 
-# ── 磁性元素(拷贝自 E: incar_builder) ───────────────────────────────────────
-MAGNETIC_ELEMENTS = {'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni'}
-DEFAULT_MAGMOM = 5  # μB,磁性原子初始磁矩猜测
+# ── 磁性元素 → 每原子初猜磁矩(μB) ──────────────────────────────────────────────
+# 元素经验磁矩初猜(**初猜非终值**:仅给 VASP 起步磁态,自洽后应核对 OUTCAR 末尾 mag 并按需
+# 覆盖)。数值取常见高自旋近似:3d 过渡金属按未配对 d 电子数量级,4d/5d 偏小,Ce/Gd 按 4f。
+MAGNETIC_ELEMENTS = {
+    'V': 3, 'Cr': 5, 'Mn': 5, 'Fe': 4, 'Co': 3, 'Ni': 2, 'Cu': 1,
+    'Mo': 3, 'W': 2, 'Ce': 1, 'Gd': 7,
+}
+DEFAULT_MAGMOM = 5  # μB,磁性原子磁矩兜底(元素未登记经验磁矩时用)
 
 
 def has_magnetic(elements) -> bool:
-    """体系是否含磁性 3d 过渡金属。"""
+    """体系是否含磁性元素(MAGNETIC_ELEMENTS 键)。"""
     return any(el in MAGNETIC_ELEMENTS for el in elements)
 
 
@@ -31,15 +36,20 @@ def build_magmom(elements, counts,
                  magmom_overrides: Optional[dict] = None) -> Optional[str]:
     """生成 MAGMOM 串 ``'n1*m1 n2*m2 ...'``(按 elements 顺序)。
 
-    磁性原子取 DEFAULT_MAGMOM(或 magmom_overrides),其余 0。
-    counts 缺失或与 elements 不等长 → None(调用方据此降级)。
+    磁性原子取 MAGNETIC_ELEMENTS 的元素经验磁矩(magmom_overrides 优先,登记缺失兜底
+    DEFAULT_MAGMOM),非磁性原子 0。counts 缺失或与 elements 不等长 → None(调用方降级)。
     """
     if not counts or len(counts) != len(elements):
         return None
     overrides = dict(magmom_overrides or {})
     terms = []
     for el, c in zip(elements, counts):
-        moment = overrides.get(el, DEFAULT_MAGMOM if el in MAGNETIC_ELEMENTS else 0)
+        if el in overrides:
+            moment = overrides[el]
+        elif el in MAGNETIC_ELEMENTS:
+            moment = MAGNETIC_ELEMENTS.get(el, DEFAULT_MAGMOM)   # 比矩;缺登记兜底
+        else:
+            moment = 0
         terms.append(f'{int(c)}*{moment:g}')
     return ' '.join(terms)
 
@@ -157,8 +167,15 @@ def _as_number(v):
 
 
 def validate_and_complete_incar(incar_dict, elements, counts,
-                                lib_root: str | None = None):
+                                lib_root: str | None = None,
+                                force_encut: int | None = None):
     """尊重用户 INCAR,只对【缺失键】产补全项;值不合理只 warn 不改。
+
+    force_encut:项目级统一 ENCUT。吸附能项目里各成员(clean_slab / slab+ads /
+    gas_ref)元素并集不同,若各自按自身元素补 ENCUT 会得到**不同**截断能,使
+    ΔE=E(slab+ads)−E(slab)−E(ref) 大数相减被不同基组静默污染(缺口分析指出的
+    主打功能静默错误)。调用方(create_project)按全项目元素并集算好统一值传入,
+    仅在用户 INCAR **未显式给** ENCUT 时生效(用户显式值永远尊重)。
 
     Returns:
         (completions: OrderedDict, warnings: list[str])。completions 仅含新增键
@@ -179,12 +196,24 @@ def validate_and_complete_incar(incar_dict, elements, counts,
 
     # D1 / D2:ENCUT
     if 'ENCUT' not in present:
-        mx = enmax_max()
-        enc = int(math.ceil(1.3 * mx / 50.0) * 50)      # 无 400 下限:不偷渡 RPBE 时代偏置
-        completions['ENCUT'] = enc
-        warnings.append(
-            f'INCAR 未指定 ENCUT,已按 1.3×max(ENMAX)={mx:.1f} 补为 {enc} eV;'
-            f'如需自定义请在 INCAR 显式给出。')
+        if force_encut is not None:
+            # 项目级统一:所有成员用同一 ENCUT,保 ΔE 可比性
+            mx = enmax_max()
+            if force_encut < mx:
+                warnings.append(
+                    f'项目统一 ENCUT={force_encut} 低于本成员元素最大 ENMAX={mx:.1f};'
+                    f'POTCAR 拼接阶段将报错,请提高项目 ENCUT 或在 INCAR 显式给出。')
+            completions['ENCUT'] = int(force_encut)
+            warnings.append(
+                f'INCAR 未指定 ENCUT,已按**全项目元素并集**统一补为 {int(force_encut)} eV'
+                f'(保吸附能 ΔE 各成员基组一致)。')
+        else:
+            mx = enmax_max()
+            enc = int(math.ceil(1.3 * mx / 50.0) * 50)  # 无 400 下限:不偷渡 RPBE 时代偏置
+            completions['ENCUT'] = enc
+            warnings.append(
+                f'INCAR 未指定 ENCUT,已按 1.3×max(ENMAX)={mx:.1f} 补为 {enc} eV;'
+                f'如需自定义请在 INCAR 显式给出。')
     else:
         user_encut = _as_number(upper.get('ENCUT'))
         if user_encut is not None:
@@ -210,8 +239,8 @@ def validate_and_complete_incar(incar_dict, elements, counts,
                     completions['ISPIN'] = 2
                 warnings.append(
                     f"体系含磁性元素 {mags} 但 INCAR 无 MAGMOM,已补 MAGMOM='{magmom}'"
-                    f'(每磁性原子 {DEFAULT_MAGMOM}μB)并设 ISPIN=2;顺序须与 POSCAR '
-                    f'物种一致,可自行覆盖。')
+                    f'(按元素经验磁矩初猜,非终值)并设 ISPIN=2;顺序须与 POSCAR '
+                    f'物种一致,自洽后请核对 mag 并按需覆盖。')
             else:
                 # D3':含磁但 counts 缺失/畸形 → 无法生成 MAGMOM,但仍补 ISPIN=2 保自旋极化
                 # (否则 VASP 默认 ISPIN=1 跑成非磁,静默错磁态)。
@@ -223,3 +252,118 @@ def validate_and_complete_incar(incar_dict, elements, counts,
                     f'(可能非最优),建议提供 counts 以写入正确 MAGMOM。')
         # else:用户已带 MAGMOM → 完全不动(不重复补)
     return completions, warnings
+
+
+# ── 偶极校正建议(F6)与色散一致性审计(F13):两个独立新函数,只建议不强塞 ──────
+def _mat_inv3(m):
+    """3×3 矩阵求逆(纯 Python,避免给 incar_builder 引入 numpy 硬依赖)。奇异 → ValueError。"""
+    (a, b, c), (d, e, f), (g, h, i) = m[0], m[1], m[2]
+    ca, cb, cc = e * i - f * h, f * g - d * i, d * h - e * g
+    det = a * ca + b * cb + c * cc
+    if abs(det) < 1e-12:
+        raise ValueError('晶格矢量退化(行列式≈0),无法求分数坐标')
+    inv = 1.0 / det
+    return [[ca * inv, (c * h - b * i) * inv, (b * f - c * e) * inv],
+            [cb * inv, (a * i - c * g) * inv, (c * d - a * f) * inv],
+            [cc * inv, (b * g - a * h) * inv, (a * e - b * d) * inv]]
+
+
+def _cart_to_frac(cart, cell):
+    """笛卡尔 → 分数(frac_j = Σ_k cart_k·inv[k][j],与 slab_builder 同口径)。"""
+    inv = _mat_inv3(cell)
+    return [cart[0] * inv[0][j] + cart[1] * inv[1][j] + cart[2] * inv[2][j] for j in range(3)]
+
+
+def dipole_correction_keys(poscar_text, calc_type) -> dict:
+    """slab 且结构 z 不对称 → 建议偶极校正键;否则空 dict。**只建议不强塞**(调用方合并)。
+
+    判据:仅对 calc_type='slab' 生效;z 质心偏离盒中心(|c|/2)> 1 Å 视为上下表面不对称
+    (吸附/掺杂造成),返回 {'LDIPOL':'.TRUE.','IDIPOL':'3','DIPOL':'质心分数坐标'};
+    z 近似对称或非 slab → {}。POSCAR 解析失败静默返回 {}(顾问绝不挡主流程)。
+    """
+    if str(calc_type).lower() != 'slab':
+        return {}
+    try:
+        from vcstudio.generate.structure_view import parse_positions
+        parsed = parse_positions(poscar_text)
+    except Exception:                                    # noqa: BLE001 解析失败 → 不建议
+        return {}
+    coords, cell = parsed['coords'], parsed['cell']
+    if not coords:
+        return {}
+    n = len(coords)
+    lz = cell[2][2]
+    if lz <= 0:
+        return {}
+    cz = sum(pt[2] for pt in coords) / n
+    if abs(cz - lz / 2.0) <= 1.0:
+        return {}                                        # z 近似对称,无需偶极校正
+    cx = sum(pt[0] for pt in coords) / n
+    cy = sum(pt[1] for pt in coords) / n
+    try:
+        frac = _cart_to_frac([cx, cy, cz], cell)
+    except ValueError:
+        return {}
+    return {'LDIPOL': '.TRUE.', 'IDIPOL': '3',
+            'DIPOL': f'{frac[0]:.4f} {frac[1]:.4f} {frac[2]:.4f}'}
+
+
+# VASPsol 隐式溶剂化顾问文本(需补丁编译;标准 VASP 会静默忽略 → 真空结果):
+VASPSOL_ADVISORY = (
+    'VASPsol 隐式溶剂化需 VASP 打 VASPsol 补丁并重新编译:标准 VASP 无 LSOL/EB_K 支持,'
+    '直接提交会**静默忽略**这些键、给出真空(gas-phase)结果而不报错——提交前务必确认集群 '
+    'VASP 版本已含 VASPsol。相对介电常数 EB_K 默认 78.4(300 K 水);其他溶剂查文献'
+    '(如乙腈 37.5、乙醇 24.9)。溶剂化能须与真空同几何单点相减,口径请在方法学写明。')
+
+
+def vaspsol_keys(enabled: bool = True, *, eb_k: float = 78.4) -> dict:
+    """VASPsol 隐式溶剂化 INCAR 键(独立顾问函数,**只给键不强塞**;调用方自行合并)。
+
+    与 dipole_correction_keys 同口径:返回纯 INCAR 键 dict,不 mutate 任何输入,不生成
+    文件。advisor 式提醒见模块常量 ``VASPSOL_ADVISORY``(补丁编译要求 + 标准 VASP 静默
+    真空陷阱),调用方应把该文本作为 warning 暴露给用户。
+
+    Args:
+        enabled: True → ``{'LSOL': True, 'EB_K': eb_k}`` 开溶剂化;
+            False → ``{'LSOL': False}``(显式关,占位便于真空/溶剂对照口径)。
+        eb_k: 相对介电常数(默认 78.4 = 300 K 水)。仅 enabled=True 时写入。
+
+    Returns:
+        dict(LSOL[/EB_K])。EB_K 为浮点。
+    """
+    if not enabled:
+        return {'LSOL': False}
+    return {'LSOL': True, 'EB_K': float(eb_k)}
+
+
+def dispersion_audit(incar_texts: list) -> dict:
+    """项目内多份 INCAR 的 IVDW(色散)一致性审计 → {'ok','ivdw','detail'}。
+
+    - 全部未设 IVDW(无色散)→ ok(口径一致)。
+    - 全部有且同值 → ok。
+    - 部分缺 / 混用不同值 → ok=False,detail 中文点名哪几份缺、哪几份何值(能量不可比)。
+    """
+    vals = []
+    for text in incar_texts:
+        vals.append(parse_incar(text).get('IVDW'))
+    present = [v for v in vals if v is not None]
+    total = len(vals)
+    if not present:
+        return {'ok': True, 'ivdw': None,
+                'detail': f'{total} 份 INCAR 均未设 IVDW(无色散校正),口径一致。'}
+    if len(present) == total and len(set(present)) == 1:
+        return {'ok': True, 'ivdw': present[0],
+                'detail': f'{total} 份 INCAR 均设 IVDW={present[0]},口径一致。'}
+    parts = []
+    missing = [i + 1 for i, v in enumerate(vals) if v is None]
+    if missing:
+        parts.append(f'第 {", ".join(map(str, missing))} 份缺 IVDW')
+    by_val: dict = {}
+    for i, v in enumerate(vals):
+        if v is not None:
+            by_val.setdefault(v, []).append(i + 1)
+    if len(by_val) > 1:
+        parts.append('; '.join(
+            f'IVDW={k} 见第 {", ".join(map(str, idxs))} 份' for k, idxs in by_val.items()))
+    return {'ok': False, 'ivdw': None,
+            'detail': '色散设置不一致,能量不可比:' + ';'.join(parts) + '。'}

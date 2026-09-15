@@ -6,19 +6,48 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e .[dev]
+      - name: Ruff lint
+        run: ruff check vcstudio tests
+
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.11", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
       - name: Install
         run: pip install -e .[dev]
       - name: Test
-        run: python -m pytest -q
+        run: python -m pytest -q --cov=vcstudio --cov-report=term-missing --cov-fail-under=60
+
+  package-smoke:
+    # 打包冒烟:确保 PyInstaller 与入口 import 链不坏(不产出 EXE 上传,只验证可打包)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e .[dev,gui,packaging]
+      - name: Import entry points
+        run: |
+          python -c "import vcstudio; import vcstudio.gui_web.api; import vcstudio.cli.main; print('entry imports ok', vcstudio.__version__)"

@@ -1,0 +1,60 @@
+schema: 1
+job_id: ads_Li2S8_zbrent
+system: ads_Li2S8_zbrent
+task_type: relax
+calc_type: slab
+created_at: '2026-07-16T17:14:54'
+created_by: vcstudio 2.0.0
+inputs:
+  elements:
+  - C
+  - N
+  - Li
+  - S
+  kpoints:
+  - 3
+  - 3
+  - 1
+  potcar:
+  - PAW_PBE C
+  - PAW_PBE N
+  - PAW_PBE Li
+  - PAW_PBE S
+  potcar_provenance:
+  - element: C
+    variant: C
+    titel: PAW_PBE C 08Apr2002
+    enmax: 400.0
+  - element: N
+    variant: N
+    titel: PAW_PBE N 08Apr2002
+    enmax: 400.0
+  - element: Li
+    variant: Li
+    titel: PAW_PBE Li 08Apr2002
+    enmax: 140.0
+  - element: S
+    variant: S
+    titel: PAW_PBE S 08Apr2002
+    enmax: 280.0
+cluster: null
+remote_dir: null
+scheduler_job_id: null
+state: UNCONVERGED
+state_history:
+- state: CREATED
+  at: '2026-07-16T17:14:54'
+- state: UNCONVERGED
+  at: '2026-07-16T17:14:54'
+attempts: []
+results:
+  diagnosis:
+    failure_class: ZBRENT
+    state: UNCONVERGED
+    restartable: true
+    evidence: 日志命中 ZBRENT 签名(离子步 bracketing 崩,可 CONTCAR 续算)
+warnings: []
+kpoints:
+- 3
+- 3
+- 1

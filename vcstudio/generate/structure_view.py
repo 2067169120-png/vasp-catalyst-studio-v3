@@ -1,7 +1,7 @@
 """结构 3D 预览(C2)——POSCAR/CONTCAR → 笛卡尔坐标 + 分子-衬底间隙分析 + XYZ。
 
-纯函数,零 IO,离线可测。复用 poscar.py 既有件(物种/晶格,负缩放因子沿用其
-显式拒绝语义)。间隙分析口径:
+纯函数,零 IO,离线可测。复用 poscar.py 既有件(物种/晶格/完整缩放语义)。
+间隙分析口径:
 
 - **分离**:全原子按 z 排序,最大相邻间隙 ≥ ``Z_SPLIT``(1.8 Å)且两侧非空 →
   上方=分子、下方=衬底(与历史实践"骨架/吸附物按 z 分离"一致)。
@@ -15,7 +15,11 @@ from __future__ import annotations
 
 import math
 
-from vcstudio.generate.poscar import parse_poscar_species, read_cell_vectors
+from vcstudio.generate.poscar import (
+    parse_poscar_species,
+    read_cell_vectors,
+    read_scale_factors,
+)
 
 # 阈值(Å):历史 S8 撞车事故标定,见模块 docstring。
 Z_SPLIT = 1.8       # z 相邻间隙 ≥ 此值才认定分子/衬底可分离
@@ -44,21 +48,19 @@ _FALLBACK_MAX_ATOMS = 600
 def parse_positions(content: str) -> dict:
     """POSCAR 文本 → ``{'elements','coords','cell'}``(坐标为笛卡尔 Å,逐原子元素)。
 
-    Direct/其他 → 分数坐标×晶格;首字母 c/C/k/K → 笛卡尔×缩放因子(VASP 语义)。
+    Direct/其他 → 分数坐标×晶格;首字母 c/C/k/K → 笛卡尔逐分量应用第2行
+    缩放因子(VASP 语义，含负值目标体积和三个各向尺度)。
     Selective dynamics 行可选;坐标行只取前 3 列。VASP4(无元素行)/行数不足 →
-    ValueError(无元素无法着色出 XYZ)。负缩放因子沿用 read_cell_vectors 的显式拒绝。
+    ValueError(无元素无法着色出 XYZ)。
     """
     if not content or not content.strip():
         raise ValueError('POSCAR 内容为空')
     syms, counts = parse_poscar_species(content)
     if not syms or not counts or len(syms) != len(counts):
         raise ValueError('无法解析 POSCAR 物种/计数(VASP4 无元素行的文件不支持预览)')
-    cell = read_cell_vectors(content)   # 已乘缩放因子;负缩放在此显式报错
+    cell = read_cell_vectors(content)
     lines = content.splitlines()
-    try:
-        scale = float(lines[1].split()[0])
-    except (IndexError, ValueError):
-        raise ValueError('POSCAR 第2行不是合法缩放因子')
+    scale_x, scale_y, scale_z = read_scale_factors(content)
 
     # 第 8 行(index 7)起:Selective dynamics(可选)→ 坐标模式行 → 坐标块
     idx = 7
@@ -84,7 +86,7 @@ def parse_positions(content: str) -> dict:
         except ValueError:
             raise ValueError(f'POSCAR 第 {idx + k + 1} 行坐标无法解析为数值')
         if cartesian:
-            coords.append([a * scale, b * scale, c * scale])
+            coords.append([a * scale_x, b * scale_y, c * scale_z])
         else:
             coords.append([
                 a * cell[0][0] + b * cell[1][0] + c * cell[2][0],

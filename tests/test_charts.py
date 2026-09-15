@@ -89,6 +89,33 @@ def test_ladder_too_few_steps_raises():
         charts.ladder_data([{'label': 'A', 'G': 0.0}])
 
 
+def test_ladder_data_pds_index_passthrough_multi_electron():
+    """图数一致性:各步电子数不等时,pds_index 必须用调用方(逐电子口径)传入值。
+
+    场景:末步原始 ΔG 最大(+0.8,但 8 e⁻ → 每电子 0.1),真决速步是
+    +0.5/2e⁻ = 0.25 的步 1。旧实现按原始 ΔG 重算会高亮错步(≠ U_L 对应步)。
+    """
+    steps = [{'label': 'S8*', 'G': 0.0}, {'label': 'A*', 'G': -1.0},
+             {'label': 'B*', 'G': -0.5}, {'label': 'C*', 'G': -1.2},
+             {'label': 'D*', 'G': -0.4}]
+    d = charts.ladder_data(steps, u_l=-0.25, pds_index=1)
+    assert d['pds_index'] == 1                       # 尊重传入,不自行按原始 ΔG 重算
+    legacy = charts.ladder_data(steps)               # 不传 → 兜底口径(逐步 1e⁻ 才对)
+    assert legacy['pds_index'] == 3                  # 原始 ΔG 最大步(+0.8)
+    svg = charts.render_ladder_svg(d)
+    assert 'ΔG = +0.50 eV' in svg                    # 高亮步与 U_L 同源(步 1)
+    assert 'ΔG = +0.80 eV' not in svg
+
+
+def test_ladder_data_pds_index_out_of_range_raises():
+    steps = [{'label': 'A', 'G': 0.0}, {'label': 'B', 'G': 1.0}]
+    with pytest.raises(ValueError, match='越界'):
+        charts.ladder_data(steps, pds_index=1)       # 2 态只有步 0
+    with pytest.raises(ValueError, match='越界'):
+        charts.ladder_data(steps, pds_index=-1)
+    assert charts.ladder_data(steps, pds_index=0)['pds_index'] == 0
+
+
 # ── 收敛曲线 ──
 def test_convergence_svg():
     data = {'x': [300, 400, 500, 600], 'y': [-10.02, -10.21, -10.249, -10.250],
@@ -108,8 +135,25 @@ def test_convergence_mismatched_raises():
 def test_bar_data_from_delta():
     rows = [{'name': 'ads_S8', 'delta_e': -4.1}, {'name': 'bad', 'delta_e': None}]
     d = charts.bar_data_from_delta('proj', rows, band=(-2.9, -1.65))
-    assert d == {'rows': ['proj'], 'cols': ['ads_S8'], 'matrix': [[-4.1]],
+    assert d == {'rows': ['proj'], 'cols': ['S8'], 'matrix': [[-4.1]],
                  'band': (-2.9, -1.65), 'band_label': ''}
+
+
+def test_bar_data_from_delta_shortens_long_names_without_losing_semantics():
+    semantic = 'Li2S8_bridge_site_long_relaxed_spin_polarized'
+    other = 'Li2S8_top_site_long_relaxed_spin_polarized'
+    rows = [
+        {'name': f'/E/results/Catalyst_Alpha_ads_{semantic}', 'delta_e': -2.11},
+        {'name': f'/E/results/ads_{semantic}', 'delta_e': -2.22},
+        {'name': f'/E/results/Catalyst_Alpha_{other}', 'delta_e': -2.33},
+    ]
+
+    data = charts.bar_data_from_delta('Catalyst_Alpha', rows)
+
+    assert data['cols'] == [semantic, f'{semantic} [2]', other]
+    assert data['matrix'] == [[-2.11, -2.22, -2.33]]
+    assert all('Catalyst_Alpha' not in label and not label.startswith('ads_')
+               for label in data['cols'])
 
 
 def test_bar_data_from_delta_all_none_raises():

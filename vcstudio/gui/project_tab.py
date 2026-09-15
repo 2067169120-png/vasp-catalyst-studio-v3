@@ -1,4 +1,4 @@
-"""「吸附能项目」页 v1:清洁表面 + 组态族 + 气相参考 → 批量生成;ΔE 汇总与导出。
+"""「吸附能项目」页 v1:清洁表面 + 构型族 + 气相参考 → 批量生成;ΔE 汇总与导出。
 
 单表单形态(向导式分步留待 v2):所有生成走后台线程;ΔE 只在成员全部 DONE 时给出。
 中文注释允许,英文标识符。
@@ -9,7 +9,7 @@ import os
 import sys
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog
 
 from vcstudio.gui.widgets import FileRow, LogBox
 from vcstudio.gui import runner
@@ -20,7 +20,7 @@ from vcstudio.shared.config import load_config
 class ProjectTab(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent, padding=10)
-        self._configs = []          # 组态 POSCAR 路径列表
+        self._configs = []          # 构型 POSCAR 路径列表
         self._build()
         self._reload_projects()
 
@@ -47,7 +47,7 @@ class ProjectTab(ttk.Frame):
 
         crow = ttk.Frame(new)
         crow.grid(row=5, column=0, sticky='ew', pady=3)
-        ttk.Label(crow, text='吸附组态', width=14, anchor='ne').grid(row=0, column=0, padx=4, sticky='n')
+        ttk.Label(crow, text='吸附构型', width=14, anchor='ne').grid(row=0, column=0, padx=4, sticky='n')
         self.cfg_list = tk.Listbox(crow, height=5, width=64)
         self.cfg_list.grid(row=0, column=1, padx=4)
         cbtn = ttk.Frame(crow)
@@ -59,7 +59,7 @@ class ProjectTab(ttk.Frame):
         gbar.grid(row=6, column=0, pady=4)
         self.gen_btn = ttk.Button(gbar, text='🚀 批量生成并登记台账', style='Accent.TButton', command=self._on_generate)
         self.gen_btn.grid(row=0, column=0, padx=6)
-        ttk.Label(gbar, text='类型自动:表面/组态=slab,气相参考=molecule(Γ点)',
+        ttk.Label(gbar, text='类型自动:表面/构型=slab,气相参考=molecule(Γ点)',
                   foreground='#666666').grid(row=0, column=1, padx=6)
 
         # ── 已有项目:ΔE 汇总 ──
@@ -83,9 +83,9 @@ class ProjectTab(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(3, weight=1)
 
-    # ── 组态列表 ──
+    # ── 构型列表 ──
     def _add_configs(self):
-        paths = filedialog.askopenfilenames(title='选择吸附组态 POSCAR(可多选)')
+        paths = filedialog.askopenfilenames(title='选择吸附构型 POSCAR(可多选)')
         for p in paths:
             if p and p not in self._configs:
                 self._configs.append(p)
@@ -111,7 +111,7 @@ class ProjectTab(ttk.Frame):
         if not incar or not os.path.isfile(incar):
             errs.append('共享 INCAR 不存在')
         if not self._configs:
-            errs.append('至少添加一个吸附组态')
+            errs.append('至少添加一个吸附构型')
         if ref and not os.path.isfile(ref):
             errs.append('气相参考文件不存在')
         if errs:
@@ -125,7 +125,7 @@ class ProjectTab(ttk.Frame):
             pass
         self.gen_btn.configure(state='disabled')
         self.log.clear()
-        self.log.write(f'⏳ 批量生成:清洁表面 + {len(self._configs)} 组态'
+        self.log.write(f'⏳ 批量生成:清洁表面 + {len(self._configs)} 构型'
                        + (' + 气相参考' if ref else '') + ' …')
         q = runner.submit(adsorption.create_project, os.path.join(root, name), name,
                           clean_poscar=slab, config_poscars=list(self._configs),
@@ -206,10 +206,8 @@ class ProjectTab(ttk.Frame):
             self.log.write(f'❌ 导出失败:{e}')
 
     def _member_dirs(self, proj):
-        """项目全部成员作业目录(清洁表面 + 气相参考 + 组态族)。"""
-        mem = proj.get('members') or {}
-        return [d for d in ([mem.get('clean_slab'), mem.get('gas_ref')]
-                            + list(mem.get('configs') or [])) if d]
+        """项目全部成员作业目录（含导入的物种参考态）。"""
+        return report_full._member_dirs(proj)
 
     def _on_report(self):
         proj = self._current_project()

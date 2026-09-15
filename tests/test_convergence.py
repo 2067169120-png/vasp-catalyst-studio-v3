@@ -1,5 +1,4 @@
 """C1 收敛解析纯函数测试。真实 VASP 片段夹具,数值手算核对。"""
-import math
 
 import pytest
 

@@ -5,7 +5,7 @@
   未知的花括号内容(如 shell 的 ${PBS_NODEFILE})原样保留,绝不误伤。
 
 已知占位符(含旧版 submit_template.sh 的历史别名):
-  {job_name} {queue} {nodes} {ppn} {walltime} {remote_dir}
+  {job_name} {queue} {nodes} {ppn} {walltime} {remote_dir} {command}
   {short}=job_name  {cores}=ppn  {dir}=作业目录名(相对 remote_root 的最后一段)
 中文注释允许,英文标识符。
 """
@@ -24,6 +24,9 @@ _PLACEHOLDERS = {
     'ppn': lambda s: s.ppn,
     'walltime': lambda s: s.walltime,
     'remote_dir': lambda s: s.remote_dir,
+    # 历史字段名为 vasp_cmd，但 submitter 已按 manifest 引擎选好
+    # 真正的运行命令。模板用 {command} 才能安全支持非 VASP。
+    'command': lambda s: s.vasp_cmd,
     'short': lambda s: s.job_name,
     'cores': lambda s: s.ppn,
     'dir': lambda s: posixpath.basename(s.remote_dir.rstrip('/')),
@@ -93,7 +96,7 @@ def build_script(mode: str, dialect: SchedulerDialect, spec: JobScriptSpec,
             raise ValueError('模板模式但未提供模板内容;请在集群页选择你的提交脚本模板。')
         return render_template(template_text, spec)
     if mode == 'auto':
-        missing = [n for n, v in (('队列', spec.queue), ('VASP 命令', spec.vasp_cmd)) if not v]
+        missing = [n for n, v in (('队列', spec.queue), ('执行命令', spec.vasp_cmd)) if not v]
         if spec.ppn <= 0:
             missing.append('每节点核数')
         if missing:

@@ -3,11 +3,15 @@
 每个公开方法至少一个 happy + 一个错误路径;所有返回一律 JSON-safe dict,
 异常绝不穿透到 JS(错误落 'error' 字段)。中文注释允许,英文标识符。
 """
+import copy
+import json
 import os
+import sys
 import types
 
-from vcstudio.gui_web.api import Api
+from vcstudio.gui_web.api import Api, _sha256_file
 from vcstudio.cluster.profiles import ClusterProfile
+from vcstudio.cluster import submitter as cluster_submitter
 
 
 # ── 假件工厂 ────────────────────────────────────────────────────────────────
@@ -25,6 +29,36 @@ def _fake_ledger(entries, removed):
     m.load_all = lambda: list(entries)
     m.unregister = lambda d: removed.append(d) or True
     return m
+
+
+def _attach_final_fetch_evidence(job_dir, data, names=None):
+    """Populate the same generation/hash contract written by final SFTP fetch."""
+    names = list(names or ('CONTCAR', 'OSZICAR', 'OUTCAR'))
+    token = cluster_submitter.current_attempt_token(data)
+    hashes, sizes = {}, {}
+    for name in names:
+        path = os.path.join(job_dir, *name.split('/'))
+        hashes[name] = _sha256_file(path)
+        sizes[name] = os.path.getsize(path)
+    data.setdefault('results', {}).update({
+        'fetched_at': 'now',
+        'fetched_state': 'DONE',
+        'fetched_job_id': str(data.get('scheduler_job_id') or ''),
+        'fetched_remote_dir': str(data.get('remote_dir') or ''),
+        'fetched_attempt_token': token,
+        'fetched': names,
+        'fetched_missing': [],
+        'fetch_requested': names,
+        'fetched_sha256': hashes,
+        'fetched_sizes': sizes,
+        'fetch_contract': {
+            'schema': 1, 'mode': 'final', 'state': 'DONE',
+            'scheduler_job_id': str(data.get('scheduler_job_id') or ''),
+            'remote_dir': str(data.get('remote_dir') or ''),
+            'attempt_token': token, 'requested': names,
+        },
+    })
+    return data
 
 
 # ── list_profiles ────────────────────────────────────────────────────────────
@@ -56,6 +90,49 @@ def test_save_profile_roundtrip_only_known_fields():
     assert not hasattr(store['c9'], 'bogus')
 
 
+def test_save_profile_roundtrips_engine_commands_and_normalizes_keys():
+    store = {}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({
+        'name': 'multi',
+        'engine_commands': {
+            ' CP2K ': '  cp2k.psmp -i {input} -o {stem}.out  ',
+            'Gaussian': 'g16 < {input} > {stem}.log',
+        },
+    })
+
+    assert out['ok'] is True
+    assert store['multi'].engine_commands == {
+        'cp2k': 'cp2k.psmp -i {input} -o {stem}.out',
+        'gaussian': 'g16 < {input} > {stem}.log',
+    }
+    listed = api.list_profiles()['profiles'][0]
+    assert listed['engine_commands'] == store['multi'].engine_commands
+
+
+def test_save_profile_rejects_malformed_engine_commands():
+    store = {}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({'name': 'bad', 'engine_commands': ['srun cp2k']})
+
+    assert out['ok'] is False and 'engine_commands' in out['error']
+    assert store == {}
+
+
+def test_legacy_profile_form_does_not_erase_engine_commands():
+    store = {'multi': ClusterProfile(
+        name='multi', hostname='old',
+        engine_commands={'cp2k': 'cp2k.psmp -i {input}'})}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({'name': 'multi', 'hostname': 'new'})
+
+    assert out['ok'] is True and store['multi'].hostname == 'new'
+    assert store['multi'].engine_commands == {'cp2k': 'cp2k.psmp -i {input}'}
+
+
 def test_save_profile_rejects_blank_name():
     api = Api(profiles_mod=_fake_profiles({}))
     out = api.save_profile({'name': '  '})
@@ -76,11 +153,21 @@ def test_delete_profile_missing_is_ok_false():
     assert out['ok'] is False
 
 
+def test_save_profile_rejects_scheduler_without_execution_dialect():
+    store = {}
+    api = Api(profiles_mod=_fake_profiles(store))
+
+    out = api.save_profile({'name': 'lsf', 'scheduler': 'LSF'})
+
+    assert out['ok'] is False and 'Slurm / PBS' in out['error']
+    assert store == {}
+
+
 # ── test_connection ──────────────────────────────────────────────────────────
 def test_test_connection_saves_password_on_success():
     saved = {}
     secrets = types.SimpleNamespace(
-        get_password=lambda n: None,
+        get_password=lambda n: saved.get(n),
         set_password=lambda n, pw: saved.update({n: pw}))
     ssh = types.SimpleNamespace(check_connection=lambda prof, password, trust_new=False:
         types.SimpleNamespace(ok=True, message='ok', scheduler='PBS', needs_trust=False))
@@ -89,6 +176,20 @@ def test_test_connection_saves_password_on_success():
     out = api.test_connection('c1', 'pw123', False)
     assert out['ok'] is True and saved == {'c1': 'pw123'}
     assert out['scheduler'] == 'PBS' and out['needs_trust'] is False
+
+
+def test_test_connection_rejects_keyring_write_without_matching_readback():
+    secrets = types.SimpleNamespace(
+        get_password=lambda _n: None,
+        set_password=lambda _n, _pw: None)
+    ssh = types.SimpleNamespace(check_connection=lambda prof, password, trust_new=False:
+        types.SimpleNamespace(ok=True, message='ok', scheduler='PBS', needs_trust=False))
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
+    api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets, ssh_test_mod=ssh)
+
+    out = api.test_connection('c1', 'pw123', False)
+
+    assert out['ok'] is False and '回读不一致' in out['message']
 
 
 def test_test_connection_failure_does_not_save():
@@ -129,6 +230,28 @@ def test_test_connection_unknown_profile_error():
     api = Api(profiles_mod=_fake_profiles({}))
     out = api.test_connection('nope', 'pw', False)
     assert out['ok'] is False and '集群' in out['message']
+
+
+def test_test_connection_round_trips_exact_sha256_host_pin():
+    seen = {}
+    pin = {'host': 'bastion', 'fingerprint': 'SHA256:abc',
+           'algorithm': 'ssh-ed25519'}
+
+    def _check(_prof, _password, trust_new=False):
+        seen['trust_new'] = trust_new
+        return types.SimpleNamespace(
+            ok=False, message='请核对', scheduler='', needs_trust=True,
+            host='target', fingerprint='SHA256:def', algorithm='ssh-rsa')
+
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              ssh_test_mod=types.SimpleNamespace(check_connection=_check))
+    out = api.test_connection('c1', None, pin)
+
+    assert seen['trust_new'] is pin
+    assert out['needs_trust'] is True
+    assert (out['host'], out['fingerprint'], out['algorithm']) == (
+        'target', 'SHA256:def', 'ssh-rsa')
 
 
 # ── has_saved_password ───────────────────────────────────────────────────────
@@ -202,6 +325,65 @@ def test_list_jobs_error_is_caught():
     assert out['jobs'] == [] and out['stale'] == [] and '台账坏了' in out.get('error', '')
 
 
+def test_list_jobs_injects_project_and_role():
+    """任务行注入所属吸附能项目组:clean/gas/config 各归位,独立作业 project=None。"""
+    def mk(st):
+        return {'state': st, 'task_type': 'relax', 'calc_type': 'slab',
+                'created_at': '2026-07-14T09:00:00', 'results': {}}
+    entries = [('/jobs/demo_slab_clean', mk('DONE')),
+               ('/jobs/demo_ads_S8', mk('RUNNING')),
+               ('/jobs/demo_ref', mk('DONE')),
+               ('/jobs/standalone', mk('DONE'))]
+    proj = {'name': 'demo', 'members': {
+        'clean_slab': '/jobs/demo_slab_clean',
+        'gas_ref': '/jobs/demo_ref',
+        'configs': ['/jobs/demo_ads_S8'],
+    }}
+    ads = _fake_adsorption(projects=['/p/project.yaml'],
+                           proj_map={'/p/project.yaml': proj})
+    api = Api(ledger_mod=_fake_ledger(entries, []), adsorption_mod=ads)
+    out = api.list_jobs()
+    rows = {r['dir']: r for r in out['jobs']}
+    assert rows['/jobs/demo_slab_clean']['project'] == 'demo'
+    assert rows['/jobs/demo_slab_clean']['role'] == 'clean'
+    assert rows['/jobs/demo_ads_S8']['project'] == 'demo'
+    assert rows['/jobs/demo_ads_S8']['role'] == 'config'
+    assert rows['/jobs/demo_ref']['project'] == 'demo'
+    assert rows['/jobs/demo_ref']['role'] == 'gas'
+    assert rows['/jobs/standalone']['project'] is None
+    assert rows['/jobs/standalone']['role'] is None
+
+
+def test_list_jobs_project_map_failure_does_not_break_listing():
+    """项目注册表崩坏(list_projects 抛)→ 全部作业不分组,list_jobs 契约不变。"""
+    entries = [('/jobs/a', {'state': 'DONE', 'created_at': 'x', 'results': {}})]
+    boom_ads = types.SimpleNamespace(
+        list_projects=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('注册表坏了')),
+        load_project=lambda p: None)
+    api = Api(ledger_mod=_fake_ledger(entries, []), adsorption_mod=boom_ads)
+    out = api.list_jobs()
+    assert out.get('error') is None or 'error' not in out
+    assert out['jobs'][0]['project'] is None and out['jobs'][0]['role'] is None
+
+
+def test_list_jobs_single_bad_project_yaml_is_skipped():
+    """单个 project.yaml load 抛异常 → 只影响该项目,别的项目照常归组。"""
+    entries = [('/jobs/ok_slab', {'state': 'DONE', 'created_at': 'x', 'results': {}})]
+    good = {'name': 'ok', 'members': {'clean_slab': '/jobs/ok_slab',
+                                      'gas_ref': None, 'configs': []}}
+
+    def _load(p):
+        if p == '/bad/project.yaml':
+            raise RuntimeError('yaml 畸形')
+        return good
+    ads = types.SimpleNamespace(
+        list_projects=lambda *a, **k: ['/bad/project.yaml', '/good/project.yaml'],
+        load_project=_load)
+    api = Api(ledger_mod=_fake_ledger(entries, []), adsorption_mod=ads)
+    out = api.list_jobs()
+    assert out['jobs'][0]['project'] == 'ok' and out['jobs'][0]['role'] == 'clean'
+
+
 # ── submit_jobs / _resolve ───────────────────────────────────────────────────
 def test_submit_jobs_delegates_to_batch_ops():
     calls = {}
@@ -212,6 +394,19 @@ def test_submit_jobs_delegates_to_batch_ops():
     api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
     out = api.submit_jobs(['/a', '/b'], 'c1', None, False)
     assert calls['dirs'] == ['/a', '/b'] and out['results'][0][1] is True
+
+
+def test_submit_jobs_passes_exact_host_pin_without_boolean_coercion():
+    seen = {}
+    pin = {'host': 'h', 'fingerprint': 'SHA256:abc', 'algorithm': 'ssh-ed25519'}
+    bo = types.SimpleNamespace(submit_batch=lambda _prof, _pw, _dirs, trust:
+        seen.update(trust=trust) or {'needs_trust': False, 'results': []})
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo)
+
+    api.submit_jobs(['/a'], 'c1', None, pin)
+
+    assert seen['trust'] is pin
 
 
 def test_unknown_profile_is_error_not_crash():
@@ -353,6 +548,78 @@ def test_refresh_status_unknown_profile_error():
     assert out.get('error') and '集群' in out['error']
 
 
+def test_manual_refresh_does_not_race_background_pipeline():
+    api = Api(profiles_mod=_fake_profiles({}), ledger_mod=_fake_ledger([], []))
+    assert api._pipeline_lock.acquire(blocking=False)
+    try:
+        one = api.refresh_status('c1', None, False)
+        all_profiles = api.refresh_all_status()
+    finally:
+        api._pipeline_lock.release()
+
+    assert one['busy'] is True and '后台自动托管' in one['error']
+    assert all_profiles['busy'] is True and '后台自动托管' in all_profiles['error']
+
+
+def test_refresh_all_status_monitors_all_active_servers_and_isolates_failure():
+    entries = [
+        ('/a', {'scheduler_job_id': '1', 'cluster': 'c1', 'state': 'RUNNING'}),
+        ('/b', {'scheduler_job_id': '2', 'cluster': 'c2', 'state': 'QUEUED'}),
+        ('/done', {'scheduler_job_id': '3', 'cluster': 'c3', 'state': 'DONE'}),
+    ]
+
+    def _refresh(prof, _pw, dirs, _trust):
+        if prof.name == 'c2':
+            raise RuntimeError('c2 暂时断线')
+        return {'needs_trust': False, 'results': [(dirs[0], 'RUNNING')]}
+
+    store = {name: ClusterProfile(name=name, auth='key', key_path='/k')
+             for name in ('c1', 'c2', 'c3')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=types.SimpleNamespace(refresh_batch=_refresh),
+              ledger_mod=_fake_ledger(entries, []))
+
+    out = api.refresh_all_status()
+
+    assert [row['name'] for row in out['profiles']] == ['c1', 'c2']
+    assert out['profiles'][0]['results'] == [('/a', 'RUNNING')]
+    assert '断线' in out['profiles'][1]['error']
+    assert out['results'] == [{'cluster': 'c1', 'result': ('/a', 'RUNNING')}]
+    assert out['ok'] is False and len(out['errors']) == 1
+
+
+def test_refresh_all_status_exposes_host_key_confirmation_instead_of_silence():
+    entries = [('/a', {'scheduler_job_id': '1', 'cluster': 'c1', 'state': 'RUNNING'})]
+    bo = types.SimpleNamespace(refresh_batch=lambda *a, **k: {
+        'needs_trust': True, 'results': [], 'fingerprint': 'SHA256:abc',
+        'algorithm': 'ssh-ed25519', 'host': 'h:22',
+    })
+    store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=bo,
+              ledger_mod=_fake_ledger(entries, []))
+
+    out = api.refresh_all_status()
+
+    row = out['profiles'][0]
+    assert row['ok'] is False and row['needs_trust'] is True
+    assert row['error'] == 'HOST_KEY_CONFIRMATION_REQUIRED'
+    assert row['fingerprint'] == 'SHA256:abc'
+    assert out['ok'] is False and out['errors']
+
+
+def test_refresh_all_status_reports_active_job_whose_profile_was_deleted():
+    entries = [('/lost', {
+        'scheduler_job_id': '7', 'cluster': 'old-server', 'state': 'QUEUED'})]
+    api = Api(profiles_mod=_fake_profiles({}),
+              ledger_mod=_fake_ledger(entries, []))
+
+    out = api.refresh_all_status()
+
+    assert out['ok'] is False
+    assert out['profiles'][0]['name'] == 'old-server'
+    assert '删除或改名' in out['profiles'][0]['error']
+
+
 # ── adopt_job ────────────────────────────────────────────────────────────────
 def test_adopt_job_delegates():
     calls = {}
@@ -363,6 +630,17 @@ def test_adopt_job_delegates():
     out = api.adopt_job('/local', 'c1', '777', '/remote/dir', 'myjob')
     assert out['ok'] is True
     assert calls == {'local': '/local', 'jid': '777', 'remote': '/remote/dir', 'name': 'myjob'}
+
+
+def test_adopt_job_passes_explicit_task_type():
+    calls = {}
+    sub = types.SimpleNamespace(adopt_external_job=lambda *args, **kwargs:
+                                calls.update(kwargs) or {'state': 'SUBMITTED'})
+    api = Api(profiles_mod=_fake_profiles({'c1': ClusterProfile(name='c1')}),
+              submitter_mod=sub)
+    out = api.adopt_job('/local', 'c1', '778', '/remote/dir', 'dosjob', 'dos')
+    assert out['ok'] is True
+    assert calls['name'] == 'dosjob' and calls['task_type'] == 'dos'
 
 
 def test_adopt_job_unknown_profile_error():
@@ -435,7 +713,7 @@ def _fake_logic(pos='POS摘要', inc='INC预览', errs=None):
     m = types.SimpleNamespace()
     m.poscar_preview = lambda path, calc='slab': pos
     m.incar_preview = lambda incar, poscar, lib, validate=True: inc
-    m.validate_generate_inputs = lambda p, i, o, l: list(errs or [])
+    m.validate_generate_inputs = lambda p, i, o, lib: list(errs or [])
     return m
 
 
@@ -510,6 +788,40 @@ def test_gen_run_full_chain_writes_manifest_and_registers():
     assert calls['lib'] == '/lib'
     assert calls['ui_state'] == {'last_poscar': '/p/POSCAR',
                                  'last_incar': '/p/INCAR', 'last_out': '/out/job1'}
+
+
+def test_gen_run_passes_calc_type_through():
+    """修复:web 生成页 calc_type 不再硬编码 slab,前端选择直达 build_job_dir。"""
+    seen = {}
+    payload = {'ok': True, 'out_dir': '/out/j', 'warnings': [], 'kpoints': [4, 4, 4],
+               'elements': ['Si']}
+
+    def _build(poscar, incar, out, **k):
+        seen['calc_type'] = k.get('calc_type')
+        return dict(payload)
+
+    jb = types.SimpleNamespace(build_job_dir=_build)
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register([]))
+    api.gen_run('/p/POSCAR', '/p/INCAR', '/out/j', '/lib', 'bulk')
+    assert seen['calc_type'] == 'bulk'
+
+
+def test_gen_run_invalid_calc_type_falls_back_to_slab():
+    seen = {}
+
+    def _build(poscar, incar, out, **k):
+        seen['calc_type'] = k.get('calc_type')
+        return {'ok': True, 'out_dir': '/out/j', 'warnings': [], 'kpoints': [1, 1, 1],
+                'elements': ['Si']}
+
+    jb = types.SimpleNamespace(build_job_dir=_build)
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register([]))
+    api.gen_run('/p/POSCAR', '/p/INCAR', '/out/j', '/lib', 'nonsense')
+    assert seen['calc_type'] == 'slab'
 
 
 def test_gen_run_validation_error_short_circuits():
@@ -611,6 +923,83 @@ def _fake_report_full(*, member_dirs=None, report_ret='/out/报告.html', calls=
     return m
 
 
+def _fake_result_import(*, scan_ret=None, commit_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _scan(root):
+        calls['scan'] = root
+        return dict(scan_ret or {'ok': True, 'source_root': root, 'candidates': [],
+                                 'summary': {'total': 0}, 'suggested_name': 'demo'})
+
+    def _commit(source, target, name, selections, **kwargs):
+        calls['commit'] = {'source': source, 'target': target, 'name': name,
+                           'selections': selections, **kwargs}
+        return dict(commit_ret or {'ok': True, 'project_path': '/managed/project.yaml',
+                                   'imported': [], 'summary': {'total': 0}})
+
+    m.scan_folder = _scan
+    m.commit_import = _commit
+    return m
+
+
+# ── 本地已算结果导入（扫描只读 / 提交重新校验）────────────────
+def test_proj_import_scan_forwards_structured_preview():
+    calls = {}
+    candidate = {'path': '/raw/Li2S8', 'state_suggestion': 'DONE'}
+    ri = _fake_result_import(
+        scan_ret={'ok': True, 'source_root': '/raw', 'candidates': [candidate],
+                  'summary': {'total': 1, 'done': 1}, 'suggested_name': 'LiS'}, calls=calls)
+    api = Api(result_import_mod=ri)
+
+    out = api.proj_import_scan(' /raw ')
+
+    assert out['ok'] is True and out['candidates'] == [candidate]
+    assert out['summary']['done'] == 1 and out['error'] is None
+    assert calls['scan'] == '/raw'
+
+
+def test_proj_import_scan_validation_and_exception_are_json_safe():
+    api = Api(result_import_mod=_fake_result_import())
+    assert api.proj_import_scan('')['ok'] is False
+    boom = types.SimpleNamespace(
+        scan_folder=lambda _root: (_ for _ in ()).throw(RuntimeError('输出损坏')))
+    out = Api(result_import_mod=boom).proj_import_scan('/raw')
+    assert out['ok'] is False and '输出损坏' in out['error']
+
+
+def test_proj_import_commit_passes_full_selection_and_injected_modules():
+    calls = {}
+    selections = [
+        {'path': '/raw/slab', 'selected': True, 'role': 'clean_slab',
+         'task_type': 'relax', 'manual_confirm': False},
+        {'path': '/raw/skip', 'selected': False, 'role': 'config',
+         'task_type': 'static', 'manual_confirm': False},
+    ]
+    ri = _fake_result_import(calls=calls)
+    ads = _fake_adsorption()
+    ledger = _fake_ledger([], [])
+    manifest = types.SimpleNamespace()
+    api = Api(result_import_mod=ri, adsorption_mod=ads,
+              ledger_mod=ledger, manifest_mod=manifest)
+
+    out = api.proj_import_commit('/raw', '/managed', 'demo', selections)
+
+    assert out['ok'] is True and out['error'] is None
+    got = calls['commit']
+    assert got['selections'] == selections
+    assert got['adsorption_mod'] is ads and got['ledger_mod'] is ledger
+    assert got['manifest_mod'] is manifest
+
+
+def test_proj_import_commit_requires_selected_nonignored_item():
+    api = Api(result_import_mod=_fake_result_import())
+    out = api.proj_import_commit('/raw', '/managed', 'demo', [
+        {'path': '/raw/x', 'selected': False, 'role': 'config'},
+    ])
+    assert out['ok'] is False and '至少选择' in out['error']
+
+
 # ── proj_list ────────────────────────────────────────────────────────────────
 def test_proj_list_assembles_path_name_members():
     proj = {'name': 'demo', 'members': {'clean_slab': '/s', 'gas_ref': None,
@@ -622,7 +1011,9 @@ def test_proj_list_assembles_path_name_members():
     out = api.proj_list()
     assert out['error'] is None
     assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
-                                'n_members': 3}]
+                                'n_members': 3, 'n_done': 0, 'reference_mode': 'none',
+                                'reference_species': [],
+                                'n_species_refs': 0}]
 
 
 def test_proj_list_counts_members_inline_without_report_full():
@@ -639,7 +1030,21 @@ def test_proj_list_counts_members_inline_without_report_full():
     out = api.proj_list()
     assert out['error'] is None
     assert out['projects'] == [{'path': '/p/project.yaml', 'name': 'demo',
-                                'n_members': 3}]
+                                'n_members': 3, 'n_done': 0, 'reference_mode': 'none',
+                                'reference_species': [],
+                                'n_species_refs': 0}]
+
+
+def test_proj_list_exposes_reference_species_for_lis_builder():
+    proj = {'name': 'refs', 'members': {'clean_slab': None, 'configs': []},
+            'species_ref_jobs': {'S8': '/m/S8', 'Li2S8': '/m/Li2S8'}}
+    api = Api(adsorption_mod=_fake_adsorption(
+        projects=['/refs/project.yaml'], proj_map={'/refs/project.yaml': proj}))
+
+    row = api.proj_list()['projects'][0]
+
+    assert row['reference_species'] == ['Li2S8', 'S8']
+    assert row['n_species_refs'] == 2
 
 
 def test_proj_list_skips_unloadable_and_catches_error():
@@ -660,7 +1065,7 @@ def test_proj_create_mirrors_on_generate_params_and_transforms(tmp_path):
     create_ret = {
         'ok': True, 'project_path': str(tmp_path / 'demo' / 'project.yaml'),
         'generated': [('demo_ads_x', '/o/x', ['偶极建议'])],
-        'errors': [('demo_ads_bad', 'POTCAR 缺 Ta')],       # 坏组态 → warnings,不整体失败
+        'errors': [('demo_ads_bad', 'POTCAR 缺 Ta')],       # 坏构型 → warnings,不整体失败
         'advisories': [('P1', 'ENCUT', '建议统一 ENCUT=400')],
     }
     ads = _fake_adsorption(create_ret=create_ret, calls=calls)
@@ -681,7 +1086,7 @@ def test_proj_create_mirrors_on_generate_params_and_transforms(tmp_path):
     assert c['lib_root'] == '/lib'
     # advisories → "[级别] 文案" 字符串列表
     assert out['advisories'] == ['[P1·ENCUT] 建议统一 ENCUT=400']
-    # 坏组态隔离:build 警告 + 组态错误都进 warnings(不整体失败)
+    # 坏构型隔离:build 警告 + 构型错误都进 warnings(不整体失败)
     assert 'demo_ads_x:偶极建议' in out['warnings']
     assert 'demo_ads_bad:POTCAR 缺 Ta' in out['warnings']
 
@@ -721,9 +1126,10 @@ def test_proj_delta_passes_through_rows_and_gating():
         'slab': ('DONE', -12.5), 'ref': ('无', None), 'has_ref': False,
         'rows': [
             {'name': 'demo_ads_a', 'state': 'DONE', 'e_config': -20.0,
-             'delta_e': -2.5, 'note': ''},
+             'delta_e': -2.5, 'note': '', 'reference_state': 'DONE',
+             'reference_valid': True, 'reference_note': '清单与作业能量一致'},
             {'name': 'demo_ads_b', 'state': 'RUNNING', 'e_config': None,
-             'delta_e': None, 'note': '组态未完成'},
+             'delta_e': None, 'note': '构型未完成'},
         ],
     }
     ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret=delta_ret)
@@ -731,7 +1137,10 @@ def test_proj_delta_passes_through_rows_and_gating():
     out = api.proj_delta('/p')
     assert out['ok'] is True and out['error'] is None
     assert out['rows'][0]['delta_e'] == -2.5
-    assert out['rows'][1]['delta_e'] is None and '组态未完成' in out['rows'][1]['note']
+    assert out['rows'][0]['reference_state'] == 'DONE'
+    assert out['rows'][0]['reference_valid'] is True
+    assert '一致' in out['rows'][0]['reference_note']
+    assert out['rows'][1]['delta_e'] is None and '构型未完成' in out['rows'][1]['note']
     assert '清洁表面' in out['note']
 
 
@@ -836,9 +1245,10 @@ def test_adopt_all_delegates_with_known_ids_and_root():
         calls.update(known=known, root=root, tn=tn) or
         {'needs_trust': False, 'results': [['200', True, '已认领 → X']]})
     entries = [
-        ('/a', {'scheduler_job_id': '100'}),
-        ('/b', {'scheduler_job_id': '200'}),
-        ('/c', {'state': 'DONE'}),                       # 无作业号 → 不入 known
+        ('/a', {'scheduler_job_id': '100', 'cluster': 'c1'}),
+        ('/b', {'scheduler_job_id': '200', 'cluster': 'c1'}),
+        ('/other-server', {'scheduler_job_id': '200', 'cluster': 'c2'}),
+        ('/c', {'state': 'DONE', 'cluster': 'c1'}),      # 无作业号 → 不入 known
         ('/gone', None),                                 # 失效条目 → 不入 known
     ]
     store = {'c1': ClusterProfile(name='c1', auth='key', key_path='/k')}
@@ -1137,3 +1547,6924 @@ def test_struct_view_injects_sview_mod(tmp_path):
     out = api.struct_view(str(f))
     assert out['ok'] is True
     assert seen['content'] == 'whatever'
+
+
+# ── proj_figures / proj_compare_figures(原生出图接线) ───────────────────────
+def _fake_ncharts(calls):
+    """native_charts 假件:记录每次调用与参数,返回假文件路径。"""
+    m = types.SimpleNamespace()
+
+    def _rec(kind):
+        def _f(data, out_path, **kw):
+            calls.setdefault(kind, []).append({'data': data, 'out': out_path, **kw})
+            return [str(out_path)]
+        return _f
+    m.adsorption_bar = _rec('bar')
+    m.energy_matrix_table = _rec('table')
+    m.free_energy_ladder = _rec('ladder')
+    m.heatmap_matrix = _rec('heatmap')
+    m.volcano_plot = _rec('volcano')
+    m.scaling_relation = lambda xs, ys, out_path, **kw: (
+        calls.setdefault('scaling', []).append(
+            {'xs': xs, 'ys': ys, 'out': out_path, **kw}) or [str(out_path)])
+    return m
+
+
+def _proj(name, root):
+    return {'name': name, 'root': root,
+            'members': {'clean_slab': '/s', 'gas_ref': None, 'configs': []}}
+
+
+def _delta(names_to_de, slab=('DONE', -100.0)):
+    rows = [{'name': n, 'state': 'DONE' if d is not None else 'RUNNING',
+             'e_config': None, 'delta_e': d, 'note': ''}
+            for n, d in names_to_de.items()]
+    return {'slab': slab, 'ref': ('无', None), 'has_ref': False, 'rows': rows}
+
+
+def _science_delta(name, *, method='verified', has_ref=True, values=None):
+    """Candidate/comparison summary with explicit method and reference evidence."""
+    values = values or {
+        'Li2S8': [-1.04],
+        'Li2S6': [-1.14],
+        'Li2S4': [-1.23],
+        'Li2S2': [-2.09],
+        'Li2S': [-2.81],
+    }
+    rows = []
+    for species, energies in values.items():
+        for index, value in enumerate(energies):
+            rows.append({
+                'name': f'{name}_{species}_{index}',
+                'species': species,
+                'state': 'DONE',
+                'e_config': -110.0 + value,
+                'delta_e': value,
+                'note': '',
+                'reference_valid': has_ref,
+                'method_check': {'status': method},
+            })
+    return {
+        'slab': ('DONE', -100.0),
+        'ref': (('DONE', -10.0) if has_ref else ('无', None)),
+        'has_ref': has_ref,
+        'reference_mode': 'species' if has_ref else 'none',
+        'method_consistency': {
+            'status': method,
+            'issues': [],
+            'warnings': ['方法证据待核验'] if method == 'unverified' else [],
+        },
+        'rows': rows,
+    }
+
+
+def _fake_paper_report(calls):
+    """Capture the semantic model without invoking DOCX/PDF/HTML renderers."""
+    def _render(model, out_dir, *, stem, formats):
+        calls.append({
+            'model': copy.deepcopy(model),
+            'out_dir': str(out_dir),
+            'stem': stem,
+            'formats': tuple(formats),
+        })
+        return {
+            'ok': True,
+            'files': {'html': os.path.join(str(out_dir), f'{stem}.html')},
+            'assets': [],
+        }
+
+    return types.SimpleNamespace(render_report_bundle=_render)
+
+
+def _fake_lis_freeenergy():
+    """Return one comparable Li-S path per project with an authoritative U_L."""
+    def _path(_rows, *, e_slab, molecules_dir, project=None, **_kwargs):
+        del e_slab, molecules_dir
+        name = str((project or {}).get('name') or 'M0')
+        index = int(name.removeprefix('M')) if name.removeprefix('M').isdigit() else 0
+        return {
+            'steps': [
+                {'label': 'S8*', 'G': 0.0},
+                {'label': 'Li2S4*', 'G': -0.5 - 0.01 * index},
+                {'label': 'Li2S*', 'G': -1.0 - 0.02 * index},
+            ],
+            'pds_index': 1,
+            'u_l': round(1.20 + 0.05 * index, 3),
+            'thermo_corrected': True,
+            'solvation_corrected': True,
+            'reference': 'Li/Li+',
+        }
+
+    return types.SimpleNamespace(path_from_project_and_molecules=_path)
+
+
+def test_proj_evaluate_candidate_returns_advance_and_blocked_json():
+    projects = {
+        '/advance': {
+            'name': 'Fe@B1N3', 'root': '/data/advance',
+            'project_uuid': 'advance-id',
+        },
+        '/blocked': {
+            'name': 'missing-reference', 'root': '/data/blocked',
+            'project_uuid': 'blocked-id',
+        },
+    }
+    summaries = {
+        'Fe@B1N3': _science_delta('Fe'),
+        'missing-reference': _science_delta('blocked', has_ref=False),
+    }
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(adsorption_mod=ads, config_mod=_fake_config())
+
+    advance = api.proj_evaluate_candidate('/advance')
+    blocked = api.proj_evaluate_candidate('/blocked')
+
+    assert advance['ok'] is True and advance['error'] is None
+    assert advance['evaluation']['decision']['priority'] == 'advance'
+    assert advance['evaluation']['candidate']['name'] == 'Fe@B1N3'
+    assert blocked['ok'] is True and blocked['error'] is None
+    assert blocked['evaluation']['decision']['priority'] == 'blocked'
+    assert 'ADSORBATE_REFERENCE_MISSING' in (
+        blocked['evaluation']['audit']['reason_codes'])
+    # pywebview 返回值必须能直接进入 JSON，不能泄漏 Path/集合等 Python 对象。
+    json.dumps({'advance': advance, 'blocked': blocked}, ensure_ascii=False)
+
+
+def test_proj_compare_preview_keeps_moved_project_and_canonical_stable_matrix():
+    projects = {
+        '/a': {
+            'name': 'A', 'root': '/data/a', 'project_uuid': 'a-id',
+            'comparison_method_fingerprint': 'same-method',
+        },
+        '/b': {
+            'name': 'B', 'root': '/data/b', 'project_uuid': 'b-id',
+            'comparison_method_fingerprint': 'same-method',
+        },
+    }
+    summaries = {
+        'A': _science_delta('A', values={
+            'Li₂S₈': [-1.10, -1.20],
+            'Li₂S': [-2.10],
+        }),
+        'B': _science_delta('B', values={
+            'Li2S8': [-0.90],
+            'Li₂S': [-2.40],
+        }),
+    }
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(adsorption_mod=ads, config_mod=_fake_config())
+
+    out = api.proj_compare_preview(['/a', '/moved/project.yaml', '/b'])
+
+    assert out['ok'] is True and out['selected_count'] == 3
+    assert out['ready_count'] == 2
+    assert [project['path'] for project in out['projects']] == [
+        '/a', '/moved/project.yaml', '/b',
+    ]
+    moved = out['projects'][1]
+    assert moved['status'] == 'blocked'
+    assert '已被移动' in moved['block_reasons'][0]
+    assert out['adsorption_matrix'] == {
+        'rows': ['A', 'B'],
+        'cols': ['Li2S8', 'Li2S'],
+        'values': [[-1.2, -2.1], [-0.9, -2.4]],
+    }
+    selected_a = {row['species']: row for row in out['projects'][0]['species']}
+    assert selected_a['Li2S8']['name'] == 'A_Li₂S₈_1'
+    assert selected_a['Li2S8']['co_minima'] == [{
+        'name': 'A_Li₂S₈_0',
+        'job': '',
+        'delta_e': -1.1,
+        'dd_e': 0.1,
+    }]
+
+
+def test_proj_figures_bar_table_with_short_names(tmp_path):
+    calls = {}
+    proj = _proj('liS', str(tmp_path))
+    ads = _fake_adsorption(proj_map={'/p/project.yaml': proj},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2,
+                                             'liS_ads_Li2S2': None}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              config_mod=_fake_config())
+    out = api.proj_figures('/p/project.yaml', ['bar', 'table'])
+    assert out['ok'] is True and len(out['files']) == 2
+    # 短名剥前缀 + 只收已完成 ΔE
+    data = calls['bar'][0]['data']
+    assert data['adsorbates'] == ['Li2S4']
+    assert data['substrates'] == {'liS': [-1.2]}
+    assert calls['bar'][0]['negative_up'] is True
+    assert out['out_dir'] == str(tmp_path / 'figures')
+
+
+def test_default_and_preset_ladders_share_filtered_thermo_corrections(
+        tmp_path, monkeypatch):
+    from vcstudio.project import thermo
+
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    freq_dirs = {
+        'Li2S8': str(tmp_path / 'freq-Li2S8'),
+        'Li2S': str(tmp_path / 'freq-Li2S'),
+        'missing': str(tmp_path / 'freq-missing'),
+    }
+    monkeypatch.setattr(thermo, 'load_corrections', lambda _dirs: {
+        'Li2S8': {'g_corr': 0.123, 'excluded': False},
+        'Li2S': {
+            'g_corr': 0.456,
+            'excluded': True,
+            'exclude_reason': '存在大虚频',
+        },
+    })
+    calls = {}
+
+    def _lis_path(_rows, **kwargs):
+        calls['default'] = kwargs.get('g_corr')
+        return {
+            'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S8*', 'G': -0.1}],
+            'thermo_corrected': bool(kwargs.get('g_corr')),
+        }
+
+    def _preset_path(_spec, _energies, **kwargs):
+        calls['preset'] = kwargs.get('g_corr')
+        return {
+            'steps': [{'label': '*', 'G': 0.0}, {'label': 'Li2S8*', 'G': -0.2}],
+            'thermo_corrected': bool(kwargs.get('g_corr')),
+        }
+
+    freeenergy = types.SimpleNamespace(
+        path_from_project_and_molecules=_lis_path,
+        load_molecule_energies=lambda _path: {},
+        free_energy_path=_preset_path,
+    )
+    reactions = types.SimpleNamespace(get_preset=lambda _key: {
+        'name': 'test',
+        'description': 'test path',
+        'electrode': 'none',
+        'steps': [{'species': '*'}, {'species': 'Li2S8*'}],
+    })
+    api = Api(
+        freeenergy_mod=freeenergy,
+        reactions_mod=reactions,
+        config_mod=_fake_config(cfg={'freq_dirs': freq_dirs}),
+    )
+    project = {'name': 'P', 'molecules_dir': str(molecules)}
+    summary = {
+        'slab': ('DONE', -100.0),
+        'rows': [{
+            'name': 'P_ads_Li2S8_top',
+            'state': 'DONE',
+            'e_config': -110.0,
+        }],
+    }
+
+    default, default_reason = api._proj_fed(project, summary)
+    preset, preset_reason, _title = api._proj_fed_preset(project, summary, 'test')
+
+    assert default_reason is None and preset_reason is None
+    assert calls['default'] == {'Li2S8': 0.123}
+    assert calls['preset'] == {'Li2S8*': 0.123}
+    assert default['thermo_correction_fingerprint']
+    assert preset['thermo_correction_fingerprint']
+    assert default['temperature_K'] == thermo.DEFAULT_T
+    assert preset['temperature_K'] == thermo.DEFAULT_T
+    assert any('大虚频' in warning for warning in preset['warnings'])
+    assert any('没有可用振动证据' in warning for warning in default['warnings'])
+
+
+def test_proj_figures_no_done_rows_all_skipped(tmp_path):
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': _proj('x', str(tmp_path))},
+                           delta_ret=_delta({'x_ads_a': None}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              config_mod=_fake_config())
+    out = api.proj_figures('/p', ['bar', 'table'])
+    assert out['ok'] is True and out['files'] == []
+    assert {s['kind'] for s in out['skipped']} == {'bar', 'table'}
+    assert 'bar' not in calls
+
+
+def test_proj_figures_ladder_uses_fed_pds_index(tmp_path):
+    calls = {}
+    mol_dir = tmp_path / 'mols'
+    mol_dir.mkdir()
+    fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
+           'pds_index': 0, 'u_l': 1.5, 'mu_li': -1.65, 'per_electron': [0.5],
+           'thermo_corrected': False}
+    fe = types.SimpleNamespace(
+        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir, **kw: fed)
+    ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              freeenergy_mod=fe,
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol_dir)}))
+    out = api.proj_figures('/p', ['ladder'])
+    assert out['ok'] is True and len(out['files']) == 1
+    lad = calls['ladder'][0]
+    assert lad['pds_index'] == 0                      # 逐电子权威口径透传
+    assert lad['step_labels'] == ['S8*', 'Li2S*']
+    assert lad['show_ul'] is True
+    assert lad['data'] == [{
+        'name': 'liS', 'G': [0.0, -1.0], 'pds_index': 0, 'u_l': 1.5,
+    }]
+
+
+def test_proj_figures_prefers_imported_project_molecules(tmp_path):
+    calls, seen = {}, {}
+    project_mols = tmp_path / 'imported-molecules'
+    configured_mols = tmp_path / 'configured-molecules'
+    project_mols.mkdir()
+    configured_mols.mkdir()
+    proj = _proj('liS', str(tmp_path))
+    proj['molecules_dir'] = str(project_mols)
+    fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
+           'pds_index': 0, 'u_l': 1.5}
+
+    def _path(rows, e_slab, molecules_dir, **_context):
+        seen['molecules_dir'] = molecules_dir
+        return fed
+
+    ads = _fake_adsorption(proj_map={'/p': proj},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              freeenergy_mod=types.SimpleNamespace(path_from_project_and_molecules=_path),
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(configured_mols)}))
+
+    out = api.proj_figures('/p', ['ladder'])
+
+    assert out['ok'] is True and len(out['files']) == 1
+    assert seen['molecules_dir'] == str(project_mols)
+
+
+def test_proj_figures_ladder_skipped_without_molecules_dir(tmp_path):
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
+                           delta_ret=_delta({'liS_ads_a': -1.0}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              config_mod=_fake_config())          # 无 lis_molecules_dir
+    out = api.proj_figures('/p', ['ladder'])
+    assert out['ok'] is True and out['files'] == []
+    assert out['skipped'][0]['kind'] == 'ladder'
+    assert 'lis_molecules_dir' in out['skipped'][0]['reason']
+
+
+def test_proj_compare_figures_heatmap_union_cols(tmp_path):
+    calls = {}
+    p1, p2 = _proj('A', str(tmp_path / 'a')), _proj('B', str(tmp_path / 'b'))
+    deltas = {'/a': _delta({'A_ads_S8': -0.5, 'A_ads_Li2S': -2.0}),
+              '/b': _delta({'B_ads_S8': -0.8})}
+    for summary in deltas.values():
+        summary.update({
+            'has_ref': True,
+            'reference_mode': 'single',
+            'ref': ('DONE', -10.0),
+            'method_consistency': {
+                'status': 'verified', 'issues': [], 'warnings': [],
+            },
+        })
+        for row in summary['rows']:
+            row['reference_valid'] = True
+    ads = _fake_adsorption(proj_map={'/a': p1, '/b': p2})
+    ads.delta_e_rows = lambda proj: deltas['/a' if proj['name'] == 'A' else '/b']
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              config_mod=_fake_config())
+    out = api.proj_compare_figures(['/a', '/b'], ['heatmap'])
+    assert out['ok'] is True and len(out['files']) == 1
+    data = calls['heatmap'][0]['data']
+    assert data['rows'] == ['A', 'B']
+    assert data['cols'] == ['S8', 'Li2S']            # 首见序并集
+    assert data['values'] == [[-0.5, -2.0], [-0.8, None]]
+
+
+def test_proj_compare_figures_needs_two_projects():
+    api = Api(adsorption_mod=_fake_adsorption(proj_map={}),
+              native_charts_mod=_fake_ncharts({}), config_mod=_fake_config())
+    out = api.proj_compare_figures(['/only'], ['heatmap'])
+    assert out['ok'] is False and '2 个' in out['error']
+
+
+def test_proj_compare_scaling_pair_and_volcano_skip(tmp_path):
+    calls = {}
+    projs = {f'/p{i}': _proj(f'M{i}', str(tmp_path / f'p{i}')) for i in range(3)}
+    des = {'M0': {'M0_ads_a': -1.0, 'M0_ads_b': -2.0},
+           'M1': {'M1_ads_a': -1.5, 'M1_ads_b': -2.6},
+           'M2': {'M2_ads_a': -2.0, 'M2_ads_b': -3.1}}
+    ads = _fake_adsorption(proj_map=projs)
+    ads.delta_e_rows = lambda proj: _delta(des[proj['name']])
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              config_mod=_fake_config())          # 无分子库 → volcano 应 skip
+    out = api.proj_compare_figures(list(projs), ['scaling', 'volcano'])
+    assert out['ok'] is True
+    sc = calls['scaling'][0]
+    assert sc['xs'] == [-1.0, -1.5, -2.0] and sc['ys'] == [-2.0, -2.6, -3.1]
+    assert [s['kind'] for s in out['skipped']] == ['volcano']
+    assert 'U_L' in out['skipped'][0]['reason']
+
+
+def test_proj_compare_eight_projects_share_one_ladder_with_explicit_ul(tmp_path):
+    calls = {}
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    projects = {}
+    summaries = {}
+    for index in range(8):
+        name = f'M{index}'
+        path = f'/project/{index}'
+        projects[path] = {
+            'name': name,
+            'root': str(tmp_path / name),
+            'project_uuid': f'project-{index}',
+            'comparison_method_fingerprint': 'same-method',
+            'molecules_dir': str(molecules),
+        }
+        summaries[name] = _science_delta(name)
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(
+        adsorption_mod=ads,
+        native_charts_mod=_fake_ncharts(calls),
+        freeenergy_mod=_fake_lis_freeenergy(),
+        config_mod=_fake_config(),
+    )
+
+    out = api.proj_compare_figures(
+        list(projects), ['ladder'], save_to=str(tmp_path / 'figures'))
+
+    assert out['ok'] is True and out['skipped'] == []
+    assert len(calls['ladder']) == 1
+    call = calls['ladder'][0]
+    assert call['show_ul'] is True and call['mark_pds'] is False
+    assert call['step_labels'] == ['S8*', 'Li2S4*', 'Li2S*']
+    assert len(call['data']) == 8
+    assert [path['name'] for path in call['data']] == [
+        f'M{index}' for index in range(8)
+    ]
+    assert [path['u_l'] for path in call['data']] == [
+        round(1.20 + 0.05 * index, 3) for index in range(8)
+    ]
+    assert all('u_l' in path and path['u_l'] is not None for path in call['data'])
+
+
+def test_proj_batch_report_unverified_method_is_diagnostic(tmp_path):
+    render_calls = []
+    chart_calls = {}
+    projects = {
+        '/a': {
+            'name': 'A', 'root': '/data/a', 'project_uuid': 'a-id',
+            'comparison_method_fingerprint': 'same-method',
+        },
+        '/b': {
+            'name': 'B', 'root': '/data/b', 'project_uuid': 'b-id',
+            'comparison_method_fingerprint': 'same-method',
+        },
+    }
+    summaries = {
+        name: _science_delta(name, method='unverified')
+        for name in ('A', 'B')
+    }
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(
+        adsorption_mod=ads,
+        native_charts_mod=_fake_ncharts(chart_calls),
+        paper_report_mod=_fake_paper_report(render_calls),
+        config_mod=_fake_config(),
+    )
+
+    out = api.proj_batch_report(
+        ['/a', '/b'], str(tmp_path / 'reports'),
+        formats=['html'], include_individual=False, final=True)
+
+    assert out['ok'] is True
+    assert out['kind'] == 'diagnostic'
+    assert out['snapshot']['comparison_gate']['status'] == 'unverified'
+    assert out['snapshot']['can_final_report'] is False
+    assert len(render_calls) == 1
+    model = render_calls[0]['model']
+    assert model['report_kind'] == 'diagnostic'
+    assert '诊断' in model['subtitle']
+    assert model['metadata']['比较门禁'] == 'unverified'
+    assert model['candidate_evaluations']['rows']
+    assert all(row[1] == 'hold_for_evidence'
+               for row in model['candidate_evaluations']['rows'])
+    assert out['files']['individual'] == []
+    json.dumps(out, ensure_ascii=False)
+
+
+def test_proj_compare_volcano_requires_path_delta_g_and_labels_success(tmp_path):
+    calls = {}
+    molecules = tmp_path / 'molecules'
+    molecules.mkdir()
+    projects = {}
+    summaries = {}
+    for index in range(3):
+        name = f'M{index}'
+        path = f'/project/{index}'
+        projects[path] = {
+            'name': name,
+            'root': str(tmp_path / name),
+            'project_uuid': f'project-{index}',
+            'comparison_method_fingerprint': 'same-method',
+            'molecules_dir': str(molecules),
+        }
+        summaries[name] = _science_delta(name)
+    ads = _fake_adsorption(proj_map=projects)
+    ads.delta_e_rows = lambda project: summaries[project['name']]
+    api = Api(
+        adsorption_mod=ads,
+        native_charts_mod=_fake_ncharts(calls),
+        freeenergy_mod=_fake_lis_freeenergy(),
+        config_mod=_fake_config(),
+    )
+
+    skipped = api.proj_compare_figures(
+        list(projects), ['volcano'], save_to=str(tmp_path / 'missing'))
+
+    assert skipped['ok'] is True and skipped['files'] == []
+    assert skipped['skipped'][0]['kind'] == 'volcano'
+    assert 'ΔG_ads(*LiS2)' in skipped['skipped'][0]['reason']
+    assert 'volcano' not in calls
+
+    for index, project in enumerate(projects.values()):
+        project['volcano_descriptor'] = {
+            'quantity': 'delta_G_ads',
+            'species': '*LiS₂',
+            'reaction_path_id': 'LIS_ASSOC_LIS2',
+            'sign_convention': 'negative_is_stronger',
+            'value_eV': -1.60 - 0.10 * index,
+        }
+    rendered = api.proj_compare_figures(
+        list(projects), ['volcano'], save_to=str(tmp_path / 'ready'))
+
+    assert rendered['ok'] is True and rendered['skipped'] == []
+    assert len(calls['volcano']) == 1
+    volcano = calls['volcano'][0]
+    assert [point['name'] for point in volcano['data']] == ['M0', 'M1', 'M2']
+    assert [round(point['x'], 2) for point in volcano['data']] == [-1.6, -1.7, -1.8]
+    assert r'\Delta G_{\mathrm{ads}}' in volcano['descriptor_label']
+    assert r'\Delta E' not in volcano['descriptor_label']
+
+
+# ── 设置页 / 自动驾驶 假件 ────────────────────────────────────────────────────
+def _fake_config_rw(backing):
+    """可读写 config 假件:load_config/save_config/get_ui_state/set_ui_state 共享 backing。"""
+    m = types.SimpleNamespace()
+    m.load_config = lambda *a, **k: dict(backing)
+    m.save_config = lambda cfg, *a, **k: (backing.clear() or backing.update(cfg))
+
+    def _get_ui(c=None):
+        src = c if c is not None else backing
+        return dict(src.get('ui') or {})
+    m.get_ui_state = _get_ui
+
+    def _set_ui(**kv):
+        ui = dict(backing.get('ui') or {})
+        ui.update({k: v for k, v in kv.items() if v is not None})
+        backing['ui'] = ui
+    m.set_ui_state = _set_ui
+    m.set_potcar_lib_root = lambda p, *a, **k: backing.__setitem__('potcar_lib_root', p)
+    return m
+
+
+def _fake_ai(calls=None, key_saved=False):
+    """ai_analysis 假件:save/load key + probe(用注入 transport)+ 默认预设常量。"""
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.DEFAULT_PROMPT_PRESET = 'DEFAULT_PRESET_TEXT'
+    m.save_api_key = lambda k: calls.__setitem__('saved_key', k)
+    m.load_api_key = lambda: 'stored-key' if key_saved else None
+
+    def _probe(*, api_key=None, base_url='', model='', transport=None, timeout=20):
+        calls['probe'] = {'base_url': base_url, 'model': model}
+        if transport is not None:
+            st, _raw = transport(base_url or 'u', b'{}', {}, timeout)
+            return {'ok': st == 200, 'error': None if st == 200 else f'HTTP {st}'}
+        return {'ok': True, 'error': None}
+    m.probe = _probe
+    return m
+
+
+def _fake_manifest_mod(states):
+    """manifest 假件:load_manifest 按目录返回注入的 manifest dict。"""
+    m = types.SimpleNamespace()
+    m.load_manifest = lambda d: states.get(d)
+    m.create_from_build = lambda *a, **k: None
+    return m
+
+
+# ── settings_get / llm_save / key 状态掩码 ───────────────────────────────────
+def test_settings_get_aggregates_and_masks_key():
+    backing = {'potcar_lib_root': '/lib', 'lis_molecules_dir': '/mols',
+               'ideal_window': [-1.0, 0.5],
+               'llm': {'base_url': 'u', 'model': 'm', 'allow_external': True},
+               'ui': {'theme': 'paper', 'poll_interval': 5, 'autopilot_fetch': False}}
+    api = Api(config_mod=_fake_config_rw(backing), ai_analysis_mod=_fake_ai(key_saved=True))
+    out = api.settings_get()
+    assert out['ok'] is True
+    assert out['llm'] == {'base_url': 'u', 'model': 'm', 'allow_external': True,
+                          'key_saved': True}
+    assert 'api_key' not in out['llm'] and 'stored-key' not in str(out)   # 绝不回显密钥
+    assert out['paths']['lis_molecules_dir'] == '/mols'
+    assert out['paths']['ideal_window'] == [-1.0, 0.5]
+    assert out['ui']['theme'] == 'paper' and out['ui']['poll_interval'] == 5
+    assert out['ui']['autopilot_fetch'] is False and out['ui']['autopilot'] is False
+    assert out['prompt']['is_default'] is True and 'DEFAULT_PRESET_TEXT' in out['prompt']['text']
+
+
+def test_settings_get_defaults_when_unset():
+    api = Api(config_mod=_fake_config_rw({}), ai_analysis_mod=_fake_ai(key_saved=False))
+    out = api.settings_get()
+    assert out['ui'] == {'theme': 'classic', 'autopilot': False, 'poll_interval': 10,
+                         'autopilot_continue': True, 'autopilot_fetch': True,
+                         'autopilot_report': True, 'autopilot_campaigns': False,
+                         'scenario': '', 'active_engine': '', 'active_calculation': ''}
+    assert out['llm']['key_saved'] is False and out['llm']['base_url'] == ''
+
+
+def test_llm_save_roundtrip():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    out = api.llm_save('https://api.openai.com/v1/chat/completions', 'gpt-4o', True)
+    assert out['ok'] is True
+    assert backing['llm'] == {'base_url': 'https://api.openai.com/v1/chat/completions',
+                              'model': 'gpt-4o', 'allow_external': True}
+
+
+def test_llm_key_save_and_status():
+    calls = {}
+    api = Api(ai_analysis_mod=_fake_ai(calls=calls, key_saved=False))
+    out = api.llm_key_save('sk-123')
+    assert out['ok'] is True and calls['saved_key'] == 'sk-123'
+    assert api.llm_key_status() == {'saved': False}
+    api2 = Api(ai_analysis_mod=_fake_ai(key_saved=True))
+    assert api2.llm_key_status() == {'saved': True}
+
+
+def test_llm_key_save_rejects_blank():
+    api = Api(ai_analysis_mod=_fake_ai())
+    out = api.llm_key_save('   ')
+    assert out['ok'] is False and out['error']
+
+
+# ── llm_test(注入假 transport) ──────────────────────────────────────────────
+def test_llm_test_ok_with_injected_transport():
+    calls = {}
+    api = Api(ai_analysis_mod=_fake_ai(calls=calls))
+    out = api.llm_test('http://api', 'gpt', transport=lambda u, b, h, t: (200, b'{}'))
+    assert out['ok'] is True and calls['probe']['base_url'] == 'http://api'
+
+
+def test_llm_test_http_error():
+    api = Api(ai_analysis_mod=_fake_ai())
+    out = api.llm_test('http://api', 'gpt', transport=lambda u, b, h, t: (401, b'no'))
+    assert out['ok'] is False and '401' in out['error']
+
+
+# ── prompt_get / prompt_save / prompt_reset ──────────────────────────────────
+def test_prompt_save_get_reset_roundtrip():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing), ai_analysis_mod=_fake_ai())
+    g0 = api.prompt_get()
+    assert g0['is_default'] is True and g0['text'] == 'DEFAULT_PRESET_TEXT'
+    assert api.prompt_save('MY CUSTOM PROMPT')['ok'] is True
+    assert backing['llm']['prompt_preset'] == 'MY CUSTOM PROMPT'
+    g1 = api.prompt_get()
+    assert g1['is_default'] is False and g1['text'] == 'MY CUSTOM PROMPT'
+    r = api.prompt_reset()
+    assert r['ok'] is True and 'prompt_preset' not in backing.get('llm', {})
+    assert api.prompt_get()['is_default'] is True
+
+
+def test_prompt_save_rejects_blank():
+    api = Api(config_mod=_fake_config_rw({}), ai_analysis_mod=_fake_ai())
+    assert api.prompt_save('   ')['ok'] is False
+
+
+# ── paths_save / theme_set / autopilot_save ──────────────────────────────────
+def test_paths_save_roundtrip_and_ideal_window():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    out = api.paths_save('/lib2', '/mols2', '-1.5', '0.5')
+    assert out['ok'] is True
+    assert backing['potcar_lib_root'] == '/lib2'
+    assert backing['lis_molecules_dir'] == '/mols2'
+    assert backing['ideal_window'] == [-1.5, 0.5]
+    # 两个都留空 → 移除 ideal_window
+    api.paths_save('/lib2', '/mols2', '', '')
+    assert 'ideal_window' not in backing
+
+
+def test_paths_save_partial_ideal_window_error():
+    api = Api(config_mod=_fake_config_rw({}))
+    out = api.paths_save('/lib', '/mols', '1.0', '')
+    assert out['ok'] is False and 'ideal_window' in out['error']
+
+
+def test_theme_set_persists_and_validates():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    assert api.theme_set('deep')['theme'] == 'deep' and backing['ui']['theme'] == 'deep'
+    assert api.theme_set('bogus')['theme'] == 'classic'   # 非法 → classic
+
+
+def test_autopilot_save_persists_subswitches():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    api.autopilot_save(True, 15, True, False, True, True)
+    ui = backing['ui']
+    assert ui['autopilot'] is True and ui['poll_interval'] == 15
+    assert ui['autopilot_continue'] is True and ui['autopilot_fetch'] is False
+    assert ui['autopilot_report'] is True
+    assert ui['autopilot_campaigns'] is True
+    # 非法间隔回落 10
+    api.autopilot_save(poll_interval=999)
+    assert backing['ui']['poll_interval'] == 10
+
+
+# ── pipeline_tick(幂等:首拍 report_done + 写标记,次拍无重复) ──────────────────
+def _install_fake_report_bundle(api, calls, *, order=None):
+    """Replace the bundle entry point while preserving final/diagnostic gating."""
+    def _bundle(path, out_dir, formats=None, final=True, stem=None):
+        calls['reports'] = calls.get('reports', 0) + 1
+        if order is not None:
+            order.append('report')
+        project = api._adsorption.load_project(path)
+        summary = api._adsorption.delta_e_rows(project)
+        eligible, _reason = api._final_report_gate(project, summary)
+        kind = 'final' if final and eligible else 'diagnostic'
+        wanted = tuple(formats or ('html', 'docx', 'pdf'))
+        report_stem = stem or 'report'
+        files = {}
+        os.makedirs(out_dir, exist_ok=True)
+        for fmt in wanted:
+            output = os.path.join(out_dir, f'{report_stem}.{fmt}')
+            with open(output, 'w', encoding='utf-8') as handle:
+                handle.write(
+                    f'{kind} {fmt} bundle generation {calls["reports"]}')
+            files[str(fmt)] = output
+        calls.setdefault('kinds', []).append(kind)
+        return {
+            'ok': True,
+            'kind': kind,
+            'files': files,
+            'figures': [],
+            'error': None,
+        }
+
+    api.proj_report_bundle = _bundle
+
+
+def _report_gate_fixture(tmp_path, *, has_ref=True, method_status='verified',
+                         save_project=None):
+    """构造一个无远程依赖的最终报告门禁项目。"""
+    clean = str(tmp_path / 'clean')
+    config = str(tmp_path / 'config')
+    reference = str(tmp_path / 'reference') if has_ref else None
+    members = {'clean_slab': clean, 'gas_ref': reference, 'configs': [config]}
+    project = {
+        'name': 'report-gate', 'root': str(tmp_path),
+        'autopilot_managed': True, 'members': members,
+    }
+    manifests = {
+        clean: {'state': 'DONE', 'scheduler_job_id': 'clean-1', 'attempts': [],
+                'results': {'energy_e0_eV': -100.0}},
+        config: {'state': 'DONE', 'scheduler_job_id': 'config-1', 'attempts': [],
+                 'results': {'energy_e0_eV': -115.0}},
+    }
+    if reference:
+        manifests[reference] = {
+            'state': 'DONE', 'scheduler_job_id': 'reference-1', 'attempts': [],
+            'results': {'energy_e0_eV': -10.0},
+        }
+    summary = {
+        'slab': ('DONE', -100.0),
+        'ref': ('DONE', -10.0) if has_ref else ('无', None),
+        'has_ref': has_ref,
+        'reference_mode': 'single' if has_ref else 'none',
+        'method_consistency': {
+            'status': method_status, 'issues': [],
+            'warnings': ([] if method_status == 'verified'
+                         else ['ISPIN 不一致：分子参考、吸附构型']),
+        },
+        'rows': [{
+            'name': 'report-gate_ads_Li2S8', 'species': 'Li2S8',
+            'state': 'DONE', 'e_config': -115.0, 'delta_e': -5.0,
+            'dd_e': 0.0, 'reference_valid': has_ref,
+            'reference_job': reference, 'note': '',
+        }],
+    }
+    calls = {'reports': 0, 'saved': 0}
+    adsorption = _fake_adsorption(
+        projects=['/managed/project.yaml'],
+        proj_map={'/managed/project.yaml': project}, delta_ret=summary)
+
+    def _save(root, saved_project):
+        calls['saved'] += 1
+        if save_project is not None:
+            return save_project(root, saved_project)
+        return None
+
+    adsorption.save_project = _save
+    report_full = _fake_report_full(
+        member_dirs=[path for path in (clean, config, reference) if path])
+
+    def _generate(_project, out, config=None):
+        calls['reports'] += 1
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w', encoding='utf-8') as handle:
+            handle.write(f'<html>generation {calls["reports"]}</html>')
+        return out
+
+    report_full.generate_project_report = _generate
+    manifest_mod = _fake_manifest_mod(manifests)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifest_mod,
+              report_full_mod=report_full, config_mod=_fake_config())
+    _install_fake_report_bundle(api, calls)
+    return api, project, manifests, summary, calls
+
+
+def test_pipeline_tick_report_done_idempotent(tmp_path):
+    calls, saved = {}, []
+    proj = {'name': 'liS', 'root': str(tmp_path),
+            'autopilot_managed': True,
+            'members': {'clean_slab': '/s', 'gas_ref': None, 'configs': ['/c1']}}
+    delta = _delta({'liS_ads_Li2S4': -1.2})
+    delta.update({'has_ref': True, 'reference_mode': 'single',
+                  'ref': ('DONE', -10.0),
+                  'method_consistency': {'status': 'verified', 'issues': [], 'warnings': []}})
+    delta['rows'][0]['reference_valid'] = True
+    ads = _fake_adsorption(projects=['/p/project.yaml'],
+                           proj_map={'/p/project.yaml': proj}, delta_ret=delta)
+    ads.save_project = lambda root, p: saved.append(root)
+    manifest = _fake_manifest_mod({'/s': {'state': 'DONE', 'results': {}},
+                                   '/c1': {'state': 'DONE', 'results': {}}})
+    rf = _fake_report_full(member_dirs=['/s', '/c1'],
+                           report_ret=str(tmp_path / 'report' / 'liS_report.html'))
+    def _write_report(_project, out, config=None):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w', encoding='utf-8') as handle:
+            handle.write('<html>validated adsorption report</html>')
+        return out
+    rf.generate_project_report = _write_report
+    api = Api(profiles_mod=_fake_profiles({}), adsorption_mod=ads, manifest_mod=manifest,
+              native_charts_mod=_fake_ncharts(calls), report_full_mod=rf,
+              config_mod=_fake_config(ui={'autopilot': True}))
+    _install_fake_report_bundle(api, calls)
+    out1 = api.pipeline_tick()
+    assert out1['ok'] is True and out1['last_sync']
+    rd = [e for e in out1['events'] if e['kind'] == 'report_done']
+    assert len(rd) == 1 and rd[0]['project'] == 'liS'
+    assert rd[0]['report'].endswith('.pdf')
+    assert rd[0]['report_kind'] == 'final'
+    assert set(rd[0]['files']) == {'html', 'docx', 'pdf'}
+    assert set(proj['autopilot_report']['files']) == {'html', 'docx', 'pdf'}
+    assert proj.get('autopilot_report_done') and saved == [str(tmp_path)]   # 标记已写
+    # 次拍:标记已在 → 不再重复出报告
+    out2 = api.pipeline_tick()
+    assert [e for e in out2['events'] if e['kind'] == 'report_done'] == []
+
+
+def test_final_report_rejects_numeric_difference_without_reference_state(tmp_path):
+    """E(config)-E(slab) 可供诊断，但不能冒充最终吸附能报告。"""
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, has_ref=False)
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert errors == []
+    assert [event['kind'] for event in events] == ['report_done']
+    assert events[0]['report_kind'] == 'diagnostic'
+    assert calls['reports'] == 1 and calls['saved'] == 1
+    assert project['autopilot_report']['kind'] == 'diagnostic'
+    assert set(project['autopilot_report']['files']) == {'html', 'docx', 'pdf'}
+    final = api.proj_report('/managed/project.yaml', str(tmp_path / 'manual.html'), final=True)
+    assert final['ok'] is False and '未设置有效气相/逐物种参考态' in final['error']
+
+
+def test_unverified_method_requires_persisted_reason_before_final_report(tmp_path):
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, method_status='unverified')
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert errors == [] and calls['reports'] == 1 and calls['saved'] == 1
+    assert [event['report_kind'] for event in events] == ['diagnostic']
+    assert project['autopilot_report']['kind'] == 'diagnostic'
+    project['preparation'] = {'method_check': {'confirmation': {
+        'confirmed': True,
+        'reason': '已核对 Li2S8 非磁基态 ISPIN=1，周期吸附体系 ISPIN=2',
+    }}}
+
+    confirmed_events, confirmed_errors = [], []
+    api._tick_reports(confirmed_events, confirmed_errors)
+
+    assert confirmed_errors == [] and calls['reports'] == 2 and calls['saved'] == 2
+    assert [event['kind'] for event in confirmed_events] == ['report_done']
+    assert confirmed_events[0]['report_kind'] == 'final'
+    assert project['autopilot_report']['kind'] == 'final'
+    assert project['autopilot_report']['input_fingerprint']
+
+
+def test_report_marker_invalidates_on_file_and_member_generation_changes(tmp_path):
+    api, project, manifests, _summary, calls = _report_gate_fixture(tmp_path)
+
+    def _tick_once():
+        events, errors = [], []
+        api._tick_reports(events, errors)
+        assert errors == []
+        assert [event['kind'] for event in events] == ['report_done']
+
+    _tick_once()
+    report_path = project['autopilot_report']['file']
+    assert calls['reports'] == 1
+    os.unlink(report_path)
+    _tick_once()  # 报告文件被删，marker 不得继续有效
+    assert calls['reports'] == 2
+
+    config = project['members']['configs'][0]
+    manifests[config]['results']['energy_e0_eV'] = -115.2
+    _tick_once()
+    assert calls['reports'] == 3
+
+    manifests[config]['scheduler_job_id'] = 'config-2'
+    _tick_once()
+    assert calls['reports'] == 4
+
+    manifests[config]['attempts'].append({'round': 2, 'reason': 'continued'})
+    _tick_once()
+    assert calls['reports'] == 5
+
+
+def test_report_marker_save_failure_never_emits_report_done(tmp_path):
+    def _fail_save(_root, _project):
+        raise OSError('disk full')
+
+    api, project, _manifests, _summary, calls = _report_gate_fixture(
+        tmp_path, save_project=_fail_save)
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert events == []
+    assert calls['reports'] == 1 and calls['saved'] == 1
+    assert any('报告标记落盘失败' in error and 'disk full' in error
+               for error in errors)
+    assert 'autopilot_report' not in project
+    assert 'autopilot_report_done' not in project
+
+
+def test_pipeline_tick_no_profiles_no_errors():
+    api = Api(profiles_mod=_fake_profiles({}),
+              adsorption_mod=_fake_adsorption(projects=[]),
+              config_mod=_fake_config())
+    out = api.pipeline_tick()
+    assert out['ok'] is True and out['events'] == [] and out['errors'] == []
+    assert out['synced'] == 0
+
+
+def test_pipeline_tick_backend_lock_skips_overlapping_tick():
+    api = Api(profiles_mod=_fake_profiles({}),
+              adsorption_mod=_fake_adsorption(projects=[]),
+              config_mod=_fake_config(ui={'autopilot': True}))
+    assert api._pipeline_lock.acquire(blocking=False)
+    try:
+        out = api.pipeline_tick()
+    finally:
+        api._pipeline_lock.release()
+    assert out['ok'] is True and out['busy'] is True and out['synced'] == 0
+    assert '仍在执行' in out['events'][0]['text']
+
+
+def test_pipeline_tick_reports_deleted_managed_profile():
+    project = {
+        'name': 'lost-cluster', 'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'deleted-server'},
+                   'submitted_job_dirs': ['/job']},
+        'members': {'clean_slab': '/job', 'gas_ref': None, 'configs': []},
+    }
+    api = Api(
+        profiles_mod=_fake_profiles({}),
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}),
+        config_mod=_fake_config(ui={'autopilot': True}))
+
+    out = api.pipeline_tick()
+
+    assert any('deleted-server' in error and '已不存在' in error
+               for error in out['errors'])
+
+
+def test_pipeline_tick_configured_but_idle_profile_is_not_counted_as_synced():
+    api = Api(
+        profiles_mod=_fake_profiles({'idle': ClusterProfile(name='idle', auth='key')}),
+        adsorption_mod=_fake_adsorption(projects=[]),
+        ledger_mod=_fake_ledger([], []),
+        config_mod=_fake_config(ui={
+            'autopilot': True, 'autopilot_report': False,
+            'autopilot_campaigns': False,
+        }))
+
+    out = api.pipeline_tick()
+
+    assert out['ok'] is True
+    assert out['synced'] == 0
+
+
+def test_pipeline_tick_monitors_multiple_servers_and_isolates_one_failure():
+    profiles = {
+        'server-a': ClusterProfile(name='server-a', auth='key'),
+        'server-b': ClusterProfile(name='server-b', auth='key'),
+    }
+    api = Api(
+        profiles_mod=_fake_profiles(profiles),
+        config_mod=_fake_config(ui={
+            'autopilot': True, 'autopilot_report': False,
+            'autopilot_campaigns': False,
+        }))
+    seen = []
+
+    def _tick(name, *_args):
+        seen.append(name)
+        if name == 'server-a':
+            raise RuntimeError('network down')
+        return True
+
+    api._tick_cluster = _tick
+    out = api.pipeline_tick()
+
+    assert seen == ['server-a', 'server-b']
+    assert out['synced'] == 1
+    assert any('server-a' in error for error in out['errors'])
+
+
+def test_pipeline_tick_disabled_has_no_cluster_campaign_or_report_side_effects():
+    calls = []
+    profiles = types.SimpleNamespace(load_profiles=lambda: calls.append('profiles') or {})
+    adsorption = types.SimpleNamespace(
+        list_projects=lambda: calls.append('projects') or [], load_project=lambda _p: None)
+    secrets = types.SimpleNamespace(
+        get_password=lambda _n: calls.append('password'), set_password=lambda *_a: None)
+    api = Api(profiles_mod=profiles, adsorption_mod=adsorption, secrets_mod=secrets,
+              config_mod=_fake_config(ui={'autopilot': False,
+                                          'autopilot_report': False,
+                                          'autopilot_campaigns': True}))
+    api._tick_campaigns = lambda *_a: calls.append('campaigns')
+
+    out = api.pipeline_tick()
+
+    assert out['ok'] is True and out['events'] == [] and out['synced'] == 0
+    assert calls == []
+
+
+def test_pipeline_report_only_mode_never_loads_remote_automation():
+    calls = []
+    profiles = types.SimpleNamespace(
+        load_profiles=lambda: (_ for _ in ()).throw(
+            AssertionError('report-only path must not load profiles')))
+    secrets = types.SimpleNamespace(
+        get_password=lambda _n: (_ for _ in ()).throw(
+            AssertionError('report-only path must not load credentials')),
+        set_password=lambda *_a: None,
+    )
+    api = Api(
+        profiles_mod=profiles,
+        secrets_mod=secrets,
+        config_mod=_fake_config(ui={
+            'autopilot': False,
+            'autopilot_report': True,
+            'autopilot_campaigns': True,
+        }),
+    )
+    api._tick_reports = lambda events, _errors: (
+        calls.append('reports'),
+        events.append({'kind': 'report_done', 'text': 'local report'}),
+    )
+    api._tick_campaigns = lambda *_a: (_ for _ in ()).throw(
+        AssertionError('report-only path must not advance campaigns'))
+
+    out = api.pipeline_tick()
+
+    assert calls == ['reports']
+    assert out['synced'] == 0
+    assert [event['kind'] for event in out['events']] == ['report_done']
+
+
+def test_pipeline_campaigns_require_independent_explicit_switch():
+    calls = []
+    api = Api(profiles_mod=_fake_profiles({}),
+              config_mod=_fake_config(ui={'autopilot': True,
+                                          'autopilot_continue': True,
+                                          'autopilot_fetch': True}))
+    api._tick_campaigns = lambda *_a: calls.append('campaign')
+    api.pipeline_tick()
+    assert calls == []
+
+    api._config = _fake_config(ui={'autopilot': True,
+                                   'autopilot_campaigns': True})
+    api.pipeline_tick()
+    assert calls == ['campaign']
+
+
+def test_pipeline_tick_skips_profile_without_credentials():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
+    secrets = types.SimpleNamespace(get_password=lambda n: None, set_password=lambda n, pw: None)
+    api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets,
+              adsorption_mod=_fake_adsorption(projects=[]),
+              ledger_mod=_fake_ledger([], []),
+              config_mod=_fake_config(ui={'autopilot': True}))
+    out = api.pipeline_tick()
+    assert any(e['kind'] == 'skip' and 'c1' in e['text'] for e in out['events'])
+    assert out['synced'] == 0
+
+
+# ── pipeline_status(阶段判定) ───────────────────────────────────────────────
+def test_pipeline_status_stage_detection():
+    projA = {'name': 'A', 'members': {'clean_slab': '/a/s', 'gas_ref': None,
+                                      'configs': ['/a/c1', '/a/c2']},
+             'launch': {'resources': {'profile': 'gpu-a'}}}
+    projB = {'name': 'B', 'members': {'clean_slab': '/b/s', 'gas_ref': None,
+                                      'configs': ['/b/c1']},
+             'autopilot_report_done': '2026-07-16T00:00:00'}
+    ads = _fake_adsorption(projects=['/a/project.yaml', '/b/project.yaml'],
+                           proj_map={'/a/project.yaml': projA, '/b/project.yaml': projB})
+    states = {
+        '/a/s': {'state': 'DONE', 'results': {}},
+        '/a/c1': {'state': 'CREATED', 'results': {}},     # 未提交 → 提交阶段
+        '/a/c2': {'state': 'DONE', 'results': {}},
+        '/b/s': {'state': 'DONE', 'results': {}},
+        '/b/c1': {'state': 'DONE', 'results': {}},         # 全 DONE + 标记 → 报告完成
+    }
+    api = Api(adsorption_mod=ads, manifest_mod=_fake_manifest_mod(states))
+    out = api.pipeline_status()
+    by = {p['name']: p for p in out['projects']}
+    assert by['A']['stage'] == 'submit' and by['A']['needs_human'] is False
+    assert by['A']['profile'] == 'gpu-a'
+    # 旧时间字符串不绑定成员/能量/报告文件，必须失效并等待重建。
+    assert by['B']['stage'] == 'analysis'
+    assert by['B']['done'] == 2 and by['B']['total'] == 2
+    assert by['B']['stage_index'] == 4 and by['B']['stages'][5] == 'report_done'
+
+
+def test_pipeline_status_monitor_recover_and_needs_human():
+    projM = {'name': 'M', 'members': {'clean_slab': '/m/s', 'gas_ref': None,
+                                      'configs': ['/m/c1']}}
+    projR = {'name': 'R', 'members': {'clean_slab': '/r/s', 'gas_ref': None,
+                                      'configs': ['/r/c1', '/r/c2']}}
+    ads = _fake_adsorption(projects=['/m/p', '/r/p'],
+                           proj_map={'/m/p': projM, '/r/p': projR})
+    states = {
+        '/m/s': {'state': 'DONE', 'results': {}},
+        '/m/c1': {'state': 'RUNNING', 'results': {}},      # 在跑 → 监控
+        '/r/s': {'state': 'DONE', 'results': {}},
+        '/r/c1': {'state': 'UNCONVERGED',
+                  'results': {'diagnosis': {'restartable': True}, 'continue_rounds': 2}},
+        '/r/c2': {'state': 'NEEDS_HUMAN', 'results': {}},  # 红旗
+    }
+    api = Api(adsorption_mod=ads, manifest_mod=_fake_manifest_mod(states))
+    out = api.pipeline_status()
+    by = {p['name']: p for p in out['projects']}
+    assert by['M']['stage'] == 'monitor'
+    assert by['R']['stage'] == 'recover' and by['R']['recover_round'] == 2
+    assert by['R']['needs_human'] is True
+
+
+# ── open_dir 文件路径 → 打开所在目录 ─────────────────────────────────────────
+def test_open_dir_file_opens_parent(tmp_path, monkeypatch):
+    import subprocess
+    f = tmp_path / 'report.html'
+    f.write_text('x', encoding='utf-8')
+    opened = {}
+    monkeypatch.setattr(subprocess, 'Popen', lambda args, *a, **k: opened.update(args=args))
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    api = Api()
+    out = api.open_dir(str(f))
+    assert out['ok'] is True and opened['args'] == ['xdg-open', str(tmp_path)]
+
+
+def test_open_dir_missing_still_errors():
+    api = Api()
+    out = api.open_dir('/definitely/not/a/real/path/xyz')
+    assert out['ok'] is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase A 新引擎接线(派生计算 / SAC 矩阵 / 多自旋 / 通用反应 / campaign)
+# 全部走构造注入的假件,零真实 matplotlib/ssh/campaign 磁盘依赖。
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 假件工厂 ────────────────────────────────────────────────────────────────
+def _fake_freq(*, changes=None, warnings=None, calls=None, boom=None):
+    """freq_builder 假件:build_freq_job 回显 out_dir + 逐条改动 dict。"""
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(relax_dir, out_dir, **kw):
+        calls['build'] = {'relax_dir': relax_dir, 'out_dir': out_dir, **kw}
+        if boom:
+            raise boom
+        return {'out_dir': out_dir, 'free_atoms': [0, 1],
+                'changes': list(changes if changes is not None else
+                                [{'key': 'IBRION', 'action': 'replace', 'old': '2',
+                                  'new': '5', 'reason': '有限差分频率'}]),
+                'warnings': list(warnings or [])}
+    m.build_freq_job = _build
+    return m
+
+
+def _fake_estatic(*, calls=None, boom_kinds=None):
+    """estatic 假件:build_static_job 回显 out_dir + 字符串 changes。"""
+    calls = calls if calls is not None else {}
+    boom_kinds = boom_kinds or {}
+    m = types.SimpleNamespace()
+
+    def _build(relax_dir, out_dir, *, purpose='pdos', **kw):
+        calls.setdefault('purposes', []).append(purpose)
+        if purpose in boom_kinds:
+            raise boom_kinds[purpose]
+        return {'out_dir': out_dir, 'changes': [f'{purpose} 改动 A', f'{purpose} 改动 B'],
+                'warnings': []}
+    m.build_static_job = _build
+    return m
+
+
+_SAC_POSCAR = ('demo\n1.0\n8 0 0\n0 8 0\n0 0 20\nFe N C\n1 4 26\nCartesian\n'
+               + '0 0 0\n' * 31)
+
+
+def _fake_sac(*, sites_list=None, ads_texts=None, place_boom=None, build_boom=None,
+              calls=None):
+    """sac 束假件:sac_builder.build_sac / sites.enumerate+place / molecules。"""
+    calls = calls if calls is not None else {}
+    sb = types.SimpleNamespace()
+
+    def _build_sac(template, metal, **kw):
+        calls.setdefault('built', []).append((metal, template))
+        if build_boom and template in build_boom:
+            raise build_boom[template]
+        return {'poscar': _SAC_POSCAR, 'description': f'{metal}@{template}',
+                'site_indices': {'metal': 0, 'coord': [1, 2, 3, 4],
+                                 'metal_element': metal}}
+    sb.build_sac = _build_sac
+
+    _sites = sites_list if sites_list is not None else [
+        {'name': 'top_metal', 'position': [0.5, 0.5, 0.4], 'kind': 'top_metal'},
+        {'name': 'hollow', 'position': [0.5, 0.5, 0.4], 'kind': 'hollow'}]
+    st = types.SimpleNamespace()
+    st.enumerate_sac_sites = lambda pos, si: [dict(s) for s in _sites]
+
+    def _place(pos, mol, site, *, rotations=(0,), **kw):
+        calls.setdefault('placed', []).append((mol, site['name'], tuple(rotations)))
+        if place_boom:
+            raise place_boom
+        return list(ads_texts if ads_texts is not None
+                    else [f'{mol}@{site["name"]}_r{d}\nPOSCAR\n' for d in rotations])
+    st.place_adsorbate = _place
+
+    mo = types.SimpleNamespace()
+    mo.list_molecules = lambda: ['S8', 'Li2S4', 'O2']
+    mo.molecule_info = lambda n: {'formula': n, 'spin_hint': None, 'source_note': 'x'}
+    return types.SimpleNamespace(sac_builder=sb, sites=st, molecules=mo)
+
+
+def _fake_jb_text(built=None):
+    """job_builder 假件:build_job_dir 回显 out_dir(供 _job_from_text 链)。"""
+    built = built if built is not None else []
+    m = types.SimpleNamespace()
+
+    def _build(poscar_path, incar, out, **kw):
+        built.append(out)
+        return {'ok': True, 'out_dir': out, 'warnings': [], 'kpoints': [3, 3, 1],
+                'elements': ['Fe', 'N', 'C']}
+    m.build_job_dir = _build
+    return m
+
+
+def _fake_ads_projects(saved=None):
+    """adsorption 假件:save_project/register_project 收参(不碰真实注册表)。"""
+    saved = saved if saved is not None else []
+    m = types.SimpleNamespace()
+    m.save_project = lambda root, proj: saved.append((root, proj))
+    m.register_project = lambda pp: True
+    m.list_projects = lambda *a, **k: []
+    return m
+
+
+def _fake_spin(*, variants=None, ground=None, audit=None, calls=None, build_boom=None):
+    """spin_scan 假件:build_spin_variants / pick_ground_state / audit_magmom。"""
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _bsv(job_dir, out_root, **kw):
+        calls['bsv'] = {'job_dir': job_dir, 'out_root': out_root}
+        if build_boom:
+            raise build_boom
+        return list(variants if variants is not None else [
+            {'name': 'nm', 'out_dir': out_root + '/j_spin_nm', 'magmom': None,
+             'changes': [{'key': 'ISPIN', 'old': None, 'new': 2}], 'warnings': []},
+            {'name': 'hs', 'out_dir': out_root + '/j_spin_hs', 'magmom': '4 0',
+             'changes': [{'key': 'MAGMOM', 'old': None, 'new': '4 0'}], 'warnings': []}])
+    m.build_spin_variants = _bsv
+    m.pick_ground_state = lambda dirs: (ground if ground is not None
+                                        else {'winner': 'hs', 'energies': {},
+                                              'de_meV': {}, 'warning': None})
+
+    def _audit(outcar, init):
+        calls.setdefault('audits', []).append({'outcar': outcar, 'init': init})
+        return audit if audit is not None else {
+            'final_magnetization': 3.9, 'initial_magmom': init, 'collapsed': False,
+            'flipped': False, 'audited': True, 'warning': None}
+    m.audit_magmom = _audit
+    return m
+
+
+def _fake_reactions(presets=None):
+    p = presets if presets is not None else {
+        'ORR_4E': {'name': 'ORR_4E', 'description': '4 电子氧还原 ORR',
+                   'electrode': 'RHE', 'direction': 'reduction', 'steps': []},
+        'HER': {'name': 'HER', 'description': '析氢 HER', 'electrode': 'RHE',
+                'direction': 'reduction', 'steps': []}}
+    m = types.SimpleNamespace()
+    m.list_presets = lambda: dict(p)
+    m.get_preset = lambda k: dict(p)[k]
+    return m
+
+
+def _reactions_orr_spec():
+    return {'name': 'ORR_4E', 'description': '4 电子氧还原 ORR', 'electrode': 'RHE',
+            'direction': 'reduction', 'steps': [
+                {'label': 'O2', 'species': '*', 'n_electrons_cumulative': 0,
+                 'coadsorbates_or_gas': [{'name': 'O2', 'coef': 1}]},
+                {'label': '*OOH', 'species': 'OOH*', 'n_electrons_cumulative': 1,
+                 'coadsorbates_or_gas': []},
+                {'label': '*OH', 'species': 'OH*', 'n_electrons_cumulative': 2,
+                 'coadsorbates_or_gas': [{'name': 'H2O', 'coef': 1}]}]}
+
+
+def _fake_reactions_orr():
+    spec = _reactions_orr_spec()
+    m = types.SimpleNamespace()
+    m.list_presets = lambda: {'ORR_4E': spec}
+    m.get_preset = lambda k: {'ORR_4E': spec}[k]
+    return m
+
+
+def _fake_fe_preset(*, mol_e=None, fed=None, path_calls=None):
+    """freeenergy 假件(通用预设路径):load_molecule_energies + free_energy_path。"""
+    path_calls = path_calls if path_calls is not None else {}
+    m = types.SimpleNamespace()
+    m.load_molecule_energies = lambda d: dict(mol_e or {})
+
+    def _fep(spec, energies, **kw):
+        path_calls['energies'] = dict(energies)
+        path_calls['spec'] = spec
+        return fed if fed is not None else {
+            'steps': [{'label': s['label'], 'G': 0.0} for s in spec['steps']],
+            'pds_index': 0, 'u_l': 0.7, 'u_eq': 1.23, 'eta': 0.5,
+            'per_electron': [], 'warnings': []}
+    m.free_energy_path = _fep
+    return m
+
+
+def _fake_campaign(*, campaigns=None, calls=None):
+    """campaign 束假件:new_task/init_campaign/estimate/record + load/summary/budget。"""
+    calls = calls if calls is not None else {}
+    campaigns = campaigns or {}
+    m = types.SimpleNamespace()
+    m.new_task = lambda tid, kind, *, job_dir=None, **kw: {
+        'id': tid, 'kind': kind, 'job_dir': job_dir}
+
+    def _init(base, cid, *, tasks=None, title='', **kw):
+        cdir = os.path.join(str(base), '.camp', str(cid))
+        calls['init'] = {'base': str(base), 'cid': cid, 'title': title,
+                         'tasks': list(tasks or [])}
+        return {'dir': cdir, 'meta': {'id': cid, 'title': title,
+                                      'budget_core_hours': None},
+                'tasks': list(tasks or [])}
+    m.init_campaign = _init
+    m.estimate_job = lambda natoms, nkpts, kind, cores, **kw: round((natoms or 1) * 0.01, 3)
+    m.record_estimate = lambda cdir, tid, ch: calls.setdefault(
+        'estimates', {}).__setitem__(tid, ch)
+    m.load_campaign = lambda cdir: campaigns.get(cdir)
+    m.progress_summary = lambda camp: camp.get('_summary', {}) if isinstance(camp, dict) else {}
+    m.load_budget = lambda cdir: (campaigns.get(cdir) or {}).get(
+        '_budget', {'estimates': {}, 'actuals': {}})
+    return m
+
+
+# ── derive_freq ──────────────────────────────────────────────────────────────
+def test_derive_freq_derives_and_registers(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(freq_builder_mod=_fake_freq(calls=calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_freq(str(tmp_path))
+    assert out['ok'] is True and out['error'] is None
+    assert out['job_dir'].endswith(os.path.basename(str(tmp_path)) + '_freq')
+    assert out['changes'][0]['key'] == 'IBRION'          # 逐条派生改动
+    assert registered == [out['job_dir']]                # 入台账
+    assert calls['build']['out_dir'] == out['job_dir']   # 命名 {原名}_freq
+
+
+def test_derive_freq_missing_dir_error():
+    api = Api(freq_builder_mod=_fake_freq())
+    out = api.derive_freq('/no/such/dir/xyz')
+    assert out['ok'] is False and out['job_dir'] is None and '目录' in out['error']
+
+
+def test_derive_freq_engine_exception_caught(tmp_path):
+    api = Api(freq_builder_mod=_fake_freq(boom=ValueError('缺 CONTCAR')),
+              ledger_mod=_fake_ledger_register([]))
+    out = api.derive_freq(str(tmp_path))
+    assert out['ok'] is False and '缺 CONTCAR' in out['error']
+
+
+# ── derive_estatic ───────────────────────────────────────────────────────────
+def test_derive_estatic_multi_kind_registers(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(estatic_mod=_fake_estatic(calls=calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_estatic(str(tmp_path), ['pdos', 'bader', 'chgdiff'])
+    assert out['ok'] is True and len(out['jobs']) == 3
+    assert calls['purposes'] == ['pdos', 'bader', 'chgdiff']
+    assert [j['kind'] for j in out['jobs']] == ['pdos', 'bader', 'chgdiff']
+    assert out['jobs'][0]['job_dir'].endswith('_st_pdos')   # 命名 {原名}_st_{kind}
+    assert len(registered) == 3
+    assert out['jobs'][0]['changes'] == ['pdos 改动 A', 'pdos 改动 B']
+
+
+def test_derive_estatic_skips_invalid_kind(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(estatic_mod=_fake_estatic(), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_estatic(str(tmp_path), ['pdos', 'bogus'])
+    assert out['ok'] is True and len(out['jobs']) == 1
+    assert out['skipped'] == [{'kind': 'bogus',
+                               'reason': '不支持的静态类型(仅 pdos/bader/chgdiff)'}]
+
+
+def test_derive_estatic_no_valid_kinds_error(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(estatic_mod=_fake_estatic())
+    out = api.derive_estatic(str(tmp_path), ['nope'])
+    assert out['ok'] is False and out['jobs'] == [] and '静态类型' in out['error']
+
+
+def test_derive_estatic_engine_failure_isolated(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    est = _fake_estatic(boom_kinds={'bader': RuntimeError('母 KPOINTS 缺')})
+    api = Api(estatic_mod=est, ledger_mod=_fake_ledger_register([]))
+    out = api.derive_estatic(str(tmp_path), ['pdos', 'bader'])
+    assert out['ok'] is True and len(out['jobs']) == 1
+    assert out['jobs'][0]['kind'] == 'pdos'
+    assert any(s['kind'] == 'bader' and '母 KPOINTS' in s['reason'] for s in out['skipped'])
+
+
+# ── molecule_list ────────────────────────────────────────────────────────────
+def test_molecule_list_from_engine():
+    api = Api(sac_mods=_fake_sac())
+    out = api.molecule_list()
+    assert out['ok'] is True
+    assert [m['name'] for m in out['molecules']] == ['S8', 'Li2S4', 'O2']
+    assert out['molecules'][0]['formula'] == 'S8'
+
+
+def test_molecule_list_error_caught():
+    boom = types.SimpleNamespace(molecules=types.SimpleNamespace(
+        list_molecules=lambda: (_ for _ in ()).throw(RuntimeError('库坏'))))
+    api = Api(sac_mods=boom)
+    out = api.molecule_list()
+    assert out['ok'] is False and '库坏' in out['error']
+
+
+# ── sac_matrix_preview ───────────────────────────────────────────────────────
+def test_sac_matrix_preview_counts_and_estimate():
+    api = Api(sac_mods=_fake_sac())
+    out = api.sac_matrix_preview(['Fe', 'Co'], ['MN4'], ['S8', 'O2'], 'metal_top', 2)
+    assert out['ok'] is True
+    assert out['n_slabs'] == 2                        # 2 金属 × 1 模板
+    assert out['n_configs'] == 8                      # 每 slab 1 顶位 × 2 吸附质 × 2 取向 ×2 slab
+    assert out['n_total_jobs'] == 10
+    assert '粗估' in out['estimate_note']
+    assert out['names'][0] == 'Fe@MN4_clean'
+
+
+def test_sac_matrix_preview_all_sites_uses_all_kinds():
+    api = Api(sac_mods=_fake_sac())                   # 默认 2 位点(top_metal + hollow)
+    out = api.sac_matrix_preview(['Fe'], ['MN4'], ['S8'], 'all', 1)
+    assert out['n_configs'] == 2                      # 2 位点 × 1 吸附质 × 1 取向
+
+
+def test_sac_matrix_preview_requires_metal_and_template():
+    api = Api(sac_mods=_fake_sac())
+    out = api.sac_matrix_preview([], ['MN4'], ['S8'], 'all', 1)
+    assert out['ok'] is False and '金属' in out['error']
+
+
+# ── sac_matrix_generate ──────────────────────────────────────────────────────
+def test_sac_matrix_generate_creates_jobs_project_and_campaign(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('ENCUT=500\n', encoding='utf-8')
+    registered, saved, cc = [], [], {}
+    api = Api(sac_mods=_fake_sac(), job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register(registered),
+              adsorption_mod=_fake_ads_projects(saved),
+              campaign_mods=_fake_campaign(calls=cc),
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/lib'}))
+    out = api.sac_matrix_generate(['Fe'], ['MN4'], ['S8'], 'metal_top', 1,
+                                  str(incar), str(tmp_path))
+    assert out['ok'] is True and out['error'] is None
+    assert out['created'] == 2                        # 1 清洁面 + 1 构型
+    assert len(registered) == 2                       # 全部入台账
+    # 每 slab 一个吸附能项目(清洁面 + 构型族)
+    assert len(out['project_paths']) == 1 and len(saved) == 1
+    assert saved[0][1]['members']['clean_slab'].endswith('_clean')
+    assert len(saved[0][1]['members']['configs']) == 1
+    # 同步注册 campaign(2 任务节点 + 逐任务记预估机时)
+    assert out['campaign'].endswith(cc['init']['cid'])
+    assert len(cc['init']['tasks']) == 2 and len(cc['estimates']) == 2
+
+
+def test_sac_matrix_generate_place_rejection_skipped(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('E\n', encoding='utf-8')
+    sac = _fake_sac(place_boom=ValueError('分子-表面最近距离过近,全部拒绝'))
+    api = Api(sac_mods=sac, job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}), ledger_mod=_fake_ledger_register([]),
+              adsorption_mod=_fake_ads_projects(), campaign_mods=_fake_campaign(),
+              config_mod=_fake_config())
+    out = api.sac_matrix_generate(['Fe'], ['MN4'], ['S8'], 'metal_top', 1,
+                                  str(incar), str(tmp_path))
+    assert out['ok'] is True and out['created'] == 1          # 仅清洁面
+    assert any('拒绝' in s['reason'] for s in out['skipped'])
+    assert out['project_paths'] == []                         # 无构型 → 不建项目
+
+
+def test_sac_matrix_generate_clean_only_no_project(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('E\n', encoding='utf-8')
+    saved = []
+    api = Api(sac_mods=_fake_sac(), job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}), ledger_mod=_fake_ledger_register([]),
+              adsorption_mod=_fake_ads_projects(saved), campaign_mods=_fake_campaign(),
+              config_mod=_fake_config())
+    out = api.sac_matrix_generate(['Fe'], ['MN4'], [], 'all', 1,
+                                  str(incar), str(tmp_path))
+    assert out['ok'] is True and out['created'] == 1
+    assert out['project_paths'] == [] and saved == []
+
+
+def test_sac_matrix_generate_missing_incar_error(tmp_path):
+    api = Api(sac_mods=_fake_sac(), config_mod=_fake_config())
+    out = api.sac_matrix_generate(['Fe'], ['MN4'], ['S8'], 'all', 1,
+                                  '/no/incar', str(tmp_path))
+    assert out['ok'] is False and 'INCAR' in out['error']
+
+
+def test_sac_matrix_generate_build_failure_isolated(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('E\n', encoding='utf-8')
+    sac = _fake_sac(build_boom={'MN4': ValueError('未知模板')})
+    api = Api(sac_mods=sac, job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}), ledger_mod=_fake_ledger_register([]),
+              adsorption_mod=_fake_ads_projects(), campaign_mods=_fake_campaign(),
+              config_mod=_fake_config())
+    out = api.sac_matrix_generate(['Fe'], ['MN4', 'MN3'], ['S8'], 'metal_top', 1,
+                                  str(incar), str(tmp_path))
+    assert out['ok'] is True
+    assert any('MN4' in s['name'] and '建模失败' in s['reason'] for s in out['skipped'])
+    assert out['created'] >= 1                        # MN3 正常生成
+
+
+# ── spin_family_generate ─────────────────────────────────────────────────────
+def test_spin_family_generate_creates_family(tmp_path):
+    pos = tmp_path / 'POSCAR'
+    pos.write_text('p', encoding='utf-8')
+    incar = tmp_path / 'INCAR'
+    incar.write_text('i', encoding='utf-8')
+    registered = []
+    api = Api(spin_mod=_fake_spin(), job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register(registered), config_mod=_fake_config())
+    out = api.spin_family_generate(str(pos), str(incar), str(tmp_path))
+    assert out['ok'] is True and len(out['variants']) == 2
+    assert [v['name'] for v in out['variants']] == ['nm', 'hs']
+    assert len(registered) == 2                       # 家族全部入台账
+    assert out['variants'][1]['magmom'] == '4 0'
+
+
+def test_spin_family_generate_missing_files_error(tmp_path):
+    api = Api(spin_mod=_fake_spin(), config_mod=_fake_config())
+    out = api.spin_family_generate('/no/POSCAR', '/no/INCAR', str(tmp_path))
+    assert out['ok'] is False and 'POSCAR' in out['error']
+
+
+def test_spin_family_generate_engine_exception_caught(tmp_path):
+    pos = tmp_path / 'POSCAR'
+    pos.write_text('p', encoding='utf-8')
+    incar = tmp_path / 'INCAR'
+    incar.write_text('i', encoding='utf-8')
+    spin = _fake_spin(build_boom=ValueError('作业目录缺 POSCAR'))
+    api = Api(spin_mod=spin, job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest({}), ledger_mod=_fake_ledger_register([]),
+              config_mod=_fake_config())
+    out = api.spin_family_generate(str(pos), str(incar), str(tmp_path))
+    assert out['ok'] is False and '缺 POSCAR' in out['error']
+
+
+# ── spin_family_compare ──────────────────────────────────────────────────────
+def test_spin_family_compare_ground_and_audit(tmp_path):
+    d1 = tmp_path / 'j_nm'
+    d1.mkdir()
+    (d1 / 'OUTCAR').write_text('magnetization 0.0', encoding='utf-8')
+    d2 = tmp_path / 'j_hs'
+    d2.mkdir()
+    (d2 / 'OUTCAR').write_text('magnetization 3.9', encoding='utf-8')
+    calls = {}
+    manifest = _fake_manifest_mod({str(d1): {'inputs': {'spin_magmom': '0'}},
+                                   str(d2): {'inputs': {'spin_magmom': '4 0'}}})
+    api = Api(spin_mod=_fake_spin(calls=calls), manifest_mod=manifest)
+    out = api.spin_family_compare([str(d1), str(d2)])
+    assert out['ok'] is True and out['ground']['winner'] == 'hs'
+    assert len(out['audits']) == 2 and all(a['audited'] for a in out['audits'])
+    # audit_magmom 收到 OUTCAR 文本 + 各自初猜磁矩(从 manifest 溯源)
+    assert any(a['init'] == '4 0' for a in calls['audits'])
+    assert any('3.9' in a['outcar'] for a in calls['audits'])
+    assert out['report_file'] and os.path.isfile(out['report_file'])
+
+
+def test_spin_family_compare_pending_passthrough_and_missing_outcar(tmp_path):
+    d1 = tmp_path / 'j_nm'
+    d1.mkdir()                                        # 无 OUTCAR
+    spin = _fake_spin(ground={'pending': ['nm']})
+    api = Api(spin_mod=spin, manifest_mod=_fake_manifest_mod({}))
+    out = api.spin_family_compare([str(d1)])
+    assert out['ok'] is True and out['ground'] == {'pending': ['nm']}
+    assert out['audits'][0]['audited'] is False
+    assert 'OUTCAR' in out['audits'][0]['warning']
+
+
+def test_spin_family_compare_empty_dirs_error():
+    api = Api(spin_mod=_fake_spin())
+    out = api.spin_family_compare([])
+    assert out['ok'] is False and '作业目录' in out['error']
+
+
+def test_spin_family_compare_error_caught(tmp_path):
+    spin = _fake_spin()
+    spin.pick_ground_state = lambda dirs: (_ for _ in ()).throw(RuntimeError('读能量失败'))
+    api = Api(spin_mod=spin, manifest_mod=_fake_manifest_mod({}))
+    out = api.spin_family_compare([str(tmp_path)])
+    assert out['ok'] is False and '读能量失败' in out['error']
+
+
+# ── reaction_presets ─────────────────────────────────────────────────────────
+def test_reaction_presets_shape():
+    api = Api(reactions_mod=_fake_reactions())
+    out = api.reaction_presets()
+    assert out['ok'] is True
+    assert {p['key'] for p in out['presets']} == {'ORR_4E', 'HER'}
+    orr = next(p for p in out['presets'] if p['key'] == 'ORR_4E')
+    assert orr['name'] == 'ORR_4E' and '氧还原' in orr['description']
+
+
+def test_reaction_presets_error_caught():
+    boom = types.SimpleNamespace(
+        list_presets=lambda: (_ for _ in ()).throw(RuntimeError('预设坏')))
+    api = Api(reactions_mod=boom)
+    out = api.reaction_presets()
+    assert out['ok'] is False and '预设坏' in out['error']
+
+
+# ── proj_figures(通用反应预设 ladder;默认 Li-S 向后兼容) ─────────────────────
+def test_proj_figures_preset_ladder_maps_species(tmp_path):
+    calls, path_calls = {}, {}
+    proj = _proj('PtN4', str(tmp_path))
+    delta_ret = {'slab': ('DONE', -100.0), 'ref': ('无', None), 'has_ref': False,
+                 'rows': [
+                     {'name': 'PtN4_ads_OOH', 'state': 'DONE', 'e_config': -110.0,
+                      'delta_e': -1.0, 'note': ''},
+                     {'name': 'PtN4_ads_OH', 'state': 'DONE', 'e_config': -104.5,
+                      'delta_e': -1.0, 'note': ''}]}
+    ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret=delta_ret)
+    mol = tmp_path / 'mols'
+    mol.mkdir()
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              reactions_mod=_fake_reactions_orr(),
+              freeenergy_mod=_fake_fe_preset(
+                  mol_e={'O2': -9.8, 'H2O': -14.2, 'H2': -6.8}, path_calls=path_calls),
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
+    out = api.proj_figures('/p', ['ladder'], str(tmp_path), 'ORR_4E')
+    assert out['ok'] is True and len(out['files']) == 1
+    e = path_calls['energies']
+    assert e['*'] == -100.0                            # 干净基底 '*' → 清洁表面能量
+    assert e['OOH*'] == -110.0 and e['OH*'] == -104.5  # 构型名 → 物种能量
+    assert e['O2'] == -9.8 and e['H2O'] == -14.2 and e['H2'] == -6.8  # 分子库 + RHE 定标
+    assert '氧还原' in calls['ladder'][0]['title']      # 标题随预设
+
+
+def test_proj_figures_preset_ladder_missing_species_skipped(tmp_path):
+    proj = _proj('PtN4', str(tmp_path))
+    delta_ret = {'slab': ('DONE', -100.0), 'ref': ('无', None), 'has_ref': False,
+                 'rows': [{'name': 'PtN4_ads_OH', 'state': 'DONE', 'e_config': -104.5,
+                           'delta_e': -1.0, 'note': ''}]}    # 缺 OOH
+    ads = _fake_adsorption(proj_map={'/p': proj}, delta_ret=delta_ret)
+    mol = tmp_path / 'mols'
+    mol.mkdir()
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts({}),
+              reactions_mod=_fake_reactions_orr(),
+              freeenergy_mod=_fake_fe_preset(mol_e={'O2': -9.8, 'H2O': -14.2, 'H2': -6.8}),
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
+    out = api.proj_figures('/p', ['ladder'], str(tmp_path), 'ORR_4E')
+    assert out['ok'] is True and out['files'] == []
+    assert out['skipped'][0]['kind'] == 'ladder'
+    assert 'OOH*' in out['skipped'][0]['reason'] and '缺' in out['skipped'][0]['reason']
+
+
+def test_proj_figures_default_ladder_unchanged_when_no_preset(tmp_path):
+    # 不传 preset_key → 走既有 Li-S path_from_project_and_molecules,行为完全不变
+    calls = {}
+    mol_dir = tmp_path / 'mols'
+    mol_dir.mkdir()
+    fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
+           'pds_index': 0, 'u_l': 1.5}
+    seen = {}
+
+    def _path(rows, e_slab, molecules_dir, **_context):
+        seen['called'] = True
+        return fed
+    fe = types.SimpleNamespace(path_from_project_and_molecules=_path)
+    ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    api = Api(adsorption_mod=ads, native_charts_mod=_fake_ncharts(calls),
+              freeenergy_mod=fe,
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol_dir)}))
+    out = api.proj_figures('/p', ['ladder'])          # 无 preset_key
+    assert out['ok'] is True and len(out['files']) == 1
+    assert seen.get('called') is True                 # 仍走 Li-S 便捷入口
+    assert 'Li-S discharge path' in calls['ladder'][0]['title']
+
+
+# ── campaign_list ────────────────────────────────────────────────────────────
+def test_campaign_list_aggregates_states_and_budget():
+    cdir = '/base/.camp/sac-1'
+    campaigns = {cdir: {
+        'meta': {'id': 'sac-1', 'title': 'SAC 批 3 作业', 'budget_core_hours': 50.0},
+        'tasks': [],
+        '_summary': {'total': 3, 'pending': 0, 'running': 0, 'failed': 0,
+                     'completed': 1, 'validated': 1, 'accepted': 1},
+        '_budget': {'estimates': {'a': 0.3, 'b': 0.5}, 'actuals': {}}}}
+    api = Api(campaign_mods=_fake_campaign(campaigns=campaigns),
+              config_mod=_fake_config(ui={'campaign_dirs': [cdir]}))
+    out = api.campaign_list()
+    assert out['ok'] is True and out['available'] is True and len(out['campaigns']) == 1
+    c = out['campaigns'][0]
+    assert c['name'] == 'SAC 批 3 作业' and c['n_tasks'] == 3
+    # 累计口径:completed ⊇ validated ⊇ accepted(三态嵌套小条形)
+    assert c['states'] == {'completed': 3, 'validated': 2, 'accepted': 1}
+    assert c['budget'] == {'estimated': 0.8, 'cap': 50.0}
+
+
+def test_campaign_list_no_campaigns_hidden():
+    api = Api(campaign_mods=_fake_campaign(), config_mod=_fake_config(ui={}))
+    out = api.campaign_list()
+    assert out['ok'] is True and out['available'] is True and out['campaigns'] == []
+
+
+def test_campaign_list_module_unavailable(monkeypatch):
+    # campaign 模块不可用(ImportError)→ available=False,前端据此隐藏区块
+    api = Api(config_mod=_fake_config(ui={'campaign_dirs': ['/x']}))
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == 'vcstudio.campaign':
+            raise ImportError('campaign 不可用')
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, '__import__', fake_import)
+    out = api.campaign_list()
+    assert out['ok'] is True and out['available'] is False and out['campaigns'] == []
+
+
+def test_campaign_list_skips_unloadable_campaign():
+    good = '/base/.camp/good'
+    campaigns = {good: {
+        'meta': {'id': 'good'}, 'tasks': [],
+        '_summary': {'total': 1, 'completed': 1, 'validated': 0, 'accepted': 0},
+        '_budget': {'estimates': {}, 'actuals': {}}}}
+    api = Api(campaign_mods=_fake_campaign(campaigns=campaigns),
+              config_mod=_fake_config(ui={'campaign_dirs': ['/base/.camp/bad', good]}))
+    out = api.campaign_list()
+    assert len(out['campaigns']) == 1 and out['campaigns'][0]['name'] == 'good'
+
+
+def test_campaign_list_bad_campaign_does_not_break():
+    cdir = '/b/c'
+    fc = _fake_campaign(campaigns={cdir: {'meta': {'id': 'c'}, 'tasks': []}})
+    fc.progress_summary = lambda camp: (_ for _ in ()).throw(RuntimeError('summary 坏'))
+    api = Api(campaign_mods=fc, config_mod=_fake_config(ui={'campaign_dirs': [cdir]}))
+    out = api.campaign_list()
+    assert out['ok'] is True and out['campaigns'] == []   # 坏批次跳过,绝不拖垮仪表盘
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v3.1 GUI 总集成:研究场景 / i18n / 图表预设 / 成稿包 / AI 助手 / 多引擎 / 结构编辑器
+# ═══════════════════════════════════════════════════════════════════════════════
+def _fake_scenarios(calls=None, reg=None, active=None):
+    """scenarios 假件:list/get/active/set 全可注入;set 落 calls 便于断言持久化。"""
+    calls = calls if calls is not None else {}
+    full = {'key': 'full', 'name': '通用', 'description': '兜底',
+            'pages': ['dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings'],
+            'cards': {}, 'figure_preset_order': ['bar', 'ladder'],
+            'reaction_presets': [], 'engines': ['vasp'],
+            'defaults': {'calc_type': 'slab'}, 'ai_context': 'x'}
+    lis = {'key': 'lis', 'name': '锂硫', 'description': 'Li-S',
+           'pages': ['dashboard', 'generate', 'project', 'jobs', 'cluster', 'settings'],
+           'cards': {}, 'figure_preset_order': ['ladder', 'volcano'],
+           'reaction_presets': ['LIS_16E'], 'engines': ['vasp'],
+           'defaults': {'calc_type': 'slab'}, 'ai_context': 'y'}
+    reg = reg if reg is not None else {'full': full, 'lis': lis}
+    m = types.SimpleNamespace()
+    m.list_scenarios = lambda: [dict(v) for v in reg.values()]
+    m.get_scenario = lambda k: dict(reg.get(k, full))
+    m.active_scenario = lambda cfg=None: dict(active if active is not None else full)
+    m.set_scenario = lambda k, *a, **kw: calls.__setitem__('set', k)
+    return m
+
+
+def _fake_i18n(calls=None, lang='zh', avail=None, dict_ret=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.current_lang = lambda cfg=None: lang
+    m.available_langs = lambda: list(avail if avail is not None else ['zh', 'en'])
+    m.set_lang = lambda lg, *a, **kw: calls.__setitem__('lang', lg)
+    m.export_for_js = lambda lg: dict(dict_ret if dict_ret is not None else (
+        {'nav.dashboard': '仪表盘'} if lg == 'zh' else {'nav.dashboard': 'Dashboard'}))
+    return m
+
+
+def _fake_figpresets(calls=None, reg=None):
+    calls = calls if calls is not None else {}
+    reg = reg if reg is not None else {
+        'adsorption_bar': {'key': 'adsorption_bar', 'name': '吸附能柱状图',
+                           'category': '能量学', 'description': '柱状',
+                           'required_data': 'adsorbates+substrates',
+                           'thumbnail_svg': '<svg id="bar"/>',
+                           'params_schema': {'negative_up': False, 'title': ''}},
+        'delta_e_heatmap': {'key': 'delta_e_heatmap', 'name': 'ΔE 热图',
+                            'category': '能量学', 'description': '热图',
+                            'required_data': 'rows+cols+values',
+                            'thumbnail_svg': '<svg id="hm"/>',
+                            'params_schema': {'annotate': True}},
+        'free_energy_ladder': {'key': 'free_energy_ladder', 'name': 'ΔG 台阶图',
+                               'category': '电池', 'description': '台阶',
+                               'required_data': 'paths',
+                               'thumbnail_svg': '<svg id="ld"/>',
+                               'params_schema': {'mark_pds': True, 'title': ''}},
+        'pdos': {'key': 'pdos', 'name': 'PDOS', 'category': '电子结构',
+                 'description': 'pdos', 'required_data': 'series',
+                 'thumbnail_svg': '<svg id="pd"/>', 'params_schema': {}},
+        'volcano': {'key': 'volcano', 'name': '火山图', 'category': '能量学',
+                    'description': '火山', 'required_data': 'points',
+                    'thumbnail_svg': '<svg id="vo"/>', 'params_schema': {}},
+    }
+    m = types.SimpleNamespace()
+    m.list_presets = lambda category=None: [
+        {k: v for k, v in p.items() if k != 'thumbnail_svg'}
+        for p in reg.values() if category is None or p['category'] == category]
+    m.get_preset = lambda k: dict(reg[k])   # 未知 key → KeyError
+    m.categories = lambda: list(dict.fromkeys(p['category'] for p in reg.values()))
+
+    def _render(k, data, out_path, **params):
+        calls.setdefault('render', []).append(
+            {'key': k, 'data': data, 'out': out_path, 'params': params})
+        return [str(out_path)]
+    m.render_preset = _render
+    m.preset_provenance = lambda k, ds, params=None: {
+        'preset': k, 'data_source': ds, 'params': dict(params or {})}
+    return m
+
+
+def _fake_draftpack(ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _dr(proj, out, **kw):
+        calls['draft'] = {'out': out, 'proj': proj, 'kw': kw}
+        if ret is not None:
+            return dict(ret)
+        return {'ok': True, 'summary': '✅ Draft-Ready 通过', 'issues': [],
+                'issues_total': 0, 'summary_path': out + '/DRAFT_READY.md',
+                'report': {
+                    'si_package': {'zip_path': out + '/x_SI.zip', 'ok': True,
+                                   'contents': ['members/a']},
+                    'tables': {'files': [out + '/t.csv', out + '/t.html'], 'issues': []},
+                    'methods': {'files': [out + '/methods_zh.md'], 'issues': []}}}
+    m.draft_ready = _dr
+    return m
+
+
+def _fake_ai_paper(*, extract_ret=None, plan_ret=None, inst_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _extract(source, transport=None, config=None):
+        calls['extract'] = {'source': source, 'transport': transport}
+        return extract_ret if extract_ret is not None else {
+            'ok': True, 'spec': {'systems': [], 'adsorbates': []},
+            'issues': ['未知泛函「XPB」'], 'error': None}
+    m.extract_spec = _extract
+    m.plan_campaign = lambda spec, **kw: (plan_ret if plan_ret is not None else {
+        'ok': True, 'plan': {'jobs_estimate': 3, 'warnings': ['需用户提供 INCAR'],
+                             'tasks': [{'id': 'a'}], 'nk': 9}})
+
+    def _inst(plan, out_root, **kw):
+        calls['inst'] = {'out_root': out_root, 'kw': dict(kw)}
+        if kw.get('dry_run'):
+            return {'ok': True, 'created': ['a'], 'campaign_dir': '(dry)',
+                    'gates': {'budget': {'estimated_core_hours': 12.5}},
+                    'dry_run': True}
+        return inst_ret if inst_ret is not None else {
+            'ok': True, 'created': ['a', 'b'],
+            'campaign_dir': out_root + '/.camp/ai-paper',
+            'gates': {'pilot': {'status': 'awaiting'}},
+            'pilot': {'id': 'a'}, 'awaiting': 'pilot_validation'}
+    m.instantiate = _inst
+    return m
+
+
+def _fake_engines(calls=None, gen_ret=None, validate_issues=None, nonequiv=None):
+    calls = calls if calls is not None else {}
+
+    class _Spec:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+            calls['spec'] = dict(kw)
+
+    class _Backend:
+        def generate_inputs(self, spec, out):
+            calls['gen'] = {'out': out, 'spec': spec}
+            return gen_ret if gen_ret is not None else {
+                'files': [out + '/cp2k.inp'], 'warnings': ['CP2K 需自备 GTH 赝势库']}
+
+    m = types.SimpleNamespace()
+    m.CalcSpec = _Spec
+    m.validate = lambda spec: list(validate_issues or [])
+    m.available_engines = lambda: ['vasp', 'cp2k', 'gaussian', 'castep']
+    m.get_backend = lambda name: (calls.__setitem__('engine', name) or _Backend())
+    m.nonequivalence_report = lambda s, d: list(
+        nonequiv if nonequiv is not None else [f'[cutoff] {s}→{d} 截断能不可换算'])
+    return m
+
+
+# 供结构编辑器往返测试的最小 slab POSCAR:2 层(底层两 Fe,顶层一 O),c 向 20 Å 真空 18 Å
+_EDITOR_POSCAR = (
+    'slab test\n1.0\n3.0 0.0 0.0\n0.0 3.0 0.0\n0.0 0.0 20.0\n'
+    'Fe O\n2 1\nCartesian\n'
+    '0.0 0.0 5.0\n1.5 1.5 5.0\n0.75 0.75 7.0\n')
+
+
+# ── scenario_* ───────────────────────────────────────────────────────────────
+def test_scenario_list_shape():
+    api = Api(scenarios_mod=_fake_scenarios())
+    out = api.scenario_list()
+    assert out['ok'] is True
+    assert {s['key'] for s in out['scenarios']} == {'full', 'lis'}
+    lis = next(s for s in out['scenarios'] if s['key'] == 'lis')
+    assert 'project' in lis['pages'] and lis['reaction_presets'] == ['LIS_16E']
+
+
+def test_scenario_get_configured_true_reads_active():
+    calls = {}
+    api = Api(scenarios_mod=_fake_scenarios(active={'key': 'lis', 'name': '锂硫',
+              'pages': ['dashboard'], 'cards': {}, 'figure_preset_order': [],
+              'reaction_presets': [], 'engines': ['vasp'], 'defaults': {},
+              'ai_context': ''}, calls=calls),
+              config_mod=_fake_config(ui={'scenario': 'lis'}))
+    out = api.scenario_get()
+    assert out['ok'] is True and out['configured'] is True
+    assert out['scenario']['key'] == 'lis'
+
+
+def test_scenario_get_unconfigured_first_launch():
+    # config 无 ui.scenario → configured=False(前端据此弹首启场景选择模态)
+    api = Api(scenarios_mod=_fake_scenarios(), config_mod=_fake_config(ui={}))
+    out = api.scenario_get()
+    assert out['ok'] is True and out['configured'] is False
+
+
+def test_scenario_set_persists_and_returns_view():
+    calls = {}
+    api = Api(scenarios_mod=_fake_scenarios(calls=calls))
+    out = api.scenario_set('lis')
+    assert out['ok'] is True and out['key'] == 'lis' and calls['set'] == 'lis'
+    assert out['scenario']['reaction_presets'] == ['LIS_16E']
+
+
+def test_scenario_set_rejects_unknown_before_persisting():
+    calls = {}
+    api = Api(scenarios_mod=_fake_scenarios(calls=calls))
+    out = api.scenario_set('typo-mode')
+    assert out['ok'] is False and '未知工作模式' in out['error']
+    assert 'set' not in calls
+
+
+def test_calculation_get_falls_back_to_mode_default_and_set_validates():
+    backing = {'ui': {'scenario': 'vasp', 'active_calculation': 'not-a-task'}}
+    api = Api(config_mod=_fake_config_rw(backing))
+    got = api.calculation_get()
+    assert got['ok'] is True and got['configured'] is False
+    assert got['active_calculation'] == 'relax'
+    bad = api.calculation_set('gaussian_fake')
+    assert bad['ok'] is False
+    good = api.calculation_set('bands')
+    assert good['ok'] is True and backing['ui']['active_calculation'] == 'bands'
+
+
+def test_engine_selection_is_persistent_and_filters_calculation_contract():
+    backing = {'ui': {'scenario': 'full', 'active_calculation': 'bands'}}
+    api = Api(config_mod=_fake_config_rw(backing), engines_mod=_fake_engines())
+
+    changed = api.engine_set('cp2k')
+    assert changed['ok'] is True and changed['engine'] == 'cp2k'
+    assert changed['active_calculation'] == 'relax'
+    assert backing['ui']['active_engine'] == 'cp2k'
+    assert backing['ui']['active_calculation'] == 'relax'
+
+    current = api.engine_get()
+    assert current['engine'] == 'cp2k' and current['configured'] is True
+    assert current['capability']['task_keys'] == ['relax', 'static', 'freq']
+    assert api.calculation_set('bands')['ok'] is False
+    assert api.calculation_set('freq')['ok'] is True
+
+
+def test_engine_selection_rejects_mode_incompatible_engine():
+    backing = {'ui': {'scenario': 'molecular'}}
+    api = Api(config_mod=_fake_config_rw(backing), engines_mod=_fake_engines())
+    out = api.engine_set('castep')
+    assert out['ok'] is False and '分子化学' in out['error']
+
+
+def test_scenario_get_error_caught():
+    boom = _fake_scenarios()
+    boom.active_scenario = lambda cfg=None: (_ for _ in ()).throw(RuntimeError('场景坏'))
+    api = Api(scenarios_mod=boom, config_mod=_fake_config())
+    out = api.scenario_get()
+    assert out['ok'] is False and '场景坏' in out['error']
+
+
+# ── lang_* / i18n_dict ───────────────────────────────────────────────────────
+def test_lang_get_returns_lang_and_available():
+    api = Api(i18n_mod=_fake_i18n(lang='en', avail=['zh', 'en']),
+              config_mod=_fake_config(ui={'lang': 'en'}))
+    out = api.lang_get()
+    assert out['ok'] is True and out['lang'] == 'en'
+    assert out['available'] == ['zh', 'en']
+
+
+def test_lang_set_persists_active_language():
+    calls = {}
+    api = Api(i18n_mod=_fake_i18n(calls=calls))
+    out = api.lang_set('en')
+    assert out['ok'] is True and out['lang'] == 'en' and calls['lang'] == 'en'
+
+
+def test_i18n_dict_returns_full_table():
+    api = Api(i18n_mod=_fake_i18n())
+    out = api.i18n_dict('en')
+    assert out['ok'] is True and out['lang'] == 'en'
+    assert out['dict']['nav.dashboard'] == 'Dashboard'
+
+
+def test_lang_get_error_caught():
+    boom = _fake_i18n()
+    boom.current_lang = lambda cfg=None: (_ for _ in ()).throw(RuntimeError('语言坏'))
+    api = Api(i18n_mod=boom, config_mod=_fake_config())
+    out = api.lang_get()
+    assert out['ok'] is False and '语言坏' in out['error']
+
+
+# ── figure_presets / render_figure_preset ────────────────────────────────────
+def test_figure_presets_gallery_with_thumbnails():
+    api = Api(figure_presets_mod=_fake_figpresets())
+    out = api.figure_presets()
+    assert out['ok'] is True and len(out['presets']) == 5
+    bar = next(p for p in out['presets'] if p['key'] == 'adsorption_bar')
+    assert bar['thumbnail_svg'] == '<svg id="bar"/>'
+    assert bar['params_schema'] == {'negative_up': False, 'title': ''}
+    assert '能量学' in out['categories']
+
+
+def test_render_figure_preset_bar_assembles_from_delta(tmp_path):
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))},
+                           delta_ret=_delta({'O': -1.0, 'OH': -2.0}))
+    api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads)
+    out = api.render_figure_preset('adsorption_bar', '/p', {'save_to': str(tmp_path)})
+    assert out['ok'] is True and len(out['files']) == 1 and out['skipped'] == []
+    data = calls['render'][0]['data']
+    assert data['adsorbates'] == ['O', 'OH']
+    assert data['substrates']['demo'] == [-1.0, -2.0]
+    assert out['provenance']['preset'] == 'adsorption_bar'
+
+
+def test_render_figure_preset_heatmap_rows_cols_values(tmp_path):
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))},
+                           delta_ret=_delta({'O': -1.0, 'OH': -2.0}))
+    api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads)
+    out = api.render_figure_preset('delta_e_heatmap', '/p', {'save_to': str(tmp_path)})
+    assert out['ok'] is True
+    data = calls['render'][0]['data']
+    assert data['rows'] == ['demo'] and data['cols'] == ['O', 'OH']
+    assert data['values'] == [[-1.0, -2.0]]
+
+
+def test_render_figure_preset_ladder_lis_default(tmp_path):
+    calls = {}
+    mol = tmp_path / 'mols'
+    mol.mkdir()
+    fed = {'steps': [{'label': 'S8*', 'G': 0.0}, {'label': 'Li2S*', 'G': -1.0}],
+           'pds_index': 0, 'u_l': 1.5}
+    fe = types.SimpleNamespace(
+        path_from_project_and_molecules=lambda rows, e_slab, molecules_dir, **kw: fed)
+    ads = _fake_adsorption(proj_map={'/p': _proj('liS', str(tmp_path))},
+                           delta_ret=_delta({'liS_ads_Li2S4': -1.2}))
+    api = Api(figure_presets_mod=_fake_figpresets(calls=calls), adsorption_mod=ads,
+              freeenergy_mod=fe,
+              config_mod=_fake_config(cfg={'lis_molecules_dir': str(mol)}))
+    out = api.render_figure_preset('free_energy_ladder', '/p', {'save_to': str(tmp_path)})
+    assert out['ok'] is True and len(out['files']) == 1
+    data = calls['render'][0]['data']
+    assert data['paths'][0]['G'] == [0.0, -1.0] and data['pds_index'] == 0
+    assert calls['render'][0]['params']['title'] == 'Li-S discharge path'
+
+
+def test_render_figure_preset_pdos_skipped_needs_parse(tmp_path):
+    api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
+    out = api.render_figure_preset('pdos', '/p', {})
+    assert out['ok'] is True and out['files'] == []
+    assert out['skipped'][0]['kind'] == 'pdos' and 'PDOS' in out['skipped'][0]['reason']
+
+
+def test_render_figure_preset_volcano_skipped_multi(tmp_path):
+    api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
+    out = api.render_figure_preset('volcano', '/p', {})
+    assert out['ok'] is True and out['files'] == []
+    assert '多催化剂' in out['skipped'][0]['reason']
+
+
+def test_render_figure_preset_no_done_skipped(tmp_path):
+    ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))},
+                           delta_ret={'slab': ('RUNNING', None), 'ref': ('无', None),
+                                      'has_ref': False,
+                                      'rows': [{'name': 'O', 'state': 'RUNNING',
+                                                'e_config': None, 'delta_e': None,
+                                                'note': ''}]})
+    api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=ads)
+    out = api.render_figure_preset('adsorption_bar', '/p', {})
+    assert out['ok'] is True and out['files'] == []
+    assert 'ΔE' in out['skipped'][0]['reason']
+
+
+def test_render_figure_preset_unknown_key_error():
+    api = Api(figure_presets_mod=_fake_figpresets(), adsorption_mod=_fake_adsorption())
+    out = api.render_figure_preset('nope', '/p', {})
+    assert out['ok'] is False and '未知图表预设' in out['error']
+
+
+# ── draft_ready ──────────────────────────────────────────────────────────────
+def test_draft_ready_aggregates_products(tmp_path):
+    calls = {}
+    ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))})
+    api = Api(adsorption_mod=ads, draftpack_mod=_fake_draftpack(calls=calls))
+    out = api.draft_ready('/p', str(tmp_path))
+    assert out['ok'] is True and out['error'] is None
+    assert out['out_dir'] == str(tmp_path)
+    # products 汇总 SI + 表格 + 方法学 + 总结
+    assert any(p.endswith('_SI.zip') for p in out['products'])
+    assert any(p.endswith('methods_zh.md') for p in out['products'])
+    assert any(p.endswith('DRAFT_READY.md') for p in out['products'])
+    assert calls['draft']['out'] == str(tmp_path)
+
+
+def test_draft_ready_not_ok_passthrough(tmp_path):
+    ret = {'ok': False, 'summary': '⚠️ 口径稽核未通过', 'issues': ['[待确认:X 无 ΔE]'],
+           'issues_total': 1, 'summary_path': '/o/DRAFT_READY.md',
+           'report': {'si_package': {'zip_path': '/o/x.zip', 'ok': False},
+                      'tables': {'files': []}, 'methods': {'files': []}}}
+    ads = _fake_adsorption(proj_map={'/p': _proj('demo', str(tmp_path))})
+    api = Api(adsorption_mod=ads, draftpack_mod=_fake_draftpack(ret=ret))
+    out = api.draft_ready('/p', str(tmp_path))
+    assert out['ok'] is False and out['issues_total'] == 1
+    assert out['issues'] == ['[待确认:X 无 ΔE]']
+
+
+def test_draft_ready_missing_project_error():
+    api = Api(adsorption_mod=_fake_adsorption(), draftpack_mod=_fake_draftpack())
+    out = api.draft_ready('/nope', '/out')
+    assert out['ok'] is False and '项目不存在' in out['error']
+
+
+# ── ai_extract / ai_plan / ai_instantiate ────────────────────────────────────
+def test_ai_extract_forwards_and_returns_spec():
+    calls = {}
+    api = Api(ai_paper_mod=_fake_ai_paper(calls=calls))
+    out = api.ai_extract('论文文本 ... VASP ENCUT 500 eV', transport='T')
+    assert out['ok'] is True and out['spec']['systems'] == []
+    assert '未知泛函「XPB」' in out['issues']
+    assert calls['extract']['transport'] == 'T'
+
+
+def test_ai_extract_external_off_passthrough():
+    ret = {'ok': False, 'spec': None, 'issues': [],
+           'error': '未开启联网抽取:请在设置页开启「允许将文本发送到外部 LLM」'}
+    api = Api(ai_paper_mod=_fake_ai_paper(extract_ret=ret))
+    out = api.ai_extract('text')
+    assert out['ok'] is False and '未开启联网抽取' in out['error']
+
+
+def test_ai_plan_returns_plan_and_estimate():
+    api = Api(ai_paper_mod=_fake_ai_paper())
+    out = api.ai_plan({'systems': [], 'adsorbates': []})
+    assert out['ok'] is True and out['jobs_estimate'] == 3
+    assert out['est_core_hours'] == 12.5           # 经 dry-run 机时预算闸估值
+    assert '需用户提供 INCAR' in out['warnings']
+
+
+def test_ai_instantiate_registers_campaign_and_returns_gates(tmp_path):
+    cc = {}
+    api = Api(ai_paper_mod=_fake_ai_paper(),
+              config_mod=_fake_config(ui={}, calls=cc))
+    out = api.ai_instantiate({'tasks': [{'id': 'a'}]}, str(tmp_path), {})
+    assert out['ok'] is True and out['created'] == ['a', 'b']
+    assert out['awaiting'] == 'pilot_validation'
+    assert out['gates']['pilot']['status'] == 'awaiting'
+    # campaign 目录记入仪表盘发现表(config ui.campaign_dirs)
+    assert out['campaign_dir'] in cc['ui_state']['campaign_dirs']
+
+
+def test_ai_instantiate_missing_out_root_error():
+    api = Api(ai_paper_mod=_fake_ai_paper())
+    out = api.ai_instantiate({'tasks': []}, '', {})
+    assert out['ok'] is False and '输出根目录' in out['error']
+
+
+# ── engine_list / engine_generate / engine_nonequiv ──────────────────────────
+def test_engine_list_all_and_scenario_visibility():
+    api = Api(engines_mod=_fake_engines())      # 用真实 scenarios 判可见
+    out = api.engine_list()
+    assert out['ok'] is True and out['default'] == 'vasp'
+    assert {e['key'] for e in out['engines']} == {'vasp', 'cp2k', 'gaussian', 'castep'}
+    vasp = next(e for e in out['engines'] if e['key'] == 'vasp')
+    assert vasp['experimental'] is False and vasp['visible'] is True
+    assert vasp['support_level'] == 'full' and 'bands' in vasp['task_keys']
+    cp2k = next(e for e in out['engines'] if e['key'] == 'cp2k')
+    assert cp2k['task_keys'] == ['relax', 'static', 'freq']
+    assert 'cutoff_ry' in cp2k['fields'] and 'cutoff_ev' not in cp2k['fields']
+    castep = next(e for e in out['engines'] if e['key'] == 'castep')
+    assert castep['boundaries'] == ['periodic']
+    # 分子化学场景:Gaussian 可见,CP2K/CASTEP 不在场景引擎白名单
+    out2 = api.engine_list('molecular')
+    vis = {e['key']: e['visible'] for e in out2['engines']}
+    assert vis['vasp'] is True and vis['gaussian'] is True
+    assert vis['cp2k'] is False and vis['castep'] is False
+    assert out2['default'] == 'gaussian'
+
+
+def test_engine_generate_builds_calcspec_and_writes(tmp_path):
+    calls = {}
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines(calls=calls))
+    out = api.engine_generate('cp2k', {
+        'poscar': str(poscar), 'task': 'relax', 'functional': 'PBE',
+        'cutoff_ry': 500, 'rel_cutoff_ry': 70, 'spin': True, 'charge': 0,
+        'periodic': True}, str(tmp_path / 'cp2k_out'))
+    assert out['ok'] is True and out['files'] == [str(tmp_path / 'cp2k_out') + '/cp2k.inp']
+    assert calls['engine'] == 'cp2k'
+    assert calls['spec']['cutoff_ev'] is None and calls['spec']['kpoints'] is None
+    assert calls['spec']['extras']['cutoff_ry'] == 500
+    assert calls['spec']['extras']['rel_cutoff_ry'] == 70
+    assert calls['spec']['spin'] is True
+
+
+def test_engine_generate_surfaces_validate_issues(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines(
+        validate_issues=['周期性计算必须指定 cutoff_ev(平面波截断能,eV);缺失或非正值。']))
+    out = api.engine_generate('cp2k', {'poscar': str(poscar), 'periodic': True},
+                              str(tmp_path / 'o'))
+    assert out['ok'] is True and out['issues']
+    assert 'CUTOFF（Ry）' in out['issues'][0] and 'cutoff_ev' not in str(out['issues'])
+
+
+def test_engine_generate_missing_poscar_error(tmp_path):
+    api = Api(engines_mod=_fake_engines())
+    out = api.engine_generate('cp2k', {'poscar': '/nope/POSCAR'}, str(tmp_path))
+    assert out['ok'] is False and '结构文件' in out['error']
+
+
+def test_engine_generate_rejects_unadvertised_task_and_castep_molecule(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines())
+    unsupported = api.engine_generate(
+        'cp2k', {'poscar': str(poscar), 'task': 'bands', 'periodic': True},
+        str(tmp_path / 'cp2k'))
+    assert unsupported['ok'] is False and '不支持任务' in unsupported['error']
+    molecule = api.engine_generate(
+        'castep', {'poscar': str(poscar), 'task': 'static', 'periodic': False},
+        str(tmp_path / 'castep'))
+    assert molecule['ok'] is False and '孤立分子' in molecule['error']
+
+
+def test_engine_generate_rejects_duplicate_vasp_adapter_path(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines())
+    generated = api.engine_generate(
+        'vasp', {'poscar': str(poscar), 'task': 'relax', 'cutoff_ev': 500},
+        str(tmp_path / 'out'))
+    preview = api.engine_preview(
+        'vasp', {'poscar': str(poscar), 'task': 'relax', 'cutoff_ev': 500})
+    assert generated['ok'] is False and '主工作流' in generated['error']
+    assert preview['ok'] is False and '四件套预览' in preview['error']
+
+
+def test_engine_nonequiv_report():
+    api = Api(engines_mod=_fake_engines(
+        nonequiv=['[cutoff] ENCUT 与 CUTOFF 不可换算', '[basis] 平面波 vs 高斯基组']))
+    out = api.engine_nonequiv('vasp', 'cp2k')
+    assert out['ok'] is True and len(out['report']) == 2
+    assert 'cutoff' in out['report'][0]
+
+
+# ── struct_load / struct_save / struct_fix_layers / struct_vacuum(真实往返) ───
+def test_struct_load_parses_elements_coords_lattice(tmp_path):
+    p = tmp_path / 'POSCAR'
+    p.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api()
+    out = api.struct_load(str(p))
+    assert out['ok'] is True
+    st = out['struct']
+    assert st['elements'] == ['Fe', 'Fe', 'O'] and st['natoms'] == 3
+    assert st['lattice'][2] == [0.0, 0.0, 20.0]
+    assert st['formula'] == 'Fe2 O1'
+    assert out['vacuum'] == 18.0                       # |c| 20 − z 跨度 2
+
+
+def test_struct_load_missing_file_error():
+    api = Api()
+    out = api.struct_load('/nope/POSCAR')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+def test_struct_save_roundtrip(tmp_path):
+    api = Api()
+    state = {'elements': ['Fe', 'Fe', 'O'],
+             'coords': [[0.0, 0.0, 5.0], [1.5, 1.5, 5.0], [0.75, 0.75, 7.0]],
+             'lattice': [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 20.0]]}
+    dest = tmp_path / 'out' / 'POSCAR'
+    out = api.struct_save(state, str(dest))
+    assert out['ok'] is True and os.path.isfile(str(dest))
+    # 写出的 POSCAR 应可被 struct_load 再解析回同样的元素/原子数(往返)
+    back = api.struct_load(str(dest))
+    assert back['ok'] is True and back['struct']['elements'] == ['Fe', 'Fe', 'O']
+    assert back['struct']['natoms'] == 3
+
+
+def test_struct_fix_layers_maps_flags_back_to_state_order():
+    # 状态原子序为 O(顶) 在前、Fe(底) 在后 —— 写出按物种分块会重排,须正确映射回状态序
+    api = Api()
+    state = {'elements': ['O', 'Fe', 'Fe'],
+             'coords': [[0.75, 0.75, 7.0], [0.0, 0.0, 5.0], [1.5, 1.5, 5.0]],
+             'lattice': [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 20.0]]}
+    out = api.struct_fix_layers(state, 1)
+    assert out['ok'] is True
+    # 底层是两个 Fe(状态 idx 1、2)→ 冻结;O(状态 idx 0,顶层)→ 不冻结
+    assert out['fixed'] == [False, True, True] and out['fixed_count'] == 2
+    assert out['vacuum'] == 18.0
+
+
+def test_struct_fix_layers_too_many_layers_error():
+    api = Api()
+    state = {'elements': ['Fe', 'Fe', 'O'],
+             'coords': [[0.0, 0.0, 5.0], [1.5, 1.5, 5.0], [0.75, 0.75, 7.0]],
+             'lattice': [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 20.0]]}
+    out = api.struct_fix_layers(state, 5)          # 5 ≥ 总层数 2
+    assert out['ok'] is False and out['fixed'] is None
+
+
+def test_struct_save_with_fixed_emits_selective_dynamics(tmp_path):
+    api = Api()
+    state = {'elements': ['Fe', 'Fe', 'O'],
+             'coords': [[0.0, 0.0, 5.0], [1.5, 1.5, 5.0], [0.75, 0.75, 7.0]],
+             'lattice': [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 20.0]],
+             'fixed': [True, True, False]}
+    dest = tmp_path / 'POSCAR'
+    out = api.struct_save(state, str(dest))
+    assert out['ok'] is True
+    text = dest.read_text(encoding='utf-8')
+    assert 'Selective dynamics' in text
+    assert text.count('F F F') == 2 and text.count('T T T') == 1
+
+
+def test_struct_vacuum_from_state():
+    api = Api()
+    state = {'elements': ['Fe', 'O'],
+             'coords': [[0.0, 0.0, 5.0], [0.75, 0.75, 7.0]],
+             'lattice': [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 20.0]]}
+    out = api.struct_vacuum(state)
+    assert out['ok'] is True and out['vacuum'] == 18.0
+
+
+def test_struct_vacuum_invalid_state_error():
+    api = Api()
+    out = api.struct_vacuum({'elements': ['Fe'], 'coords': [], 'lattice': []})
+    assert out['ok'] is False and out['vacuum'] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 分子计算全流程总装(结构建模分子区 / ②Gaussian 面板 / ③本机运行·文件管理 /
+# ⑤波函数分析 / ④AIMD 派生)—— 全部注入假件,零 rdkit/paramiko/Multiwfn/VMD。
+# ═══════════════════════════════════════════════════════════════════════════════
+def _fake_molbuild(*, ocsr_ret=None, svg_ret=None, s3d_ret=None, info_ret=None,
+                   export_ret=None, open_ret=None, check_ret=None, reimport_ret=None,
+                   probe_avail=True, calls=None):
+    """molbuild 束假件:ocsr/smiles3d/molinfo/external_editor 四子模块。"""
+    calls = calls if calls is not None else {}
+    ocsr = types.SimpleNamespace()
+    ocsr.probe = lambda: {'available': probe_avail,
+                          'detail': 'DECIMER 可用' if probe_avail else '未安装 DECIMER'}
+    ocsr.image_to_smiles = lambda p: (calls.__setitem__('img', p) or (
+        ocsr_ret if ocsr_ret is not None else
+        {'ok': True, 'smiles': 'c1ccccc1', 'elapsed_ms': 12.3, 'error': ''}))
+    ocsr.smiles_svg = lambda s, width=400, height=300: (
+        calls.__setitem__('svg', {'s': s, 'w': width, 'h': height}) or (
+            svg_ret if svg_ret is not None else
+            {'ok': True, 'svg': '<svg>ok</svg>', 'error': ''}))
+    smiles3d = types.SimpleNamespace()
+    smiles3d.smiles_to_3d = lambda s, forcefield='auto', **k: (
+        calls.__setitem__('s3d', {'s': s, 'ff': forcefield}) or (
+            s3d_ret if s3d_ret is not None else
+            {'ok': True, 'elements': ['C', 'O'], 'coords': [[0, 0, 0], [1.2, 0, 0]],
+             'formula': 'CO', 'n_atoms': 2, 'charge': 0, 'multiplicity_hint': 1,
+             'warnings': ['实际所用力场:MMFF'], 'error': ''}))
+    molinfo = types.SimpleNamespace()
+    molinfo.mol_summary = lambda els, coords=None, charge=0: (
+        info_ret if info_ret is not None else
+        {'formula': 'CO', 'n_atoms': len(els), 'n_electrons': 14, 'mass_amu': 28.01,
+         'charge': charge, 'suggested_multiplicity': 1, 'multiplicity_note': '按奇偶初猜'})
+    molinfo.formula = lambda els: '+'.join(sorted(set(els))) or 'X'
+    ee = types.SimpleNamespace()
+    ee.export_for_editor = lambda els, cds, fmt='xyz', workdir=None: (
+        calls.__setitem__('export', {'fmt': fmt, 'workdir': workdir}) or (
+            export_ret if export_ret is not None else
+            {'ok': True, 'path': '/tmp/vcstudio_external_edit.' + fmt,
+             'mtime': 111.0, 'error': ''}))
+    ee.open_with = lambda p, editor_exe=None: (
+        calls.__setitem__('open', {'p': p, 'exe': editor_exe}) or (
+            open_ret if open_ret is not None else {'ok': True, 'error': ''}))
+    ee.check_reimport = lambda p, last: (
+        check_ret if check_ret is not None else {'changed': True, 'mtime': 222.0})
+    ee.reimport = lambda p: (
+        reimport_ret if reimport_ret is not None else
+        {'ok': True, 'elements': ['C', 'O'], 'coords': [[0, 0, 0], [1.2, 0, 0]], 'error': ''})
+    return types.SimpleNamespace(ocsr=ocsr, smiles3d=smiles3d, molinfo=molinfo,
+                                 external_editor=ee)
+
+
+def _fake_gaussian(*, preview_text='#P B3LYP def2-SVP opt\n\n0 1\nC 0 0 0\n', calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.GAUSSIAN_TASKS = {
+        'opt': {'name_zh': '结构优化', 'note': 'Opt'},
+        'freq': {'name_zh': '频率分析', 'note': 'Freq'},
+        'td': {'name_zh': '激发态 TD-DFT', 'note': 'TD'},
+    }
+    m.PERIODIC_TABLE_GROUPS = {
+        'note': '基组建议仅供起点',
+        'categories': [{'key': 'transition_metal', 'label': '过渡金属',
+                        'basis_suggestion': ['LANL2DZ', 'SDD'], 'needs_ecp': True}],
+        'elements': [{'z': 1, 'symbol': 'H', 'category': 'main_group',
+                      'basis_suggestion': ['6-31G(d)']},
+                     {'z': 26, 'symbol': 'Fe', 'category': 'transition_metal',
+                      'basis_suggestion': ['LANL2DZ', 'SDD']}],
+    }
+    m.preview = lambda spec: (calls.__setitem__('spec', spec) or preview_text)
+    return m
+
+
+# ── mol_ocsr_probe ───────────────────────────────────────────────────────────
+def test_mol_ocsr_probe_available():
+    api = Api(molbuild_mods=_fake_molbuild(probe_avail=True))
+    out = api.mol_ocsr_probe()
+    assert out['ok'] is True and out['available'] is True and 'DECIMER' in out['detail']
+
+
+def test_mol_ocsr_probe_missing_reports_unavailable():
+    api = Api(molbuild_mods=_fake_molbuild(probe_avail=False))
+    out = api.mol_ocsr_probe()
+    assert out['ok'] is True and out['available'] is False
+
+
+def test_mol_ocsr_probe_exception_caught():
+    boom = types.SimpleNamespace(ocsr=types.SimpleNamespace(
+        probe=lambda: (_ for _ in ()).throw(RuntimeError('炸'))))
+    out = Api(molbuild_mods=boom).mol_ocsr_probe()
+    assert out['ok'] is False and '炸' in out['error']
+
+
+# ── mol_image_to_smiles ──────────────────────────────────────────────────────
+def test_mol_image_to_smiles_ok():
+    calls = {}
+    api = Api(molbuild_mods=_fake_molbuild(calls=calls))
+    out = api.mol_image_to_smiles('/tmp/mol.png')
+    assert out['ok'] is True and out['smiles'] == 'c1ccccc1' and out['elapsed_ms'] == 12.3
+    assert calls['img'] == '/tmp/mol.png'
+
+
+def test_mol_image_to_smiles_empty_path_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_image_to_smiles('   ')
+    assert out['ok'] is False and '图片' in out['error']
+
+
+def test_mol_image_to_smiles_driver_missing_passthrough():
+    api = Api(molbuild_mods=_fake_molbuild(
+        ocsr_ret={'ok': False, 'smiles': '', 'elapsed_ms': 0.0, 'error': '未安装 DECIMER'}))
+    out = api.mol_image_to_smiles('/tmp/x.png')
+    assert out['ok'] is False and 'DECIMER' in out['error']
+
+
+# ── mol_smiles_svg ───────────────────────────────────────────────────────────
+def test_mol_smiles_svg_ok():
+    calls = {}
+    api = Api(molbuild_mods=_fake_molbuild(calls=calls))
+    out = api.mol_smiles_svg('CCO', width=500, height=350)
+    assert out['ok'] is True and '<svg>' in out['svg']
+    assert calls['svg'] == {'s': 'CCO', 'w': 500, 'h': 350}
+
+
+def test_mol_smiles_svg_empty_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_smiles_svg('')
+    assert out['ok'] is False and 'SMILES' in out['error']
+
+
+# ── mol_smiles_to_3d ─────────────────────────────────────────────────────────
+def test_mol_smiles_to_3d_builds_struct():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_smiles_to_3d('CO', 'mmff')
+    assert out['ok'] is True
+    st = out['struct']
+    assert st['elements'] == ['C', 'O'] and st['natoms'] == 2 and st['formula'] == 'CO'
+    assert st['lattice'][0][0] == 15.0                 # 立方盒边长
+    assert out['charge'] == 0 and out['multiplicity_hint'] == 1
+    assert any('MMFF' in w for w in out['warnings'])
+
+
+def test_mol_smiles_to_3d_empty_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_smiles_to_3d('')
+    assert out['ok'] is False and out['struct'] is None
+
+
+def test_mol_smiles_to_3d_rdkit_missing():
+    api = Api(molbuild_mods=_fake_molbuild(
+        s3d_ret={'ok': False, 'elements': [], 'coords': [], 'formula': '', 'n_atoms': 0,
+                 'charge': 0, 'multiplicity_hint': None, 'warnings': [],
+                 'error': '未安装 rdkit'}))
+    out = api.mol_smiles_to_3d('CCO')
+    assert out['ok'] is False and 'rdkit' in out['error'] and out['struct'] is None
+
+
+# ── mol_info ─────────────────────────────────────────────────────────────────
+def test_mol_info_ok():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_info(['C', 'O'], [[0, 0, 0], [1.2, 0, 0]], 0)
+    assert out['ok'] is True and out['n_electrons'] == 14
+    assert out['suggested_multiplicity'] == 1 and out['formula'] == 'CO'
+
+
+def test_mol_info_empty_elements_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_info([])
+    assert out['ok'] is False and '原子' in out['error']
+
+
+def test_mol_info_unregistered_element_caught():
+    boom = types.SimpleNamespace(molinfo=types.SimpleNamespace(
+        mol_summary=lambda els, coords=None, charge=0:
+        (_ for _ in ()).throw(ValueError('未登记元素'))))
+    out = Api(molbuild_mods=boom).mol_info(['Xx'])
+    assert out['ok'] is False and '未登记' in out['error']
+
+
+# ── mol_export_editor / mol_open_with ────────────────────────────────────────
+def test_mol_export_editor_ok():
+    calls = {}
+    api = Api(molbuild_mods=_fake_molbuild(calls=calls))
+    out = api.mol_export_editor(['C', 'O'], [[0, 0, 0], [1.2, 0, 0]], 'mol', '/wd')
+    assert out['ok'] is True and out['path'].endswith('.mol') and out['mtime'] == 111.0
+    assert calls['export'] == {'fmt': 'mol', 'workdir': '/wd'}
+
+
+def test_mol_export_editor_bad_fmt_passthrough():
+    api = Api(molbuild_mods=_fake_molbuild(
+        export_ret={'ok': False, 'path': None, 'mtime': None, 'error': '未知导出格式'}))
+    out = api.mol_export_editor(['C'], [[0, 0, 0]], 'pdb')
+    assert out['ok'] is False and '格式' in out['error']
+
+
+def test_mol_open_with_ok():
+    calls = {}
+    api = Api(molbuild_mods=_fake_molbuild(calls=calls))
+    out = api.mol_open_with('/tmp/x.xyz', '/usr/bin/avogadro')
+    assert out['ok'] is True and calls['open']['exe'] == '/usr/bin/avogadro'
+
+
+def test_mol_open_with_empty_path_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_open_with('')
+    assert out['ok'] is False and '路径' in out['error']
+
+
+# ── mol_check_reimport / mol_reimport ────────────────────────────────────────
+def test_mol_check_reimport_changed():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_check_reimport('/tmp/edit.xyz', 100.0)
+    assert out['ok'] is True and out['changed'] is True and out['mtime'] == 222.0
+
+
+def test_mol_check_reimport_empty_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_check_reimport('')
+    assert out['ok'] is False and out['changed'] is False
+
+
+def test_mol_reimport_builds_struct(tmp_path):
+    f = tmp_path / 'edit.xyz'
+    f.write_text('2\n\nC 0 0 0\nO 1.2 0 0\n', encoding='utf-8')
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_reimport(str(f))
+    assert out['ok'] is True and out['struct']['elements'] == ['C', 'O']
+    assert out['struct']['natoms'] == 2
+
+
+def test_mol_reimport_missing_file_error():
+    api = Api(molbuild_mods=_fake_molbuild())
+    out = api.mol_reimport('/nope/edit.xyz')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+# ── gauss_tasks / gauss_periodic_table ───────────────────────────────────────
+def test_gauss_tasks_shape():
+    api = Api(gaussian_mod=_fake_gaussian())
+    out = api.gauss_tasks()
+    assert out['ok'] is True
+    keys = {t['key'] for t in out['tasks']}
+    assert 'td' in keys
+    td = next(t for t in out['tasks'] if t['key'] == 'td')
+    assert td['name'] == '激发态 TD-DFT'
+
+
+def test_gauss_periodic_table_shape():
+    api = Api(gaussian_mod=_fake_gaussian())
+    out = api.gauss_periodic_table()
+    assert out['ok'] is True
+    syms = {e['symbol'] for e in out['table']['elements']}
+    assert 'Fe' in syms
+    fe = next(e for e in out['table']['elements'] if e['symbol'] == 'Fe')
+    assert 'LANL2DZ' in fe['basis_suggestion']
+
+
+def test_gauss_tasks_exception_caught():
+    class _Boom:
+        @property
+        def GAUSSIAN_TASKS(self):
+            raise RuntimeError('炸')
+    out = Api(gaussian_mod=_Boom()).gauss_tasks()
+    assert out['ok'] is False and '炸' in out['error']
+
+
+# ── engine_preview ───────────────────────────────────────────────────────────
+def test_engine_preview_gaussian_text_and_chars(tmp_path):
+    calls = {}
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines(), gaussian_mod=_fake_gaussian(calls=calls))
+    out = api.engine_preview('gaussian', {
+        'poscar': str(poscar), 'periodic': False, 'functional': 'B3LYP',
+        'extras': {'gaussian_task': 'opt', 'basis': 'def2-SVP'}})
+    assert out['ok'] is True and out['chars'] == len(out['text'])
+    assert 'B3LYP' in out['text']
+    assert calls['spec'].extras['gaussian_task'] == 'opt'   # extras 透传进 CalcSpec
+
+
+def test_engine_preview_generic_roundtrip(tmp_path):
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+
+    def _writer(spec, out):
+        p = os.path.join(out, 'cp2k.inp')
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write('&GLOBAL\n  RUN_TYPE GEO_OPT\n&END\n')
+        return {'files': [p], 'warnings': ['需自备 GTH 赝势']}
+    eng = _fake_engines()
+    eng.get_backend = lambda name: types.SimpleNamespace(generate_inputs=_writer)
+    api = Api(engines_mod=eng)
+    out = api.engine_preview('cp2k', {'poscar': str(poscar), 'periodic': True,
+                                      'cutoff_ev': 500})
+    assert out['ok'] is True and 'RUN_TYPE' in out['text'] and out['chars'] > 0
+    assert '需自备 GTH 赝势' in out['warnings']
+
+
+def test_engine_preview_missing_structure_error():
+    api = Api(engines_mod=_fake_engines(), gaussian_mod=_fake_gaussian())
+    out = api.engine_preview('gaussian', {'poscar': '/nope/POSCAR'})
+    assert out['ok'] is False and '结构文件' in out['error']
+
+
+def test_engine_generate_passes_extras(tmp_path):
+    calls = {}
+    poscar = tmp_path / 'POSCAR'
+    poscar.write_text(_EDITOR_POSCAR, encoding='utf-8')
+    api = Api(engines_mod=_fake_engines(calls=calls))
+    out = api.engine_generate('gaussian', {
+        'poscar': str(poscar), 'periodic': False,
+        'extras': {'gaussian_task': 'freq', 'nproc': 8}}, str(tmp_path / 'g_out'))
+    assert out['ok'] is True
+    assert calls['spec']['extras'] == {'gaussian_task': 'freq', 'nproc': 8}
+
+
+# ── quick_submit_build ───────────────────────────────────────────────────────
+def _fake_quick_submit(*, jobs=None, skipped=None, ok=True, error=None, calls=None,
+                       scan_items=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _scan(paths, *, shared_incar=''):
+        calls['scan'] = {'paths': list(paths), 'shared_incar': shared_incar}
+        items = list(scan_items or [])
+        return {'ok': True, 'items': items,
+                'summary': {'total': len(items),
+                            'ready': sum(bool(x.get('can_build')) for x in items)},
+                'error': None}
+
+    def _build(files, out_root, job_prefix='', **kwargs):
+        calls['build'] = {'files': list(files), 'out_root': out_root,
+                          'prefix': job_prefix, **kwargs}
+        return {'ok': ok, 'jobs': list(jobs if jobs is not None else
+                [{'dir': out_root + '/benzene', 'name': 'benzene', 'engine': 'gaussian',
+                  'files': ['benzene.gjf']}]),
+                'skipped': list(skipped or []), 'preflight': {'summary': {'total': 1}},
+                'error': error}
+    m.scan_inputs = _scan
+    m.build_quick_jobs = _build
+    m.submit_hint = lambda engine: f'{engine}-cmd-hint'
+    return m
+
+
+def test_quick_submit_scan_forwards_shared_incar():
+    calls = {}
+    item = {'path': '/batch/a', 'can_build': True}
+    api = Api(quick_submit_mod=_fake_quick_submit(scan_items=[item], calls=calls))
+
+    out = api.quick_submit_scan(['/batch'], '/common/INCAR')
+
+    assert out['ok'] is True and out['items'] == [item]
+    assert calls['scan'] == {'paths': ['/batch'], 'shared_incar': '/common/INCAR'}
+
+
+def test_quick_submit_build_registers_and_hints(tmp_path):
+    registered = []
+    api = Api(quick_submit_mod=_fake_quick_submit(),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.quick_submit_build(['/x/benzene.gjf'], str(tmp_path))
+    assert out['ok'] is True and len(out['jobs']) == 1
+    j = out['jobs'][0]
+    assert j['engine'] == 'gaussian' and j['hint'] == 'gaussian-cmd-hint'
+    assert j['registered'] is True and registered == [j['dir']]
+
+
+def test_quick_submit_build_forwards_shared_generation_options(tmp_path):
+    calls = {}
+    api = Api(quick_submit_mod=_fake_quick_submit(calls=calls),
+              ledger_mod=_fake_ledger_register([]),
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/configured/paw'}))
+
+    out = api.quick_submit_build(
+        ['/batch'], str(tmp_path), 'p_', '/common/INCAR', '', 'molecule')
+
+    assert out['ok'] is True and out['preflight']['summary']['total'] == 1
+    built = calls['build']
+    assert built['shared_incar'] == '/common/INCAR'
+    assert built['lib_root'] == '/configured/paw'
+    assert built['calc_type'] == 'molecule' and built['prefix'] == 'p_'
+
+
+def test_quick_submit_build_reports_skipped(tmp_path):
+    api = Api(quick_submit_mod=_fake_quick_submit(
+        jobs=[], skipped=[{'file': '/x/foo.txt', 'reason': '无法识别引擎'}]),
+        ledger_mod=_fake_ledger_register([]))
+    out = api.quick_submit_build(['/x/foo.txt'], str(tmp_path))
+    assert out['ok'] is True and out['jobs'] == []
+    assert out['skipped'][0]['reason'] == '无法识别引擎'
+
+
+def test_quick_submit_build_no_files_error():
+    api = Api(quick_submit_mod=_fake_quick_submit())
+    out = api.quick_submit_build([], '/root')
+    assert out['ok'] is False and '输入文件' in out['error']
+
+
+def test_quick_submit_build_no_root_error():
+    api = Api(quick_submit_mod=_fake_quick_submit())
+    out = api.quick_submit_build(['/x/a.gjf'], '')
+    assert out['ok'] is False and '输出根目录' in out['error']
+
+
+# ── jobs_cancel_batch ────────────────────────────────────────────────────────
+def _fake_batch_cancel(*, ok=True, cancelled=None, failed=None, error=None,
+                       needs_trust=False, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _cancel(profile, jobs, *, password=None, trust_new=False):
+        calls['cancel'] = {'jobs': list(jobs), 'password': password, 'trust_new': trust_new}
+        return {'ok': ok, 'cancelled': list(cancelled or ['12345']),
+                'failed': list(failed or []), 'error': error, 'needs_trust': needs_trust}
+    m.cancel_batch = _cancel
+    return m
+
+
+def test_jobs_cancel_batch_ok():
+    calls = {}
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              batch_ops_mod=_fake_batch_cancel(calls=calls))
+    out = api.jobs_cancel_batch(['/j/a', '/j/b'], 'c1', None, False)
+    assert out['ok'] is True and out['cancelled'] == ['12345']
+    assert calls['cancel']['jobs'] == ['/j/a', '/j/b']
+
+
+def test_jobs_cancel_batch_no_dirs_error():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), batch_ops_mod=_fake_batch_cancel())
+    out = api.jobs_cancel_batch([], 'c1', None)
+    assert out['ok'] is False and '取消' in out['error']
+
+
+def test_jobs_cancel_batch_needs_password():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
+    secrets = types.SimpleNamespace(get_password=lambda n: None, set_password=lambda n, p: None)
+    api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets,
+              batch_ops_mod=_fake_batch_cancel())
+    out = api.jobs_cancel_batch(['/j/a'], 'c1', None)
+    assert out['error'] == 'NEED_PASSWORD'
+
+
+# ── local_run_start / status / cancel ────────────────────────────────────────
+def _fake_local_runner(*, start_ret=None, status_ret=None, cancel_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+
+    class _LocalJob:
+        def __init__(self, cmd, cwd, log_file, env=None):
+            self.cmd, self.cwd, self.log_file, self.env = cmd, cwd, log_file, env
+            calls['job'] = {'cmd': cmd, 'cwd': cwd, 'log_file': log_file}
+    m = types.SimpleNamespace()
+    m.LocalJob = _LocalJob
+    m.start = lambda job: (start_ret if start_ret is not None else
+                           {'ok': True, 'pid': 4242, 'error': ''})
+    m.status = lambda d: (status_ret if status_ret is not None else
+                          {'state': 'RUNNING', 'pid': 4242, 'exit_code': None,
+                           'log_tail': '... running ...'})
+    m.cancel = lambda d: (cancel_ret if cancel_ret is not None else {'ok': True, 'error': ''})
+    return m
+
+
+def test_local_run_start_builds_cmd_from_input(tmp_path):
+    (tmp_path / 'benzene.gjf').write_text('#opt', encoding='utf-8')
+    calls = {}
+    api = Api(local_runner_mod=_fake_local_runner(calls=calls))
+    out = api.local_run_start(str(tmp_path), 'g16')
+    assert out['ok'] is True and out['pid'] == 4242
+    assert out['cmd'] == ['g16', 'benzene.gjf']          # 末尾追加识别到的输入文件
+    assert calls['job']['cwd'] == str(tmp_path)
+
+
+def test_local_run_start_placeholder_template(tmp_path):
+    (tmp_path / 'mol.com').write_text('#sp', encoding='utf-8')
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_start(str(tmp_path), 'g09 {input} {output}')
+    assert out['ok'] is True and out['cmd'] == ['g09', 'mol.com', 'mol.log']
+
+
+def test_local_run_start_missing_dir_error():
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_start('/no/such/dir', 'g16')
+    assert out['ok'] is False and '目录' in out['error']
+
+
+def test_local_run_start_missing_template_error(tmp_path):
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_start(str(tmp_path), '  ')
+    assert out['ok'] is False and '命令模板' in out['error']
+
+
+def test_local_run_status_ok(tmp_path):
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_status(str(tmp_path))
+    assert out['ok'] is True and out['state'] == 'RUNNING' and out['pid'] == 4242
+
+
+def test_local_run_status_missing_dir_error():
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_status('')
+    assert out['ok'] is False and out['state'] == 'NOT_STARTED'
+
+
+def test_local_run_cancel_ok(tmp_path):
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_cancel(str(tmp_path))
+    assert out['ok'] is True
+
+
+def test_local_run_cancel_missing_dir_error():
+    api = Api(local_runner_mod=_fake_local_runner())
+    out = api.local_run_cancel('')
+    assert out['ok'] is False
+
+
+# ── remote_ls / remote_fetch_file ────────────────────────────────────────────
+class _FakeConnectError(Exception):
+    def __init__(self, message, needs_trust=False, *, fingerprint='', algorithm='', host=''):
+        super().__init__(message)
+        self.needs_trust = needs_trust
+        self.fingerprint = fingerprint
+        self.algorithm = algorithm
+        self.host = host
+
+
+def _fake_connection(*, entries=None, connect_boom=None, calls=None, exec_ret=None):
+    """connection 假件:open_client → (client, jump);client.open_sftp/exec_command。"""
+    calls = calls if calls is not None else {}
+
+    class _SFTP:
+        def listdir_attr(self, path):
+            calls['ls_path'] = path
+            attrs = []
+            for e in (entries if entries is not None else
+                      [('run.log', 2048, 1700000000, 0o100644),
+                       ('OUTCAR', 4096, 1700000100, 0o100644),
+                       ('scratch', 0, 1700000200, 0o040755)]):
+                attrs.append(types.SimpleNamespace(
+                    filename=e[0], st_size=e[1], st_mtime=e[2], st_mode=e[3]))
+            return attrs
+
+        def get(self, remote, local):
+            calls['get'] = {'remote': remote, 'local': local}
+            with open(local, 'w', encoding='utf-8') as f:
+                f.write('fetched')
+
+        def put(self, local, remote):
+            calls.setdefault('put', []).append({'local': local, 'remote': remote})
+
+        def open(self, path, mode):
+            calls.setdefault('scripts', []).append(path)
+            return _SFTPFile()
+
+        def close(self):
+            calls['sftp_closed'] = True
+
+    class _SFTPFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def write(self, data):
+            calls.setdefault('script_text', []).append(data)
+
+    class _Chan:
+        def recv_exit_status(self):
+            return (exec_ret or {}).get('code', 0)
+
+    class _Out:
+        channel = _Chan()
+
+        def read(self):
+            return (exec_ret or {}).get('stdout', b' minima found\n')
+
+    class _Client:
+        def open_sftp(self):
+            return _SFTP()
+
+        def exec_command(self, cmd, timeout=None):
+            calls.setdefault('exec', []).append(cmd)
+            return None, _Out(), None
+
+    m = types.SimpleNamespace()
+    m.ConnectError = _FakeConnectError
+
+    def _open(prof, pw, trust_new=False):
+        calls['open'] = {'prof': prof.name, 'trust_new': trust_new}
+        if connect_boom:
+            raise connect_boom
+        return _Client(), None
+    m.open_client = _open
+    m.close_quiet = lambda *cs: calls.__setitem__('closed', True)
+    return m
+
+
+def test_remote_ls_lists_entries(tmp_path):
+    calls = {}
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              connection_mod=_fake_connection(calls=calls))
+    out = api.remote_ls('c1', None, '/home/me/run')
+    assert out['ok'] is True and calls['ls_path'] == '/home/me/run'
+    names = [e['name'] for e in out['entries']]
+    assert 'scratch' in names and 'OUTCAR' in names
+    scratch = next(e for e in out['entries'] if e['name'] == 'scratch')
+    assert scratch['is_dir'] is True and out['entries'][0]['is_dir'] is True  # 目录排前
+
+
+def test_remote_ls_connect_error_needs_trust():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              connection_mod=_fake_connection(
+                  connect_boom=_FakeConnectError(
+                      '未知指纹', needs_trust=True, fingerprint='SHA256:abc',
+                      algorithm='ssh-ed25519', host='h')))
+    out = api.remote_ls('c1', None, '.')
+    assert out['ok'] is False and out['needs_trust'] is True and '指纹' in out['error']
+    assert (out['host'], out['fingerprint'], out['algorithm']) == (
+        'h', 'SHA256:abc', 'ssh-ed25519')
+
+
+def test_remote_ls_needs_password():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='password')}
+    secrets = types.SimpleNamespace(get_password=lambda n: None, set_password=lambda n, p: None)
+    api = Api(profiles_mod=_fake_profiles(store), secrets_mod=secrets,
+              connection_mod=_fake_connection())
+    out = api.remote_ls('c1', None, '.')
+    assert out['error'] == 'NEED_PASSWORD'
+
+
+def test_remote_fetch_file_downloads(tmp_path):
+    calls = {}
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              connection_mod=_fake_connection(calls=calls))
+    out = api.remote_fetch_file('c1', None, '/home/me/run/OUTCAR', str(tmp_path))
+    assert out['ok'] is True
+    assert out['local_path'] == os.path.join(str(tmp_path), 'OUTCAR')
+    assert os.path.isfile(out['local_path'])
+    assert calls['get']['remote'] == '/home/me/run/OUTCAR'
+
+
+def test_remote_fetch_file_missing_remote_error():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), connection_mod=_fake_connection())
+    out = api.remote_fetch_file('c1', None, '', '/tmp')
+    assert out['ok'] is False and '远端文件' in out['error']
+
+
+def test_remote_fetch_file_missing_local_error():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), connection_mod=_fake_connection())
+    out = api.remote_fetch_file('c1', None, '/r/OUTCAR', '')
+    assert out['ok'] is False and '本地' in out['error']
+
+
+# ── 波函数分析:probe / scenes / run / render / extrema / run_remote ───────────
+def _fake_multiwfn(*, run_ret=None, probe_avail=True, extrema=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.ANALYSES = {
+        'esp_extrema': {'name': 'ESP 表面极值点', 'stdin_script': lambda p: '12\n0\n',
+                        'outputs': (), 'note': 'ESP 极值'},
+        'homo_lumo_cube': {'name': 'HOMO/LUMO 轨道 cube',
+                           'stdin_script': lambda p: '5\n4\nHOMO\n', 'outputs': ('orbital.cub',),
+                           'note': '轨道 cube'},
+    }
+    m.probe = lambda exe=None: {'available': probe_avail, 'path': '/opt/Multiwfn' if probe_avail
+                                else None, 'detail': 'ok' if probe_avail else '未找到 Multiwfn'}
+
+    def _run(wf, key, exe=None, workdir=None, params=None):
+        calls.setdefault('runs', []).append({'wf': wf, 'key': key, 'exe': exe})
+        if run_ret is not None:
+            return dict(run_ret)
+        return {'ok': True, 'outputs': [f'{key}_orbital.cub'] if 'cube' in key else [],
+                'stdout_tail': ' Minima\n 1  0.0 0.0 0.0  -12.3\n', 'elapsed_s': 1.2,
+                'error': ''}
+    m.run = _run
+    m.extrema_parse = lambda text: (extrema if extrema is not None else
+                                    {'minima': [{'value_kcal': -12.3, 'xyz': [0.0, 0.0, 0.0]}],
+                                     'maxima': []})
+    return m
+
+
+def _fake_vmd(*, render_ret=None, probe_avail=True, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.SCENES = {
+        'esp_surface': {'name': 'ESP 着色分子表面', 'files': ('density', 'esp'),
+                        'note': 'ESP 表面'},
+        'orbital': {'name': '分子轨道等值面', 'files': ('cube',), 'note': '轨道'},
+    }
+    m.probe = lambda exe=None: {'available': probe_avail, 'path': '/opt/vmd' if probe_avail
+                                else None, 'detail': 'ok' if probe_avail else '未找到 VMD'}
+
+    def _render(scene, files, out_png, exe=None, params=None, timeout=600):
+        calls['render'] = {'scene': scene, 'files': files, 'out': out_png, 'exe': exe}
+        if render_ret is not None:
+            return dict(render_ret)
+        return {'ok': True, 'png': out_png, 'tcl': 'mol new ...', 'stdout_tail': 'done',
+                'error': ''}
+    m.render = _render
+    return m
+
+
+def test_wavefn_probe_all_tools():
+    api = Api(multiwfn_mod=_fake_multiwfn(probe_avail=True),
+              vmd_mod=_fake_vmd(probe_avail=False),
+              config_mod=_fake_config(cfg={}))
+    out = api.wavefn_probe(['multiwfn', 'vmd', 'gaussview'])
+    assert out['ok'] is True
+    assert out['tools']['multiwfn']['available'] is True
+    assert out['tools']['vmd']['available'] is False
+    assert out['tools']['gaussview']['available'] is False   # PATH 无 gview,确定性未找到
+
+
+def test_wavefn_probe_uses_configured_path():
+    calls = {}
+    mw = _fake_multiwfn(calls=calls)
+    api = Api(multiwfn_mod=mw, vmd_mod=_fake_vmd(),
+              config_mod=_fake_config(cfg={'tool_paths': {'multiwfn': '/custom/Multiwfn'}}))
+    api.wavefn_probe(['multiwfn'])
+    # probe 被调用(available 依赖 fake),配置路径读取无异常
+    out = api.wavefn_probe(['multiwfn'])
+    assert out['ok'] is True
+
+
+def test_wavefn_scenes_catalog():
+    api = Api(multiwfn_mod=_fake_multiwfn(), vmd_mod=_fake_vmd())
+    out = api.wavefn_scenes()
+    assert out['ok'] is True
+    akeys = {a['key'] for a in out['analyses']}
+    skeys = {s['key'] for s in out['scenes']}
+    assert 'esp_extrema' in akeys and 'esp_surface' in skeys
+    esp = next(s for s in out['scenes'] if s['key'] == 'esp_surface')
+    assert esp['files'] == ['density', 'esp']
+
+
+def test_wavefn_run_multiple_analyses(tmp_path):
+    calls = {}
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    api = Api(multiwfn_mod=_fake_multiwfn(calls=calls), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run(str(wf), ['esp_extrema', 'homo_lumo_cube'])
+    assert out['ok'] is True and len(out['results']) == 2
+    esp = out['results'][0]
+    assert esp['analysis'] == 'esp_extrema' and 'extrema' in esp
+    assert esp['extrema']['minima'][0]['value_kcal'] == -12.3
+    assert [r['key'] for r in calls['runs']] == ['esp_extrema', 'homo_lumo_cube']
+
+
+def test_wavefn_run_missing_file_error():
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run('', ['esp_extrema'])
+    assert out['ok'] is False and '波函数文件' in out['error']
+
+
+def test_wavefn_run_no_analyses_error(tmp_path):
+    wf = tmp_path / 'mol.wfn'
+    wf.write_text('x', encoding='utf-8')
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run(str(wf), [])
+    assert out['ok'] is False and '分析项' in out['error']
+
+
+def test_wavefn_run_missing_multiwfn_returns_script(tmp_path):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    mw = _fake_multiwfn(run_ret={'ok': False, 'outputs': [], 'stdout_tail': '',
+                                 'elapsed_s': 0.0, 'script': '12\n0\n',
+                                 'error': '未找到 Multiwfn'})
+    api = Api(multiwfn_mod=mw, config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run(str(wf), ['esp_extrema'])
+    assert out['ok'] is False and out['results'][0]['script'] == '12\n0\n'
+    assert 'Multiwfn' in out['results'][0]['error']
+
+
+def test_wavefn_render_ok(tmp_path):
+    calls = {}
+    api = Api(vmd_mod=_fake_vmd(calls=calls), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_render('esp_surface', {'density': '/d.cub', 'esp': '/e.cub'},
+                            str(tmp_path / 'esp.png'))
+    assert out['ok'] is True and out['png'].endswith('esp.png')
+    assert calls['render']['scene'] == 'esp_surface'
+
+
+def test_wavefn_render_missing_scene_error():
+    api = Api(vmd_mod=_fake_vmd(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_render('', {}, '/tmp/x.png')
+    assert out['ok'] is False and '场景' in out['error']
+
+
+def test_wavefn_render_vmd_missing_returns_tcl(tmp_path):
+    vmd = _fake_vmd(render_ret={'ok': False, 'png': None, 'tcl': 'mol new xxx',
+                                'stdout_tail': '', 'error': '未找到 VMD'})
+    api = Api(vmd_mod=vmd, config_mod=_fake_config(cfg={}))
+    out = api.wavefn_render('orbital', {'cube': '/o.cub'}, str(tmp_path / 'o.png'))
+    assert out['ok'] is False and out['tcl'] == 'mol new xxx'
+
+
+def test_wavefn_extrema_parses(tmp_path):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_extrema(str(wf), 'esp_extrema')
+    assert out['ok'] is True and out['minima'][0]['value_kcal'] == -12.3
+    assert out['maxima'] == []
+
+
+def test_wavefn_extrema_bad_kind_error(tmp_path):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_extrema(str(wf), 'nci_rdg')
+    assert out['ok'] is False and '极值类型' in out['error']
+
+
+def test_wavefn_run_remote_experimental_happy(tmp_path):
+    calls = {}
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store),
+              connection_mod=_fake_connection(calls=calls, exec_ret={'code': 0}),
+              multiwfn_mod=_fake_multiwfn())
+    out = api.wavefn_run_remote(str(wf), ['esp_extrema'], 'c1', None, '/scratch/wfn')
+    assert out['ok'] is True and out['experimental'] is True
+    assert out['results'][0]['ok'] is True
+    assert calls['put'][0]['remote'].endswith('mol.fchk')       # 上传波函数
+    assert any('Multiwfn' in c for c in calls['exec'])          # 远端执行
+
+
+def test_wavefn_run_remote_missing_file_error():
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), connection_mod=_fake_connection(),
+              multiwfn_mod=_fake_multiwfn())
+    out = api.wavefn_run_remote('/nope.fchk', ['esp_extrema'], 'c1', None, '/scratch')
+    assert out['ok'] is False and out['experimental'] is True and '不存在' in out['error']
+
+
+def test_wavefn_run_remote_missing_remote_dir_error(tmp_path):
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    store = {'c1': ClusterProfile(name='c1', hostname='h', auth='key')}
+    api = Api(profiles_mod=_fake_profiles(store), connection_mod=_fake_connection(),
+              multiwfn_mod=_fake_multiwfn())
+    out = api.wavefn_run_remote(str(wf), ['esp_extrema'], 'c1', None, '')
+    assert out['ok'] is False and '远端工作目录' in out['error']
+
+
+# ── tool_paths_get / tool_paths_set ──────────────────────────────────────────
+def test_tool_paths_roundtrip():
+    backing = {}
+    api = Api(config_mod=_fake_config_rw(backing))
+    out = api.tool_paths_set({'multiwfn': '/opt/Multiwfn', 'vmd': '  /opt/vmd  ',
+                              'blank': ''})
+    assert out['ok'] is True and out['paths']['vmd'] == '/opt/vmd'
+    got = api.tool_paths_get()
+    assert got['ok'] is True and got['paths']['multiwfn'] == '/opt/Multiwfn'
+
+
+def test_tool_paths_set_merges_existing():
+    backing = {'tool_paths': {'multiwfn': '/old/Multiwfn'}}
+    api = Api(config_mod=_fake_config_rw(backing))
+    api.tool_paths_set({'vmd': '/opt/vmd'})
+    got = api.tool_paths_get()
+    assert got['paths']['multiwfn'] == '/old/Multiwfn' and got['paths']['vmd'] == '/opt/vmd'
+
+
+def test_tool_paths_get_empty_default():
+    api = Api(config_mod=_fake_config(cfg={}))
+    out = api.tool_paths_get()
+    assert out['ok'] is True and out['paths'] == {}
+
+
+# ── derive_aimd ──────────────────────────────────────────────────────────────
+def _fake_aimd(*, changes=None, warnings=None, calls=None, boom=None, ok=True, error=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(src_dir, out_dir, **kw):
+        calls['build'] = {'src_dir': src_dir, 'out_dir': out_dir, **kw}
+        if boom:
+            raise boom
+        return {'ok': ok, 'job_dir': out_dir,
+                'changes': list(changes if changes is not None else
+                                [{'key': 'IBRION', 'action': 'replace', 'old': '2',
+                                  'new': '0', 'reason': 'MD'}]),
+                'warnings': list(warnings or ['Γ 点单点']), 'error': error}
+    m.build_aimd_job = _build
+    return m
+
+
+def test_derive_aimd_derives_and_registers(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(aimd_mod=_fake_aimd(calls=calls), ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_aimd(str(tmp_path), ensemble='nvt', temp_k=300, steps=10000,
+                          potim_fs=1.0, temp_end_k=350, encut=350)
+    assert out['ok'] is True and out['job_dir'].endswith(
+        os.path.basename(str(tmp_path)) + '_aimd')
+    assert out['changes'][0]['key'] == 'IBRION'
+    assert registered == [out['job_dir']]
+    assert calls['build']['ensemble'] == 'nvt' and calls['build']['temp_end_k'] == 350.0
+    assert calls['build']['encut'] == 350.0
+
+
+def test_derive_aimd_omits_optional_when_blank(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(aimd_mod=_fake_aimd(calls=calls), ledger_mod=_fake_ledger_register([]))
+    api.derive_aimd(str(tmp_path), ensemble='nve', temp_k=300)
+    assert 'temp_end_k' not in calls['build'] and 'encut' not in calls['build']
+
+
+def test_derive_aimd_missing_dir_error():
+    api = Api(aimd_mod=_fake_aimd())
+    out = api.derive_aimd('/no/such/dir')
+    assert out['ok'] is False and out['job_dir'] is None and '目录' in out['error']
+
+
+def test_derive_aimd_engine_failure_caught(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(aimd_mod=_fake_aimd(ok=False, error='源目录缺 INCAR'),
+              ledger_mod=_fake_ledger_register([]))
+    out = api.derive_aimd(str(tmp_path))
+    assert out['ok'] is False and 'INCAR' in out['error']
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v3.1 GUI 总装:全 DFT 任务目录 / 一键出图管线 / AI 三能力 / starpivot 对齐
+# ══════════════════════════════════════════════════════════════════════════════
+def _fake_task_catalog():
+    m = types.SimpleNamespace()
+    m.CATEGORIES = ('基础', '电子结构', '热力学与动力学', '性质', '收敛与校验')
+    m.list_catalog = lambda category=None: [
+        {'key': 'relax', 'name_zh': '结构优化', 'category': '基础',
+         'description': '弛豫', 'requires': 'POSCAR', 'outputs': 'CONTCAR', 'figure': None},
+        {'key': 'eos', 'name_zh': '状态方程', 'category': '性质',
+         'description': 'BM3', 'requires': '平衡结构', 'outputs': 'E-V', 'figure': 'eos'},
+    ]
+    return m
+
+
+def _fake_u_library():
+    m = types.SimpleNamespace()
+    m.suggest_u = lambda els: [{'element': e, 'u': 4.0, 'l': 2, 'orbital': 'd',
+                                'source': 'MP', 'note': '敏感性测试'} for e in els if e in ('Fe', 'Co')]
+    m.ldau_keys = lambda sugg, order: {'LDAU': True, 'LDAUTYPE': 2,
+                                       'LDAUL': ' '.join('2' if e in {s['element'] for s in sugg} else '-1' for e in order)}
+    return m
+
+
+def _fake_conv_scan(*, calls=None, series=None, analyze_ret=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _series_ret(out_root):
+        s = series if series is not None else [
+            {'value': 400, 'label': '400 eV', 'dir': os.path.join(out_root, 'encut_400')},
+            {'value': 500, 'label': '500 eV', 'dir': os.path.join(out_root, 'encut_500')}]
+        return {'out_root': out_root, 'dirs': {}, 'series': s, 'results': {}, 'warnings': []}
+    m.build_encut_series = lambda src, out_root, values=None: (
+        calls.__setitem__('encut', {'src': src, 'values': values}) or _series_ret(out_root))
+    m.build_kmesh_series = lambda src, out_root, meshes: (
+        calls.__setitem__('kmesh', {'meshes': meshes}) or _series_ret(out_root))
+    m.build_vacuum_series = lambda src, out_root, vacuums: (
+        calls.__setitem__('vacuum', {'vacuums': vacuums}) or _series_ret(out_root))
+    m.build_slab_thickness_series = lambda src, out_root, layers, **kw: (
+        calls.__setitem__('thick', {'layers': layers}) or _series_ret(out_root))
+    m.analyze_series = lambda dirs, **kw: (analyze_ret if analyze_ret is not None else {
+        'points': [{'x': 400, 'energy': -10.0, 'converged': False},
+                   {'x': 500, 'energy': -10.001, 'converged': True}],
+        'converged_at': 500, 'threshold_mev': 1.0, 'natoms': 4, 'note': '收敛点 x=500'})
+    m.conv_plot = lambda pts, out, **kw: (calls.__setitem__('conv_plot', out) or [out])
+    return m
+
+
+def _fake_bands_builder(*, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(src, out_root, *, lattice=None, npoints=40):
+        calls['bands'] = {'src': src, 'out': out_root, 'lattice': lattice, 'npoints': npoints}
+        return {'out_dir': out_root, 'lattice': lattice or 'fcc',
+                'changes': [{'key': 'ICHARG', 'new': '11'}], 'warnings': []}
+    m.build_bands_job = _build
+    return m
+
+
+def _fake_cell_opt(*, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(src, out_dir, *, bump_encut=False, **kw):
+        calls['cellopt'] = {'src': src, 'out': out_dir, 'bump_encut': bump_encut}
+        return {'out_dir': out_dir, 'changes': [{'key': 'ISIF', 'new': '3'}], 'warnings': []}
+    m.build_cellopt_job = _build
+    return m
+
+
+def _fake_eos_mod(*, calls=None, fit=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.DEFAULT_SCALES = (0.96, 0.98, 1.0, 1.02, 1.04)
+
+    def _build(src, out_root, scales=None):
+        s = scales if scales is not None else list(m.DEFAULT_SCALES)
+        calls['eos'] = {'src': src, 'scales': s}
+        return {'out_root': out_root, 'dirs': {}, 'warnings': [],
+                'series': [{'scale': sc, 'volume': 100 * sc,
+                            'dir': os.path.join(out_root, f'eos_{sc}')} for sc in s]}
+    m.build_eos_series = _build
+    m.fit_birch_murnaghan = lambda vols, ens: (fit if fit is not None else {
+        'v0': 100.0, 'e0': -10.5, 'b0_gpa': 200.0, 'b0_prime': 4.0, 'r2': 0.999,
+        'b0_evA3': 1.25})
+    m.eos_plot = lambda pts, fit, out, **kw: (calls.__setitem__('eos_plot', out) or [out])
+    return m
+
+
+def _fake_workfunction(*, calls=None, wf_ret=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(src, out_root, *, add_dipole='auto'):
+        calls['wf'] = {'src': src, 'out': out_root, 'add_dipole': add_dipole}
+        return {'out_dir': out_root, 'changes': [{'key': 'LVTOT', 'new': 'T'}],
+                'warnings': [], 'dipole': True}
+    m.build_workfunction_job = _build
+    m.parse_locpot_planar = lambda locpot, axis='z': {'z': [0, 1, 2], 'v_planar': [1, 5, 1], 'axis': axis}
+    m.work_function = lambda v, z, ef, **kw: (wf_ret if wf_ret is not None else {
+        'phi': 4.5, 'vacuum_level': 0.0, 'phi_values': [4.5], 'note': '', 'warnings': []})
+    m.wf_plot = lambda v, z, ef, out, **kw: (calls.__setitem__('wf_plot', out) or [out])
+    return m
+
+
+def _fake_surface_energy(*, area=100.0, gamma=1.23, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.area_from_poscar = lambda text: area
+    m.surface_energy = lambda e_slab, n_slab, e_bpa, a, **kw: (
+        calls.__setitem__('se', {'e_slab': e_slab, 'n_slab': n_slab, 'e_bpa': e_bpa, 'a': a}) or
+        {'gamma_jm2': gamma, 'gamma_evA2': gamma / 16.02176634,
+         'note': '真实字典返回', 'warnings': []})
+    return m
+
+
+def _fake_dimer(*, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(src, out_root, *, amplitude=None, displaced_poscar=None, **kw):
+        calls['dimer'] = {'src': src, 'amplitude': amplitude, 'displaced': displaced_poscar}
+        return {'out_dir': out_root, 'changes': [{'key': 'ICHAIN', 'new': '2'}],
+                'warnings': [], 'modecar_method': 'random'}
+    m.build_dimer_job = _build
+    return m
+
+
+def _fake_bands_parse(*, gap=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.parse_bands = lambda src, efermi=None: {'bands': [], 'kpath': [],
+                                              'gap': gap if gap is not None else
+                                              {'value': 1.2, 'direct': True, 'metal': False, 'note': ''}}
+    m.band_plot = lambda data, out, **kw: (calls.__setitem__('band_plot', out) or [out])
+    return m
+
+
+def _fake_auto_figures(*, ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _run(proj, scenario, out_dir, *, journal='nature', **kw):
+        calls['run'] = {'scenario': scenario, 'journal': journal,
+                        'compose_panel': kw.get('compose_panel'),
+                        'molecules_dir': kw.get('molecules_dir')}
+        return ret if ret is not None else {
+            'ok': True, 'out_dir': os.path.join(out_dir, 'figures'),
+            'files': [os.path.join(out_dir, 'figures', 'adsorption_bar.png')],
+            'panel': {'files': ['panel.png'], 'n': 1}, 'manifest': [{'key': 'adsorption_bar'}],
+            'error': None}
+    m.run_auto_figures = _run
+    return m
+
+
+def _fake_campaign_tpl(*, templates=None, inst_ret=None, next_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.list_templates = lambda: (templates if templates is not None else {
+        'sac_lis_screening': {'name_zh': 'SAC 锂硫筛选', 'description': '全链',
+                              'figures_scenario': 'lis', 'n_stages': 3, 'analyses': ['delta_e']}})
+
+    def _inst(key, spec, out_root, *, title=None, **kw):
+        calls['inst'] = {'key': key, 'spec': dict(spec), 'out_root': out_root, 'title': title}
+        return inst_ret if inst_ret is not None else {
+            'campaign_dir': os.path.join(out_root, '.camp', key),
+            'stages': {'relax': 2}, 'n_jobs': 2, 'estimate': {'total': 96.0},
+            'figures_scenario': 'lis'}
+    m.instantiate = _inst
+    m.next_derivations = lambda cdir: list(next_ret or [])
+    m.mark_derived = lambda cdir, src, derive: calls.setdefault(
+        'marked', []).append((src, derive)) or {'ok': True}
+    return m
+
+
+def _fake_solvation(*, calls=None, build_ret=None, boom=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.SOLVENT_PRESETS = {'lis_electrolyte': [('DOL', 2), ('DME', 1)],
+                         'dol_only': [('DOL', 3)]}
+
+    def _build(core='Li2S3', solvents=(('DOL', 2),), *, box=18.0, min_sep=2.5, seed=42):
+        calls['build'] = {'core': core, 'solvents': solvents, 'box': box, 'seed': seed}
+        if boom:
+            raise boom
+        return build_ret if build_ret is not None else {
+            'poscar': 'solvated\n1.0\n...\n', 'n_atoms': 42, 'note': '核 Li2S3 + 2×DOL + 1×DME'}
+    m.build_solvated_complex = _build
+    return m
+
+
+def _fake_paper_data(*, extract_ret=None, cmp_ret=None, md_ret='## 文献对照\n', calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _extract(text, *, transport=None, **kw):
+        calls['extract'] = {'text': text, 'transport': transport}
+        return extract_ret if extract_ret is not None else {
+            'ok': True, 'tables': [{'label': 'T1', 'kind': 'E_ads', 'columns': [],
+                                    'rows': [{'system': 'Fe@N4', 'species': 'Li2S4',
+                                              'value_ev': -1.5, 'page_hint': 3}]}], 'error': None}
+    m.extract_data_tables = _extract
+    m.build_reference_dataset = lambda tables: (
+        calls.__setitem__('refset', tables) or {'entries': [
+            {'system': 'Fe@N4', 'species': 'Li2S4', 'quantity': 'E_ads', 'ref_value': -1.5}]})
+
+    def _compare(ref, computed):
+        calls['compare'] = {'ref': ref, 'computed': list(computed)}
+        return cmp_ret if cmp_ret is not None else {
+            'pairs': [{'system': 'Fe@N4', 'species': 'Li2S4', 'ref': -1.5, 'ours': -1.4,
+                       'delta': 0.1, 'abs_delta': 0.1}],
+            'mae': 0.1, 'rmse': 0.1, 'n': 1, 'worst': [], 'unmatched': [],
+            'summary_zh': '共比对 1 项:MAE = 0.100 eV'}
+    m.compare_with_computed = _compare
+    m.mae_report_md = lambda cmp: md_ret
+    return m
+
+
+def _fake_variant_advisor(*, suggest_ret=None, plan_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _suggest(spec):
+        calls['suggest'] = spec
+        return suggest_ret if suggest_ret is not None else {
+            'variants': [{'kind': 'metal_swap', 'from': 'Fe', 'to': 'Co', 'metal': 'Co',
+                          'template': 'N4', 'parent': 'Fe@N4', 'priority': 0,
+                          'rationale_zh': '同族替换'}],
+            'matrix_spec': {'metals': ['Co'], 'templates': ['N4']}}
+    m.suggest_variants = _suggest
+    m.variant_campaign_plan = lambda variants, *, budget_cap_hours=None: (
+        plan_ret if plan_ret is not None else {
+            'n_jobs': len(variants), 'estimate_hours': 48.0,
+            'batches': [{'batch': 1, 'priority': 0, 'jobs': ['Co@N4'], 'n_jobs': 1,
+                         'estimate_hours': 48.0, 'reason': '锚定近邻'}],
+            'note': f'共 {len(variants)} 个变体'})
+    return m
+
+
+def _fake_manuscript(*, build_ret=None, stats_ret=None, calls=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(proj, comparison=None, figures_manifest=None, *, lang='zh', fmt='markdown'):
+        calls['build'] = {'fmt': fmt, 'has_comparison': comparison is not None}
+        return build_ret if build_ret is not None else {
+            'ok': True, 'path': '/out/manuscript_zh.md', 'md_path': '/out/manuscript_zh.md',
+            'sections': ['摘要', '引言'], 'placeholders_count': 5, 'docx_path': None,
+            'docx_available': False}
+    m.build_manuscript = _build
+    m.draft_stats = lambda path: (stats_ret if stats_ret is not None else {
+        'auto': 10, 'placeholder': 5, 'total': 15, 'auto_ratio': 0.667})
+    return m
+
+
+# ── task_catalog / u_suggest ──────────────────────────────────────────────────
+def test_task_catalog_shape():
+    api = Api(task_catalog_mod=_fake_task_catalog())
+    out = api.task_catalog()
+    assert out['ok'] is True and '性质' in out['categories']
+    keys = {t['key'] for t in out['tasks']}
+    assert 'relax' in keys and 'eos' in keys
+    assert out['tasks'][0]['name_zh'] == '结构优化'
+
+
+def test_task_catalog_filters_by_work_mode_and_active_calculation():
+    api = Api()
+    battery = api.task_catalog('battery_bulk')
+    keys = {t['key'] for t in battery['tasks']}
+    assert 'cellopt' in keys and 'bands' in keys
+    assert 'adsorption_project' not in keys and 'neb' not in keys
+    one = api.task_catalog('vasp', 'workfunction')
+    assert [t['key'] for t in one['tasks']] == ['workfunction']
+
+
+def test_task_catalog_filters_non_vasp_to_closed_loop_tasks():
+    api = Api()
+    out = api.task_catalog('full', None, 'cp2k')
+    assert out['ok'] is True and out['engine'] == 'cp2k'
+    assert [row['key'] for row in out['tasks']] == ['relax', 'static', 'freq']
+    assert all(row['kind_badge'] == '引擎输入生成' for row in out['tasks'])
+    assert all('CP2K' in row['next_action'] for row in out['tasks'])
+
+
+def test_task_catalog_error_caught():
+    boom = types.SimpleNamespace(
+        CATEGORIES=(), list_catalog=lambda *a, **k: (_ for _ in ()).throw(RuntimeError('坏表')))
+    api = Api(task_catalog_mod=boom)
+    out = api.task_catalog()
+    assert out['ok'] is False and '坏表' in out['error']
+
+
+def test_u_suggest_returns_values_missing_and_incar_keys():
+    api = Api(u_library_mod=_fake_u_library())
+    out = api.u_suggest(['Fe', 'Co', 'Xx'])
+    assert out['ok'] is True and len(out['suggestions']) == 2
+    assert out['missing'] == ['Xx']              # 库内无经验 U,不编造
+    assert out['incar_keys']['LDAU'] is True
+    assert out['suggestions'][0]['source'] == 'MP'
+
+
+def test_u_suggest_error_caught():
+    boom = types.SimpleNamespace(
+        suggest_u=lambda els: (_ for _ in ()).throw(RuntimeError('U 库坏')))
+    api = Api(u_library_mod=boom)
+    out = api.u_suggest(['Fe'])
+    assert out['ok'] is False and 'U 库坏' in out['error']
+
+
+# ── derive_task 分发 ──────────────────────────────────────────────────────────
+def test_derive_task_cellopt_registers(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(cell_opt_mod=_fake_cell_opt(calls=calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_task('cellopt', str(tmp_path))
+    assert out['ok'] is True and out['job_dirs'][0].endswith('_cellopt')
+    assert registered == out['job_dirs']
+    assert calls['cellopt']['bump_encut'] is True
+
+
+def test_derive_task_electronic_elf(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(estatic_mod=_fake_estatic(calls=calls), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('elf', str(tmp_path))
+    assert out['ok'] is True and out['job_dirs'][0].endswith('_elf')
+    assert calls['purposes'] == ['elf']
+
+
+def test_derive_task_bands_passes_params(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(bands_mod=_fake_bands_builder(calls=calls), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('bands', str(tmp_path), {'lattice': 'bcc', 'npoints': 60})
+    assert out['ok'] is True and out['lattice'] == 'bcc'
+    assert calls['bands']['npoints'] == 60
+
+
+def test_derive_task_eos_series_registers_all(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(eos_mod=_fake_eos_mod(calls=calls), ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_task('eos', str(tmp_path), {'scales': [0.98, 1.0, 1.02]})
+    assert out['ok'] is True and len(out['job_dirs']) == 3
+    assert len(registered) == 3 and out['series'][0]['scale'] == 0.98
+    assert calls['eos']['scales'] == [0.98, 1.0, 1.02]
+
+
+def test_derive_task_workfunction(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(workfunction_mod=_fake_workfunction(), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('workfunction', str(tmp_path))
+    assert out['ok'] is True and out['job_dirs'][0].endswith('_wf') and out['dipole'] is True
+
+
+def test_derive_task_dimer_amplitude(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(dimer_mod=_fake_dimer(calls=calls), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('dimer', str(tmp_path), {'amplitude': 0.02})
+    assert out['ok'] is True and calls['dimer']['amplitude'] == 0.02
+
+
+def test_derive_task_conv_encut_series(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    registered, calls = [], {}
+    api = Api(conv_scan_mod=_fake_conv_scan(calls=calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_task('conv_encut', str(tmp_path), {'values': [400, 500]})
+    assert out['ok'] is True and len(out['job_dirs']) == 2 and len(registered) == 2
+    assert calls['encut']['values'] == [400, 500]
+
+
+def test_derive_task_conv_kmesh_defaults(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(conv_scan_mod=_fake_conv_scan(calls=calls), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('conv_kmesh', str(tmp_path))
+    assert out['ok'] is True and calls['kmesh']['meshes'][0] == [3, 3, 1]
+
+
+def test_derive_task_freq_delegates(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(freq_builder_mod=_fake_freq(), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('freq', str(tmp_path))
+    assert out['ok'] is True and out['job_dirs'][0].endswith('_freq')
+
+
+def test_derive_task_aimd_delegates(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    calls = {}
+    api = Api(aimd_mod=_fake_aimd(calls=calls), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('aimd', str(tmp_path), {'temp_k': 500, 'steps': 5000})
+    assert out['ok'] is True and out['job_dirs'][0].endswith('_aimd')
+    assert calls['build']['temp_k'] == 500.0
+
+
+def test_derive_task_unsupported_key(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api()
+    out = api.derive_task('adsorption_project', str(tmp_path))
+    assert out['ok'] is False and '不支持' in out['error']
+
+
+def test_derive_task_missing_dir():
+    api = Api()
+    out = api.derive_task('cellopt', '/no/such/dir')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+# ── analyze_task ──────────────────────────────────────────────────────────────
+def _write_poscar(d, cell=10.0, natoms=2):
+    (d / 'POSCAR').write_text(
+        f'demo\n1.0\n{cell} 0 0\n0 {cell} 0\n0 0 {cell}\nSi\n{natoms}\nCartesian\n'
+        + '0 0 0\n' * natoms, encoding='utf-8')
+
+
+def test_analyze_task_conv(tmp_path):
+    for x in ('encut_400', 'encut_500'):
+        (tmp_path / x).mkdir()
+    calls = {}
+    api = Api(conv_scan_mod=_fake_conv_scan(calls=calls))
+    out = api.analyze_task(str(tmp_path), kind='conv')
+    assert out['ok'] is True and out['kind'] == 'conv'
+    assert out['result']['converged_at'] == 500
+    assert out['figure'] and out['figure'].endswith('convergence.png')
+
+
+def test_analyze_task_eos_fits(tmp_path):
+    for i, sc in enumerate((0.98, 1.0, 1.02)):
+        sub = tmp_path / f'eos_{sc}'
+        sub.mkdir()
+        _write_poscar(sub, cell=10.0 + i)
+        (sub / 'OSZICAR').write_text(f'1 F= x E0= -{10 + i * 0.1:.6f}E+00 dE=0\n', encoding='utf-8')
+    api = Api(eos_mod=_fake_eos_mod())
+    out = api.analyze_task(str(tmp_path), kind='eos')
+    assert out['ok'] is True and out['result']['b0_gpa'] == 200.0
+    assert 'V0' in out['summary'] and out['figure'].endswith('eos.png')
+
+
+def test_analyze_task_eos_insufficient(tmp_path):
+    sub = tmp_path / 'eos_1.0'
+    sub.mkdir()
+    _write_poscar(sub)          # 缺 OSZICAR → 能量 None
+    api = Api(eos_mod=_fake_eos_mod())
+    out = api.analyze_task(str(tmp_path), kind='eos')
+    assert out['ok'] is False and '≥3' in out['error']
+
+
+def test_analyze_task_bands_gap(tmp_path):
+    (tmp_path / 'EIGENVAL').write_text('eigen', encoding='utf-8')
+    (tmp_path / 'OUTCAR').write_text(' E-fermi :   3.1234  XC\n', encoding='utf-8')
+    api = Api(bands_parse_mod=_fake_bands_parse())
+    out = api.analyze_task(str(tmp_path), kind='bands')
+    assert out['ok'] is True and out['result']['gap']['value'] == 1.2
+    assert '带隙 = 1.200 eV' in out['summary'] and '直接' in out['summary']
+
+
+def test_analyze_task_workfunction(tmp_path):
+    (tmp_path / 'LOCPOT').write_text('locpot', encoding='utf-8')
+    (tmp_path / 'OUTCAR').write_text(' E-fermi :   1.5  XC\n', encoding='utf-8')
+    api = Api(workfunction_mod=_fake_workfunction())
+    out = api.analyze_task(str(tmp_path), kind='workfunction')
+    assert out['ok'] is True and out['result']['phi'] == 4.5
+    assert 'φ = 4.500 eV' in out['summary']
+
+
+def test_analyze_task_workfunction_needs_efermi(tmp_path):
+    (tmp_path / 'LOCPOT').write_text('locpot', encoding='utf-8')
+    api = Api(workfunction_mod=_fake_workfunction())
+    out = api.analyze_task(str(tmp_path), kind='workfunction')
+    assert out['ok'] is False and 'E-fermi' in out['error']
+
+
+def test_analyze_task_unknown_kind(tmp_path):
+    api = Api()
+    out = api.analyze_task(str(tmp_path), kind='nope')
+    assert out['ok'] is False and '无法识别' in out['error']
+
+
+def test_analyze_task_missing_dir():
+    api = Api()
+    out = api.analyze_task('/no/such/dir')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+# ── surface_energy_calc ───────────────────────────────────────────────────────
+def test_surface_energy_calc_auto_area_and_bulk(tmp_path):
+    slab = tmp_path / 'slab'
+    slab.mkdir()
+    _write_poscar(slab, natoms=6)
+    (slab / 'OSZICAR').write_text('1 F= x E0= -60.0E+00 dE=0\n', encoding='utf-8')
+    _mark_done_energy_job(slab, -60.0, ['Si'])
+    bulk = tmp_path / 'bulk'
+    bulk.mkdir()
+    _write_poscar(bulk, natoms=2)
+    (bulk / 'OSZICAR').write_text('1 F= x E0= -20.0E+00 dE=0\n', encoding='utf-8')
+    _mark_done_energy_job(bulk, -20.0, ['Si'])
+    calls = {}
+    api = Api(surface_energy_mod=_fake_surface_energy(calls=calls))
+    out = api.surface_energy_calc(str(slab), str(bulk))
+    assert out['ok'] is True and out['gamma_jm2'] == 1.23
+    assert out['area_a2'] == 100.0 and out['n_slab'] == 6
+    assert calls['se']['e_bpa'] == -10.0    # -20/2
+    assert out['method_check']['status'] == 'verified'
+    assert out['report_file'] and os.path.isfile(out['report_file'])
+
+
+def test_surface_energy_rejects_unfinished_and_known_method_conflict(tmp_path):
+    slab = tmp_path / 'slab'
+    slab.mkdir()
+    _write_poscar(slab, natoms=6)
+    (slab / 'OSZICAR').write_text(_osz(-60.0), encoding='utf-8')
+    _mark_done_energy_job(slab, -60.0, ['Si'])
+    bulk = tmp_path / 'bulk'
+    bulk.mkdir()
+    _write_poscar(bulk, natoms=2)
+    (bulk / 'OSZICAR').write_text(_osz(-20.0), encoding='utf-8')
+    _mark_done_energy_job(bulk, -20.0, ['Si'], titel_suffix='different')
+    api = Api(surface_energy_mod=_fake_surface_energy())
+    mismatch = api.surface_energy_calc(str(slab), str(bulk))
+    assert mismatch['ok'] is False
+    assert mismatch['method_check']['status'] == 'incompatible'
+    assert 'POTCAR' in mismatch['error']
+
+    os.remove(slab / 'OUTCAR')
+    from vcstudio.shared import manifest as real_manifest
+    manifest_value = real_manifest.load_manifest(slab)
+    manifest_value['results']['diagnosis']['clean_exit'] = False
+    real_manifest.save_manifest(slab, manifest_value)
+    unfinished = api.surface_energy_calc(str(slab), str(bulk))
+    assert unfinished['ok'] is False and 'timing 页脚' in unfinished['error']
+
+
+def test_surface_energy_manual_bulk_energy_is_explicitly_unverified(tmp_path):
+    slab = tmp_path / 'slab'
+    slab.mkdir()
+    _write_poscar(slab, natoms=6)
+    (slab / 'OSZICAR').write_text(_osz(-60.0), encoding='utf-8')
+    _mark_done_energy_job(slab, -60.0, ['Si'])
+    api = Api(surface_energy_mod=_fake_surface_energy())
+    out = api.surface_energy_calc(str(slab), '', -10.0)
+    assert out['ok'] is True and out['method_check']['status'] == 'unverified'
+    assert any('手工输入' in warning for warning in out['warnings'])
+
+
+def test_surface_energy_calc_missing_slab():
+    api = Api(surface_energy_mod=_fake_surface_energy())
+    out = api.surface_energy_calc('/no/such', '/no/bulk')
+    assert out['ok'] is False and 'slab' in out['error']
+
+
+# ── campaign_templates / instantiate ──────────────────────────────────────────
+def test_campaign_templates_shape():
+    api = Api(campaign_templates_mod=_fake_campaign_tpl())
+    out = api.campaign_templates()
+    assert out['ok'] is True and out['templates'][0]['key'] == 'sac_lis_screening'
+    assert out['templates'][0]['n_stages'] == 3
+
+
+def test_campaign_instantiate_registers(tmp_path):
+    calls = {}
+    backing = {'ui': {}}
+    api = Api(campaign_templates_mod=_fake_campaign_tpl(calls=calls),
+              config_mod=_fake_config_rw(backing))
+    out = api.campaign_instantiate('sac_lis_screening',
+                                   {'systems': ['Fe@N4', 'Co@N4']}, str(tmp_path))
+    assert out['ok'] is True and out['n_jobs'] == 2
+    assert out['campaign_dir'] in (backing['ui'].get('campaign_dirs') or [])
+    assert calls['inst']['spec']['systems'] == ['Fe@N4', 'Co@N4']
+
+
+def test_campaign_instantiate_needs_systems(tmp_path):
+    api = Api(campaign_templates_mod=_fake_campaign_tpl())
+    out = api.campaign_instantiate('sac_lis_screening', {'systems': []}, str(tmp_path))
+    assert out['ok'] is False and 'system' in out['error']
+
+
+def test_campaign_instantiate_missing_outroot():
+    api = Api(campaign_templates_mod=_fake_campaign_tpl())
+    out = api.campaign_instantiate('sac_lis_screening', {'systems': ['Fe@N4']}, '')
+    assert out['ok'] is False and '输出根目录' in out['error']
+
+
+# ── solvent_presets / build_solvated ──────────────────────────────────────────
+def test_solvent_presets_shape():
+    api = Api(solvation_mod=_fake_solvation())
+    out = api.solvent_presets()
+    assert out['ok'] is True
+    keys = {p['key'] for p in out['presets']}
+    assert 'lis_electrolyte' in keys
+
+
+def test_build_solvated_preset(tmp_path):
+    calls = {}
+    api = Api(solvation_mod=_fake_solvation(calls=calls))
+    out = api.build_solvated(core='Li2S3', solvents='lis_electrolyte')
+    assert out['ok'] is True and out['n_atoms'] == 42
+    assert calls['build']['solvents'] == 'lis_electrolyte'
+
+
+def test_build_solvated_custom_recipe_and_save(tmp_path):
+    calls = {}
+    dest = tmp_path / 'solv.vasp'
+    api = Api(solvation_mod=_fake_solvation(calls=calls))
+    out = api.build_solvated(core='S8', solvents=[['DOL', 2], ['DME', 1]], save_to=str(dest))
+    assert out['ok'] is True and out['saved_to'] == str(dest)
+    assert dest.read_text(encoding='utf-8').startswith('solvated')
+    assert calls['build']['solvents'] == [('DOL', 2), ('DME', 1)]
+
+
+def test_build_solvated_error_caught():
+    api = Api(solvation_mod=_fake_solvation(boom=ValueError('盒太小')))
+    out = api.build_solvated()
+    assert out['ok'] is False and '盒太小' in out['error']
+
+
+# ── figure_prefs ──────────────────────────────────────────────────────────────
+def test_figure_prefs_get_defaults():
+    api = Api(config_mod=_fake_config(ui={}))
+    out = api.figure_prefs_get()
+    assert out['journal_style'] == 'nature' and out['auto_figures'] is True
+    assert out['multi_panel'] is True
+
+
+def test_figure_prefs_save_persists():
+    backing = {'ui': {}}
+    api = Api(config_mod=_fake_config_rw(backing))
+    out = api.figure_prefs_save(journal_style='acs', auto_figures=False, multi_panel=False)
+    assert out['ok'] is True
+    assert backing['ui']['journal_style'] == 'acs'
+    assert backing['ui']['auto_figures'] is False
+
+
+def test_figure_prefs_save_bad_journal_falls_back():
+    backing = {'ui': {}}
+    api = Api(config_mod=_fake_config_rw(backing))
+    api.figure_prefs_save(journal_style='comic')
+    assert backing['ui']['journal_style'] == 'nature'
+
+
+# ── AI 三能力:数据对照 ────────────────────────────────────────────────────────
+def test_ai_extract_tables_forwards(tmp_path):
+    calls = {}
+    api = Api(paper_data_mod=_fake_paper_data(calls=calls))
+    out = api.ai_extract_tables('论文正文...E_ads')
+    assert out['ok'] is True and out['tables'][0]['rows'][0]['system'] == 'Fe@N4'
+    assert calls['extract']['text'].startswith('论文')
+
+
+def test_ai_extract_tables_empty():
+    api = Api(paper_data_mod=_fake_paper_data())
+    out = api.ai_extract_tables('   ')
+    assert out['ok'] is False and '论文文本' in out['error']
+
+
+def test_ai_compare_project_vs_reference(tmp_path):
+    proj = {'name': 'Fe@N4', 'root': str(tmp_path)}
+    rows = {'rows': [{'species': 'Li2S4', 'delta_e': -1.4, 'is_most_stable': True, 'name': 'c1'}]}
+    ads = _fake_adsorption(proj_map={str(tmp_path): proj}, delta_ret=rows)
+    api = Api(adsorption_mod=ads, paper_data_mod=_fake_paper_data())
+    tables = [{'label': 'T1', 'kind': 'E_ads',
+               'rows': [{'system': 'Fe@N4', 'species': 'Li2S4', 'value_ev': -1.5}]}]
+    out = api.ai_compare(str(tmp_path), tables)
+    assert out['ok'] is True and out['n'] == 1 and out['mae'] == 0.1
+    assert 'MAE' in out['summary']
+
+
+def test_ai_compare_missing_project():
+    api = Api(adsorption_mod=_fake_adsorption(proj_map={}), paper_data_mod=_fake_paper_data())
+    out = api.ai_compare('/no/proj', [])
+    assert out['ok'] is False and '项目' in out['error']
+
+
+def test_ai_write_validation_writes_md(tmp_path):
+    proj = {'name': 'Fe@N4', 'root': str(tmp_path)}
+    ads = _fake_adsorption(proj_map={str(tmp_path): proj},
+                           delta_ret={'rows': [{'species': 'Li2S4', 'delta_e': -1.4,
+                                                 'is_most_stable': True, 'name': 'c1'}]})
+    api = Api(adsorption_mod=ads, paper_data_mod=_fake_paper_data(md_ret='## 文献对照\n表格\n'))
+    out = api.ai_write_validation(str(tmp_path), [{'kind': 'E_ads', 'rows': []}])
+    assert out['ok'] is True and out['path'].endswith('validation.md')
+    assert os.path.isfile(out['path'])
+    assert '文献对照' in open(out['path'], encoding='utf-8').read()
+
+
+def test_ai_write_validation_missing_project():
+    api = Api(adsorption_mod=_fake_adsorption(proj_map={}), paper_data_mod=_fake_paper_data())
+    out = api.ai_write_validation('/no/proj', [])
+    assert out['ok'] is False and '项目' in out['error']
+
+
+# ── AI 三能力:材料变体 ────────────────────────────────────────────────────────
+def test_ai_variants_returns_list_and_plan():
+    calls = {}
+    api = Api(variant_advisor_mod=_fake_variant_advisor(calls=calls))
+    out = api.ai_variants({'systems': [{'metals': [{'value': 'Fe'}]}]}, budget_cap_hours=100)
+    assert out['ok'] is True and out['variants'][0]['metal'] == 'Co'
+    assert out['matrix_spec']['metals'] == ['Co']
+    assert out['plan']['n_jobs'] == 1
+
+
+def test_ai_variants_error_caught():
+    boom = types.SimpleNamespace(
+        suggest_variants=lambda spec: (_ for _ in ()).throw(RuntimeError('母版坏')))
+    api = Api(variant_advisor_mod=boom)
+    out = api.ai_variants({})
+    assert out['ok'] is False and '母版坏' in out['error']
+
+
+# ── AI 三能力:论文草稿 ────────────────────────────────────────────────────────
+def test_ai_manuscript_returns_stats(tmp_path):
+    proj = {'name': 'Fe@N4', 'root': str(tmp_path)}
+    ads = _fake_adsorption(proj_map={str(tmp_path): proj})
+    calls = {}
+    api = Api(adsorption_mod=ads, manuscript_draft_mod=_fake_manuscript(calls=calls))
+    out = api.ai_manuscript(str(tmp_path), fmt='markdown')
+    assert out['ok'] is True and out['stats']['auto'] == 10
+    assert out['placeholders_count'] == 5 and out['docx_available'] is False
+    assert calls['build']['fmt'] == 'markdown'
+
+
+def test_ai_manuscript_missing_project():
+    api = Api(adsorption_mod=_fake_adsorption(proj_map={}),
+              manuscript_draft_mod=_fake_manuscript())
+    out = api.ai_manuscript('/no/proj')
+    assert out['ok'] is False and '项目' in out['error']
+
+
+# ── starpivot:依赖状态 / 安装 ─────────────────────────────────────────────────
+def test_deps_status_external_tools_reflect_probe():
+    api = Api(multiwfn_mod=_fake_multiwfn(probe_avail=True),
+              vmd_mod=_fake_vmd(probe_avail=False), config_mod=_fake_config(cfg={}))
+    out = api.deps_status()
+    assert out['ok'] is True
+    by = {d['key']: d for d in out['deps']}
+    assert by['multiwfn']['available'] is True and by['vmd']['available'] is False
+    assert set(by) >= {'rdkit', 'decimer', 'matplotlib', 'multiwfn', 'vmd'}
+
+
+def _fake_deps_runner(*, returncode=0, calls=None, write_log=True):
+    calls = calls if calls is not None else {}
+
+    class _Proc:
+        def poll(self):
+            return returncode
+
+    def _run(pip_names, log_path):
+        calls['pip'] = list(pip_names)
+        calls['log'] = log_path
+        if write_log:
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write('Collecting ' + ' '.join(pip_names) + '\nSuccessfully installed\n')
+        return _Proc()
+    return _run
+
+
+def test_deps_install_starts_via_runner():
+    calls = {}
+    api = Api(deps_runner=_fake_deps_runner(returncode=None, calls=calls))
+    out = api.deps_install(['rdkit', 'matplotlib'])
+    assert out['ok'] is True and out['started'] is True
+    assert 'rdkit' in out['pip'] and 'matplotlib' in out['pip']
+    assert calls['pip']
+
+
+def test_deps_install_rejects_non_whitelist():
+    api = Api(deps_runner=_fake_deps_runner())
+    out = api.deps_install(['evil-pkg'])
+    assert out['ok'] is False and out['rejected'] == ['evil-pkg']
+
+
+def test_deps_install_busy_guard():
+    api = Api(deps_runner=_fake_deps_runner(returncode=None))
+    api.deps_install(['rdkit'])
+    out = api.deps_install(['decimer'])
+    assert out['ok'] is False and '进行中' in out['error']
+
+
+def test_deps_install_status_none_then_done():
+    api = Api()
+    assert api.deps_install_status()['active'] is False
+    api2 = Api(deps_runner=_fake_deps_runner(returncode=0))
+    api2.deps_install(['rdkit'])
+    st = api2.deps_install_status()
+    assert st['active'] is True and st['done'] is True and st['returncode'] == 0
+    assert 'Successfully' in st['log_tail']
+
+
+def test_deps_install_status_running():
+    api = Api(deps_runner=_fake_deps_runner(returncode=None))
+    api.deps_install(['decimer'])
+    st = api.deps_install_status()
+    assert st['running'] is True and st['done'] is False
+
+
+# ── starpivot:概览核时四卡 ────────────────────────────────────────────────────
+def test_overview_stats_aggregates():
+    import datetime
+    now = datetime.datetime.now().isoformat()
+    entries = [('/a', {'state': 'RUNNING', 'created_at': now}),
+               ('/b', {'state': 'QUEUED', 'created_at': now}),
+               ('/c', {'state': 'DONE', 'created_at': now})]
+    cdir = '/camp/x'
+    camp = {cdir: {'_summary': {'total': 4, 'completed': 2},
+                   '_budget': {'estimates': {'t1': 50.0, 't2': 50.0}}, 'meta': {}}}
+    camp[cdir]['meta'] = {'title': 'X', 'budget_core_hours': 200.0}
+    api = Api(ledger_mod=_fake_ledger(entries, []),
+              campaign_mods=_fake_campaign(campaigns=camp),
+              config_mod=_fake_config(ui={'campaign_dirs': [cdir]}))
+    out = api.overview_stats()
+    assert out['ok'] is True and out['jobs_30d'] == 3
+    assert out['monitor']['running'] == 1 and out['monitor']['queued'] == 1
+    assert out['monitor']['status'] == '运行中'
+    assert out['budget_cap'] == 200.0 and out['remaining_core_hours'] is not None
+
+
+def test_overview_stats_error_caught():
+    boom = types.SimpleNamespace(load_all=lambda: (_ for _ in ()).throw(RuntimeError('台账坏')))
+    api = Api(ledger_mod=boom)
+    out = api.overview_stats()
+    assert out['ok'] is False and '台账坏' in out['error']
+
+
+# ── starpivot:波函数分组菜单 + 补充分析(v3.2.2 单一事实源=引擎注册表) ─────────
+def _fake_multiwfn_full():
+    """波函数分组菜单测试用:ANALYSES 覆盖引擎全量注册表(含 v3.2.2 迁入的四补充项)。"""
+    m = _fake_multiwfn()
+    m.ANALYSES = dict(m.ANALYSES)
+    for k, name in (('density_cube', '电子密度 cube'), ('esp_cube', '静电势 cube'),
+                    ('nci_rdg', 'NCI/RDG'), ('igmh', 'IGMH'), ('iri', 'IRI'),
+                    ('aim_cp', 'AIM 临界点'), ('alie', 'ALIE cube'),
+                    ('alie_extrema', 'ALIE 极值'),
+                    ('elf_lol_section', 'ELF/LOL 截面'), ('adch_charge', 'ADCH 电荷'),
+                    ('property_summary', '性质汇总'), ('fukui_cdft', 'Fukui/CDFT')):
+        m.ANALYSES[k] = {'name': name, 'stdin_script': lambda p: '', 'outputs': (), 'note': ''}
+    return m
+
+
+def test_wavefn_analyses_grouped_all_engine():
+    api = Api(multiwfn_mod=_fake_multiwfn_full())
+    out = api.wavefn_analyses()
+    assert out['ok'] is True
+    gnames = {g['group'] for g in out['groups']}
+    assert '常用' in gnames and '弱相互作用' in gnames
+    allkeys = {it['key']: it for g in out['groups'] for it in g['items']}
+    assert 'esp_extrema' in allkeys and allkeys['esp_extrema']['source'] == 'engine'
+    # v3.2.2:四补充项由引擎注册表提供,source 统一为 engine(api 不再自带脚本)
+    assert 'elf_lol_section' in allkeys and allkeys['elf_lol_section']['source'] == 'engine'
+    assert 'fukui_cdft' in allkeys and 'adch_charge' in allkeys
+    assert all(it['source'] == 'engine' for it in allkeys.values())
+
+
+def test_wavefn_analyses_old_engine_omits_missing_items():
+    # 旧引擎(注册表无四补充项)→ 菜单诚实少这四项,不虚列点不动的卡
+    api = Api(multiwfn_mod=_fake_multiwfn())
+    out = api.wavefn_analyses()
+    assert out['ok'] is True
+    allkeys = {it['key'] for g in out['groups'] for it in g['items']}
+    assert 'esp_extrema' in allkeys
+    assert 'elf_lol_section' not in allkeys and 'fukui_cdft' not in allkeys
+
+
+def test_wavefn_analyses_error_caught():
+    # multiwfn 假件无 ANALYSES 属性 → AttributeError 被 try/except 兜住
+    api = Api(multiwfn_mod=types.SimpleNamespace())
+    out = api.wavefn_analyses()
+    assert out['ok'] is False and out['error']
+
+
+def test_wavefn_run_extra_old_engine_honest_error(tmp_path):
+    # 旧引擎注册表无四项 → 按项「引擎待扩展」中文说明(前端 engineMissing 归因依赖此措辞)
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run_extra(str(wf), ['fukui_cdft', 'adch_charge'])
+    assert out['ok'] is False and len(out['results']) == 2
+    assert all('引擎待扩展' in r['error'] for r in out['results'])
+
+
+def test_wavefn_run_extra_runs_via_engine_registry(tmp_path):
+    # v3.2.2:四项在引擎注册表 → wavefn_run_extra 直接走引擎 run()(与 wavefn_run 同路径)
+    wf = tmp_path / 'mol.fchk'
+    wf.write_text('x', encoding='utf-8')
+    calls = {}
+    mw = _fake_multiwfn(calls=calls,
+                        run_ret={'ok': True, 'outputs': ['fukui_cdft_f_plus.cub'],
+                                 'stdout_tail': 'done', 'elapsed_s': 2.0, 'error': ''})
+    mw.ANALYSES = dict(mw.ANALYSES)
+    mw.ANALYSES['fukui_cdft'] = {'name': 'Fukui/CDFT', 'stdin_script': lambda p: '22\n',
+                                 'outputs': ('f_plus.cub',), 'note': ''}
+    api = Api(multiwfn_mod=mw, config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run_extra(str(wf), ['fukui_cdft'], {'which': 'f+'})
+    assert out['ok'] is True and out['results'][0]['ok'] is True
+    assert 'fukui_cdft_f_plus.cub' in out['results'][0]['outputs']
+    assert calls['runs'][0]['key'] == 'fukui_cdft'        # 确实经引擎 run() 执行
+
+
+def test_wavefn_run_extra_missing_file():
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_run_extra('', ['fukui_cdft'])
+    assert out['ok'] is False and '波函数文件' in out['error']
+
+
+# ── starpivot:NCI/IRI 散点 ────────────────────────────────────────────────────
+def _write_cube(path, values):
+    """最小 cube:2 原子头 + 体数据。"""
+    n = len(values)
+    lines = ['comment', 'comment', '2 0 0 0', f'{n} 0.1 0 0', '1 0 0.1 0', '1 0 0 0.1',
+             '1 0 0 0 0', '6 0 0.5 0.5 0.5']
+    lines += [' '.join(f'{v:.5f}' for v in values[i:i + 6]) for i in range(0, n, 6)]
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+
+def test_wavefn_scatter_parses_and_filters(tmp_path):
+    f1 = tmp_path / 'func1.cub'   # sign(λ2)ρ
+    f2 = tmp_path / 'func2.cub'   # RDG
+    _write_cube(f1, [0.01, -0.02, 0.5, 0.03])       # 0.5 超窗口(|x|>0.05)被滤
+    _write_cube(f2, [0.5, 0.8, 0.3, 1.5])
+    api = Api()
+    out = api.wavefn_scatter(str(f1), str(f2), kind='nci')
+    assert out['ok'] is True and out['kind'] == 'nci'
+    assert out['n'] == 3          # 第三点 x=0.5 被滤
+    assert {'x', 'y'} <= set(out['points'][0])
+
+
+def test_wavefn_scatter_missing_file(tmp_path):
+    f1 = tmp_path / 'func1.cub'
+    _write_cube(f1, [0.01])
+    api = Api()
+    out = api.wavefn_scatter(str(f1), '/no/func2.cub')
+    assert out['ok'] is False and 'func2' in out['error']
+
+
+def test_wavefn_scatter_png_via_native_charts(tmp_path):
+    f1 = tmp_path / 'func1.cub'
+    f2 = tmp_path / 'func2.cub'
+    _write_cube(f1, [0.01, -0.02])
+    _write_cube(f2, [0.5, 0.8])
+    calls = {}
+    nc = types.SimpleNamespace(
+        scaling_relation=lambda xs, ys, out, **kw: (calls.__setitem__('scatter', out) or [out]))
+    dest = tmp_path / 'nci.png'
+    api = Api(native_charts_mod=nc)
+    out = api.wavefn_scatter(str(f1), str(f2), out_png=str(dest))
+    assert out['ok'] is True and out['png'] == str(dest)
+    assert calls['scatter'] == str(dest)
+
+
+# ── starpivot:远程渲染(离线错误路径) ─────────────────────────────────────────
+def test_wavefn_render_remote_missing_remote_dir(tmp_path):
+    api = Api(vmd_mod=_fake_vmd())
+    out = api.wavefn_render_remote('orbital', {'cube': str(tmp_path / 'x.cub')},
+                                   'c1', None, '')
+    assert out['ok'] is False and out['experimental'] is True and '远端工作目录' in out['error']
+
+
+def test_wavefn_render_remote_unknown_scene(tmp_path):
+    api = Api(vmd_mod=_fake_vmd())
+    out = api.wavefn_render_remote('nope', {}, 'c1', None, '/remote/run')
+    assert out['ok'] is False and '未知场景' in out['error']
+
+
+# ── 一键出图管线接线:auto_figures + campaign 推进 ─────────────────────────────
+def test_auto_figures_for_project_uses_auto_engine(tmp_path):
+    calls = {}
+    api = Api(config_mod=_fake_config(ui={'auto_figures': True, 'journal_style': 'acs',
+                                          'multi_panel': True}),
+              auto_figures_mod=_fake_auto_figures(calls=calls),
+              adsorption_mod=_fake_adsorption())
+    out = api._auto_figures_for_project({'name': 'p', 'root': str(tmp_path)},
+                                        str(tmp_path / 'project.yaml'), str(tmp_path))
+    assert out['engine'] == 'auto_figures' and len(out['files']) == 1
+    assert calls['run']['journal'] == 'acs' and calls['run']['scenario'] == 'general'
+
+
+def test_auto_figures_for_project_falls_back_when_disabled(tmp_path):
+    calls = {}
+    af = _fake_auto_figures(calls=calls)
+    api = Api(config_mod=_fake_config(ui={'auto_figures': False}),
+              auto_figures_mod=af, adsorption_mod=_fake_adsorption(proj_map={}),
+              native_charts_mod=_fake_ncharts({}))
+    out = api._auto_figures_for_project({'name': 'p', 'root': str(tmp_path)},
+                                        str(tmp_path / 'project.yaml'), str(tmp_path))
+    assert out['engine'] == 'proj_figures' and 'run' not in calls   # 未调 auto_figures
+
+
+def test_tick_campaigns_derives_and_marks(tmp_path):
+    src = tmp_path / 'Fe__clean__relax'
+    src.mkdir()
+    (src / 'CONTCAR').write_text('x', encoding='utf-8')
+    cdir = str(tmp_path / '.camp' / 'c1')
+    ct = _fake_campaign_tpl(next_ret=[{'src_id': 'Fe__clean__relax', 'src_dir': str(src),
+                                       'derive': 'estatic', 'kinds': ['pdos', 'bader'],
+                                       'task_id': 'Fe__clean__estatic'}])
+    calls = {}
+    ct.mark_derived = lambda cd, s, d: calls.setdefault('marked', []).append((s, d))
+    api = Api(campaign_templates_mod=ct, estatic_mod=_fake_estatic(),
+              ledger_mod=_fake_ledger_register([]),
+              config_mod=_fake_config(ui={'campaign_dirs': [cdir]}))
+    events, errors = [], []
+    api._tick_campaigns(events, errors)
+    assert any(e['kind'] == 'derive' for e in events)
+    assert calls['marked'] == [('Fe__clean__relax', 'estatic')]
+
+
+# ── save_text / gen_run 自定义关键词 / build_solvated 临时文件 ─────────────────
+def test_save_text_writes(tmp_path):
+    dest = tmp_path / 'preview.txt'
+    api = Api()
+    out = api.save_text(str(dest), 'INCAR\nENCUT = 500\n')
+    assert out['ok'] is True and out['path'] == str(dest)
+    assert dest.read_text(encoding='utf-8').startswith('INCAR')
+
+
+def test_save_text_missing_path():
+    api = Api()
+    out = api.save_text('', 'x')
+    assert out['ok'] is False and '保存路径' in out['error']
+
+
+def test_gen_run_appends_extra_keywords(tmp_path):
+    (tmp_path / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    payload = {'ok': True, 'out_dir': str(tmp_path), 'warnings': [], 'kpoints': [3, 3, 1],
+               'elements': ['Fe']}
+    jb = types.SimpleNamespace(build_job_dir=lambda p, i, o, **k: dict(payload))
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register([]))
+    out = api.gen_run('/p/POSCAR', '/p/INCAR', str(tmp_path), '/lib', 'slab',
+                      'LREAL = Auto\nNCORE = 4')
+    assert out['ok'] is True
+    incar = (tmp_path / 'INCAR').read_text(encoding='utf-8')
+    assert 'LREAL = Auto' in incar and 'NCORE = 4' in incar
+    assert any('自定义关键词' in w for w in out['warnings'])
+
+
+def test_build_solvated_returns_temp_path(tmp_path):
+    api = Api(solvation_mod=_fake_solvation())
+    out = api.build_solvated(core='Li2S3', solvents='lis_electrolyte')
+    assert out['ok'] is True and out['temp_path'] and os.path.isfile(out['temp_path'])
+    assert out['poscar'] in open(out['temp_path'], encoding='utf-8').read()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QA 接线修复:NEB / 形成能·结合能 / 差分电荷 / VASPsol / conv_thickness 诚实化 / 徽标
+# ══════════════════════════════════════════════════════════════════════════════
+def _osz(e0):
+    return f'   1 F= -.1E+02 E0= {e0:.6f}  d E =0.0\n'
+
+
+def _vasp5_poscar(species, counts):
+    head = f'demo\n1.0\n12 0 0\n0 12 0\n0 0 15\n{" ".join(species)}\n{" ".join(str(c) for c in counts)}\nDirect\n'
+    return head + '0.0 0.0 0.0\n' * sum(counts)
+
+
+def _mark_done_energy_job(folder, energy, species, *, encut=500, kmesh=(3, 3, 1),
+                          exit_code=0, clean=True, titel_suffix='standard'):
+    """为能量计算器测试构造可追溯 DONE 作业，不依赖集群。"""
+    from vcstudio.shared import manifest as real_manifest
+
+    (folder / 'INCAR').write_text(
+        f'GGA=PE\nENCUT={encut}\nISPIN=2\nIVDW=12\nLDAU=F\n', encoding='utf-8')
+    (folder / 'KPOINTS').write_text(
+        f'Gamma\n0\nGamma\n{kmesh[0]} {kmesh[1]} {kmesh[2]}\n0 0 0\n',
+        encoding='utf-8')
+    (folder / 'POTCAR').write_text(''.join(
+        f'TITEL = PAW_PBE {element} {titel_suffix}\n' for element in species),
+        encoding='utf-8')
+    if clean:
+        (folder / 'OUTCAR').write_text(
+            'General timing and accounting informations for this job:\n', encoding='utf-8')
+    m = real_manifest.new_manifest(
+        job_id=folder.name, system=folder.name, task_type='static', calc_type='slab',
+        inputs={'potcar': [
+            {'element': element, 'titel': f'PAW_PBE {element} {titel_suffix}'}
+            for element in species]})
+    real_manifest.set_state(m, 'DONE')
+    m['results'] = {
+        'energy_e0_eV': float(energy),
+        'diagnosis': {'failure_class': 'CONVERGED', 'clean_exit': bool(clean),
+                      'exit_code': exit_code},
+    }
+    real_manifest.save_manifest(folder, m)
+
+
+def _fake_neb_builder(*, calls=None, boom=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.DEFAULT_N_IMAGES = 5
+
+    def _build(out_dir, ini, fin, incar, *, n_images=5, potcar_fn=None, **kw):
+        calls['build'] = {'out': out_dir, 'n_images': n_images, 'potcar_fn': potcar_fn,
+                          'ini': ini, 'fin': fin, 'incar': incar}
+        if boom:
+            raise boom
+        return {'job_dir': out_dir, 'n_images': n_images, 'warnings': ['端点须已弛豫']}
+    m.build_neb_dir = _build
+    return m
+
+
+def _fake_references(*, calls=None, cohesive=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.binding_energy = lambda e_sac, e_sub, e_atom: (
+        calls.__setitem__('be', (e_sac, e_sub, e_atom)) or (e_sac - e_sub - e_atom))
+
+    def _form(e_sac, e_ref, chem_pots, counts):
+        calls['form_counts'] = dict(counts)
+        total = e_sac - e_ref
+        for sp, n in counts.items():
+            if sp not in chem_pots:
+                raise ValueError(f'缺物种 {sp!r} 的化学势 μ,无法算形成能')
+            total -= n * chem_pots[sp]
+        return total
+    m.formation_energy = _form
+
+    def _coh(metal):
+        if cohesive is not None and metal in cohesive:
+            return cohesive[metal]
+        raise ValueError(f'内置内聚能表无 {metal!r}')
+    m.cohesive_energy = _coh
+    m.stability_verdict = lambda eb, ecoh: {
+        'sigma': round(-eb / ecoh, 4), 'stable': (-eb / ecoh) > 1.0, 'note': f'σ={-eb/ecoh:.2f} 判定'}
+    return m
+
+
+def _fake_chgdiff(*, calls=None, compute_ret=None, profile=None, compute_boom=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+
+    def _build(relax_dir, out_root, ads_idx):
+        calls['build'] = {'relax': relax_dir, 'ads': list(ads_idx)}
+        dirs = {'_AB': os.path.join(out_root, '_AB'), '_A': os.path.join(out_root, '_A'),
+                '_B': os.path.join(out_root, '_B')}
+        results = {tag: {'out_dir': d, 'changes': [], 'warnings': [f'{tag} 警告']}
+                   for tag, d in dirs.items()}
+        return {'out_root': out_root, 'dirs': dirs, 'results': results}
+    m.build_chgdiff_jobs = _build
+
+    def _compute(ab, a, b, out_path):
+        calls['compute'] = {'ab': ab, 'a': a, 'b': b, 'out': str(out_path)}
+        if compute_boom:
+            raise compute_boom
+        return compute_ret if compute_ret is not None else {
+            'out': str(out_path), 'max': 8.0, 'min': -3.0, 'n_grid': 8}
+    m.compute_chgdiff = _compute
+
+    def _plane(path, axis='z'):
+        if profile == 'boom':
+            raise ValueError('面平均失败')
+        return profile if profile is not None else {'z': [0.0, 1.0], 'rho': [0.1, -0.2], 'axis': axis}
+    m.plane_averaged = _plane
+    return m
+
+
+def _fake_incar_builder():
+    m = types.SimpleNamespace()
+    m.VASPSOL_ADVISORY = 'VASPsol 需补丁编译;标准 VASP 静默给真空结果。'
+    m.vaspsol_keys = lambda enabled=True, *, eb_k=78.4: (
+        {'LSOL': True, 'EB_K': float(eb_k)} if enabled else {'LSOL': False})
+    return m
+
+
+# ── P0-1 derive_neb ───────────────────────────────────────────────────────────
+def _mk_neb_dirs(tmp_path, *, with_incar=True, with_potcar=False):
+    s = tmp_path / 'start'
+    e = tmp_path / 'end'
+    s.mkdir()
+    e.mkdir()
+    (s / 'CONTCAR').write_text(_vasp5_poscar(['H'], [2]), encoding='utf-8')
+    (e / 'CONTCAR').write_text(_vasp5_poscar(['H'], [2]), encoding='utf-8')
+    if with_incar:
+        (s / 'INCAR').write_text('ENCUT = 400\n', encoding='utf-8')
+    if with_potcar:
+        (s / 'POTCAR').write_text('H POTCAR\n', encoding='utf-8')
+    return str(s), str(e)
+
+
+def test_derive_neb_happy_registers(tmp_path):
+    s, e = _mk_neb_dirs(tmp_path, with_potcar=True)
+    registered, calls = [], {}
+    api = Api(neb_builder_mod=_fake_neb_builder(calls=calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_neb(s, e, 3)
+    assert out['ok'] is True and out['n_images'] == 3
+    assert out['job_dir'].endswith('_neb') and registered == [out['job_dir']]
+    assert calls['build']['n_images'] == 3
+    assert calls['build']['potcar_fn'] == os.path.join(s, 'POTCAR')   # 有 POTCAR 则透传路径
+    assert 'ENCUT = 400' in calls['build']['incar']                   # 始态 INCAR 透传
+
+
+def test_derive_neb_missing_start_dir():
+    api = Api(neb_builder_mod=_fake_neb_builder())
+    out = api.derive_neb('/no/such', '/also/no')
+    assert out['ok'] is False and '始态' in out['error']
+
+
+def test_derive_neb_missing_end_dir(tmp_path):
+    s = tmp_path / 'start'
+    s.mkdir()
+    (s / 'CONTCAR').write_text(_vasp5_poscar(['H'], [2]), encoding='utf-8')
+    api = Api(neb_builder_mod=_fake_neb_builder())
+    out = api.derive_neb(str(s), '/no/end')
+    assert out['ok'] is False and '末态' in out['error']
+
+
+def test_derive_neb_missing_struct(tmp_path):
+    s = tmp_path / 'start'
+    e = tmp_path / 'end'
+    s.mkdir()
+    e.mkdir()
+    (e / 'CONTCAR').write_text(_vasp5_poscar(['H'], [2]), encoding='utf-8')
+    api = Api(neb_builder_mod=_fake_neb_builder())
+    out = api.derive_neb(str(s), str(e))
+    assert out['ok'] is False and 'CONTCAR/POSCAR' in out['error']
+
+
+def test_derive_neb_missing_incar_honest_error(tmp_path):
+    s, e = _mk_neb_dirs(tmp_path, with_incar=False)
+    api = Api(neb_builder_mod=_fake_neb_builder())
+    out = api.derive_neb(s, e, 5)
+    assert out['ok'] is False and 'INCAR' in out['error']       # 诚实报错,绝不假成功
+
+
+def test_derive_neb_engine_valueerror_caught(tmp_path):
+    s, e = _mk_neb_dirs(tmp_path)
+    api = Api(neb_builder_mod=_fake_neb_builder(boom=ValueError('初末态原子组成不一致')),
+              ledger_mod=_fake_ledger_register([]))
+    out = api.derive_neb(s, e, 4)
+    assert out['ok'] is False and '组成不一致' in out['error']
+
+
+def test_derive_neb_real_engine_builds_tree(tmp_path):
+    # 真引擎端到端:确证 build_neb_dir 真落 00/01../N+1 目录树(不是假成功)
+    ini = ('H2\n1.0\n10 0 0\n0 10 0\n0 0 10\nH\n2\nDirect\n0.10 0.5 0.5\n0.30 0.5 0.5\n')
+    fin = ('H2\n1.0\n10 0 0\n0 10 0\n0 0 10\nH\n2\nDirect\n0.10 0.5 0.5\n0.55 0.5 0.5\n')
+    s = tmp_path / 's'
+    e = tmp_path / 'e'
+    s.mkdir()
+    e.mkdir()
+    (s / 'CONTCAR').write_text(ini, encoding='utf-8')
+    (e / 'CONTCAR').write_text(fin, encoding='utf-8')
+    (s / 'INCAR').write_text('ENCUT = 400\nISMEAR = 0\n', encoding='utf-8')
+    api = Api(ledger_mod=_fake_ledger_register([]))          # 真 neb_builder
+    out = api.derive_neb(str(s), str(e), nimages=3)          # 前端经桥传字符串路径
+    assert out['ok'] is True and out['n_images'] == 3
+    imgs = sorted(d for d in os.listdir(out['job_dir']) if d.isdigit())
+    assert imgs == ['00', '01', '02', '03', '04']            # 00 初 + 3 中间 + 末
+    assert 'IMAGES = 3' in (tmp_path / 's_neb' / 'INCAR').read_text(encoding='utf-8')
+
+
+# ── P0-2 formation_binding_calc ───────────────────────────────────────────────
+def _mk_fb_dirs(tmp_path, *, e_sac=-300.0, e_sub=-295.0, with_sub=True):
+    sac = tmp_path / 'sac'
+    sac.mkdir()
+    (sac / 'CONTCAR').write_text(_vasp5_poscar(['Fe', 'N', 'C'], [1, 4, 22]), encoding='utf-8')
+    (sac / 'OSZICAR').write_text(_osz(e_sac), encoding='utf-8')
+    _mark_done_energy_job(sac, e_sac, ['Fe', 'N', 'C'])
+    sub = None
+    if with_sub:
+        sub = tmp_path / 'sub'
+        sub.mkdir()
+        (sub / 'CONTCAR').write_text(_vasp5_poscar(['N', 'C'], [4, 22]), encoding='utf-8')
+        (sub / 'OSZICAR').write_text(_osz(e_sub), encoding='utf-8')
+        _mark_done_energy_job(sub, e_sub, ['N', 'C'])
+    return str(sac), (str(sub) if sub else None)
+
+
+def test_formation_binding_eb_and_sigma(tmp_path):
+    sac, sub = _mk_fb_dirs(tmp_path)
+    calls = {}
+    api = Api(references_mod=_fake_references(calls=calls, cohesive={'Fe': 4.28}))
+    out = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert out['ok'] is True and out['metal'] == 'Fe'
+    assert out['binding_energy'] == -2.0                     # -300 -(-295) -(-3)
+    assert out['sigma'] == round(2.0 / 4.28, 4) and out['stable'] is False
+    assert calls['be'] == (-300.0, -295.0, -3.0)             # 真调 references.binding_energy
+    assert out['method_check']['status'] == 'verified'
+    assert any('孤立原子能量' in warning for warning in out['warnings'])
+    assert out['report_file'] and os.path.isfile(out['report_file'])
+
+
+def test_formation_binding_ef_with_chem_pots(tmp_path):
+    sac, sub = _mk_fb_dirs(tmp_path)
+    api = Api(references_mod=_fake_references(cohesive={'Fe': 4.28}))
+    out = api.formation_binding_calc(sac, sub, {'Fe': -3.0}, {'Fe': -4.0})
+    assert out['formation_energy'] == -1.0                   # -300 -(-295) -(1*-4.0)
+    assert out['counts'] == {'Fe': 1}
+
+
+def test_formation_binding_missing_substrate_hints(tmp_path):
+    sac, _ = _mk_fb_dirs(tmp_path, with_sub=False)
+    api = Api(references_mod=_fake_references())
+    out = api.formation_binding_calc(sac, None, {'Fe': -3.0})
+    assert out['ok'] is False and out['binding_energy'] is None
+    assert any('基底' in h for h in out['hints'])
+
+
+def test_formation_binding_missing_atom_energies_hint(tmp_path):
+    sac, sub = _mk_fb_dirs(tmp_path)
+    api = Api(references_mod=_fake_references())
+    out = api.formation_binding_calc(sac, sub, None)
+    assert out['binding_energy'] is None
+    assert any('金属原子能量' in h for h in out['hints'])
+
+
+def test_formation_binding_metal_not_in_cohesive_table(tmp_path):
+    sac, sub = _mk_fb_dirs(tmp_path)
+    api = Api(references_mod=_fake_references(cohesive={}))    # 内聚能表空 → σ 缺
+    out = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert out['binding_energy'] == -2.0 and out['sigma'] is None
+    assert any('内聚能' in h for h in out['hints'])
+
+
+def test_formation_binding_ef_missing_mu_caught(tmp_path):
+    sac, sub = _mk_fb_dirs(tmp_path)
+    api = Api(references_mod=_fake_references(cohesive={'Fe': 4.28}))
+    out = api.formation_binding_calc(sac, sub, {'Fe': -3.0}, {'Ni': -4.0})  # 缺 Fe 的 μ
+    assert out['formation_energy'] is None
+    assert any('形成能' in h for h in out['hints'])
+
+
+def test_formation_binding_missing_sac_energy(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+
+    sac = tmp_path / 'sac'
+    sac.mkdir()
+    (sac / 'CONTCAR').write_text(_vasp5_poscar(['Fe'], [1]), encoding='utf-8')
+    _mark_done_energy_job(sac, -1.0, ['Fe'])
+    m = real_manifest.load_manifest(sac)
+    m['results'].pop('energy_e0_eV')
+    real_manifest.save_manifest(sac, m)
+    api = Api(references_mod=_fake_references())
+    out = api.formation_binding_calc(str(sac))
+    assert out['ok'] is False and 'energy_e0_eV' in out['error']
+
+
+def test_formation_binding_rejects_non_done_or_method_mismatch(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+
+    sac, sub = _mk_fb_dirs(tmp_path)
+    m = real_manifest.load_manifest(sac)
+    m['state'] = 'RUNNING'
+    real_manifest.save_manifest(sac, m)
+    api = Api(references_mod=_fake_references())
+    blocked = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert blocked['ok'] is False and 'DONE' in blocked['error']
+
+    m['state'] = 'DONE'
+    real_manifest.save_manifest(sac, m)
+    with open(os.path.join(sub, 'INCAR'), 'a', encoding='utf-8') as handle:
+        handle.write('ENCUT=400\n')
+    mismatch = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert mismatch['ok'] is False
+    assert mismatch['method_check']['status'] == 'incompatible'
+    assert 'ENCUT' in mismatch['error']
+
+
+def test_formation_binding_missing_dir():
+    api = Api(references_mod=_fake_references())
+    out = api.formation_binding_calc('/no/sac')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+def test_formation_binding_real_references(tmp_path):
+    # 真引擎:内置 Fe 内聚能 4.28,验证 σ 真算
+    sac, sub = _mk_fb_dirs(tmp_path, e_sac=-300.0, e_sub=-295.0)
+    api = Api()                                              # 真 references
+    out = api.formation_binding_calc(sac, sub, {'Fe': -3.0})
+    assert out['binding_energy'] == -2.0
+    assert out['sigma'] == round(2.0 / 4.28, 4) and out['stable'] is False
+
+
+# ── P0-4 差分电荷:derive_task 分派 + compute_chgdiff ─────────────────────────────
+def test_derive_task_chgdiff_dispatches_three_statics(tmp_path):
+    (tmp_path / 'CONTCAR').write_text(_vasp5_poscar(['Cu', 'O'], [4, 1]), encoding='utf-8')
+    registered, calls, est_calls = [], {}, {}
+    api = Api(chgdiff_mod=_fake_chgdiff(calls=calls),
+              estatic_mod=_fake_estatic(calls=est_calls),
+              ledger_mod=_fake_ledger_register(registered))
+    out = api.derive_task('chgdiff', str(tmp_path), {'adsorbate_indices': [5]})
+    assert out['ok'] is True and len(out['job_dirs']) == 3   # AB/A/B 三作业
+    assert len(registered) == 3
+    assert calls['build']['ads'] == [5]
+    assert 'purposes' not in est_calls                       # 不再误接单静态 build_static_job
+
+
+def test_derive_task_chgdiff_requires_indices(tmp_path):
+    (tmp_path / 'CONTCAR').write_text(_vasp5_poscar(['Cu', 'O'], [4, 1]), encoding='utf-8')
+    api = Api(chgdiff_mod=_fake_chgdiff())
+    out = api.derive_task('chgdiff', str(tmp_path), {})
+    assert out['ok'] is False and '序号' in out['error'] and out['job_dirs'] == []
+
+
+def test_chgdiff_not_in_electronic_map():
+    # 回归守卫:chgdiff 不再在电子学单静态表(名副其实,不误接 build_static_job)
+    assert 'chgdiff' not in Api._DERIVE_ELECTRONIC
+
+
+def test_compute_chgdiff_happy_with_profile(tmp_path):
+    dirs = {}
+    for tag in ('AB', 'A', 'B'):
+        d = tmp_path / tag
+        d.mkdir()
+        (d / 'CHGCAR').write_text('grid', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'])
+        dirs[tag] = str(d)
+    calls = {}
+    api = Api(chgdiff_mod=_fake_chgdiff(calls=calls))
+    out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'], str(tmp_path / 'o'))
+    assert out['ok'] is True and out['max'] == 8.0 and out['n_grid'] == 8
+    assert out['out'].endswith('CHGDIFF.vasp')
+    assert out['profile']['z'] == [0.0, 1.0]                 # 面平均 charge_profile
+    assert os.path.basename(calls['compute']['ab']) == 'CHGCAR'
+    assert out['report_file'] and os.path.isfile(out['report_file'])
+
+
+def test_compute_chgdiff_rejects_method_mismatch_before_grid_subtraction(tmp_path):
+    dirs = {}
+    for tag in ('AB', 'A', 'B'):
+        d = tmp_path / tag
+        d.mkdir()
+        (d / 'CHGCAR').write_text('grid', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'], encut=600 if tag == 'B' else 500)
+        dirs[tag] = str(d)
+    calls = {}
+    api = Api(chgdiff_mod=_fake_chgdiff(calls=calls))
+
+    out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
+
+    assert out['ok'] is False and out['method_check']['status'] == 'incompatible'
+    assert 'ENCUT' in out['error'] and 'compute' not in calls
+
+
+def test_compute_chgdiff_missing_chgcar(tmp_path):
+    ab = tmp_path / 'AB'
+    ab.mkdir()                              # 无 CHGCAR
+    a = tmp_path / 'A'
+    a.mkdir()
+    (a / 'CHGCAR').write_text('x', encoding='utf-8')
+    b = tmp_path / 'B'
+    b.mkdir()
+    (b / 'CHGCAR').write_text('x', encoding='utf-8')
+    api = Api(chgdiff_mod=_fake_chgdiff())
+    out = api.compute_chgdiff(str(ab), str(a), str(b))
+    assert out['ok'] is False and 'CHGCAR' in out['error']
+
+
+def test_compute_chgdiff_missing_dir(tmp_path):
+    api = Api(chgdiff_mod=_fake_chgdiff())
+    out = api.compute_chgdiff('/no/ab', '/no/a', '/no/b')
+    assert out['ok'] is False and '不存在' in out['error']
+
+
+def test_compute_chgdiff_engine_error_caught(tmp_path):
+    dirs = {}
+    for tag in ('AB', 'A', 'B'):
+        d = tmp_path / tag
+        d.mkdir()
+        (d / 'CHGCAR').write_text('x', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'])
+        dirs[tag] = str(d)
+    api = Api(chgdiff_mod=_fake_chgdiff(compute_boom=ValueError('AB 与 A 网格不一致')))
+    out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
+    assert out['ok'] is False and '网格不一致' in out['error']
+
+
+def test_compute_chgdiff_profile_failure_does_not_block(tmp_path):
+    dirs = {}
+    for tag in ('AB', 'A', 'B'):
+        d = tmp_path / tag
+        d.mkdir()
+        (d / 'CHGCAR').write_text('x', encoding='utf-8')
+        (d / 'CONTCAR').write_text(_vasp5_poscar(['Si'], [1]), encoding='utf-8')
+        (d / 'OSZICAR').write_text(_osz(-10.0), encoding='utf-8')
+        _mark_done_energy_job(d, -10.0, ['Si'])
+        dirs[tag] = str(d)
+    api = Api(chgdiff_mod=_fake_chgdiff(profile='boom'))
+    out = api.compute_chgdiff(dirs['AB'], dirs['A'], dirs['B'])
+    assert out['ok'] is True and out['profile'] == {}        # 面平均失败不挡主产物
+
+
+# ── P0-3 VASPsol ───────────────────────────────────────────────────────────────
+def test_vaspsol_preview_water_default():
+    api = Api(incar_builder_mod=_fake_incar_builder())
+    out = api.vaspsol_preview(78.4)
+    assert out['ok'] is True and out['keys'] == {'LSOL': True, 'EB_K': 78.4}
+    assert out['incar_lines'] == ['LSOL = .TRUE.', 'EB_K = 78.4']
+    assert 'VASPsol' in out['warning']
+
+
+def test_vaspsol_preview_custom_dielectric():
+    api = Api(incar_builder_mod=_fake_incar_builder())
+    out = api.vaspsol_preview(37.5)
+    assert out['incar_lines'] == ['LSOL = .TRUE.', 'EB_K = 37.5']
+
+
+def test_vaspsol_preview_disabled():
+    api = Api(incar_builder_mod=_fake_incar_builder())
+    out = api.vaspsol_preview(78.4, False)
+    assert out['keys'] == {'LSOL': False} and out['incar_lines'] == ['LSOL = .FALSE.']
+
+
+def test_vaspsol_preview_real_engine():
+    api = Api()                                             # 真 incar_builder
+    out = api.vaspsol_preview(78.4)
+    assert out['ok'] is True and out['keys']['LSOL'] is True
+    assert 'LSOL = .TRUE.' in out['incar_lines'] and '补丁' in out['warning']
+
+
+def test_gen_run_solvation_appends_keys_and_advisory(tmp_path):
+    (tmp_path / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    payload = {'ok': True, 'out_dir': str(tmp_path), 'warnings': [], 'kpoints': [3, 3, 1],
+               'elements': ['Fe']}
+    jb = types.SimpleNamespace(build_job_dir=lambda p, i, o, **k: dict(payload))
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register([]),
+              incar_builder_mod=_fake_incar_builder())
+    out = api.gen_run('/p/POSCAR', '/p/INCAR', str(tmp_path), '/lib', 'slab', None,
+                      {'enabled': True, 'eb_k': 37.5})
+    assert out['ok'] is True
+    incar = (tmp_path / 'INCAR').read_text(encoding='utf-8')
+    assert 'LSOL = .TRUE.' in incar and 'EB_K = 37.5' in incar
+    assert any('VASPsol' in w for w in out['warnings'])
+    assert any('静默' in w for w in out['warnings'])         # 补丁编译 advisory 一并显示
+
+
+def test_gen_run_solvation_off_is_backward_compatible(tmp_path):
+    (tmp_path / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    payload = {'ok': True, 'out_dir': str(tmp_path), 'warnings': [], 'kpoints': [3, 3, 1],
+               'elements': ['Fe']}
+    jb = types.SimpleNamespace(build_job_dir=lambda p, i, o, **k: dict(payload))
+    api = Api(config_mod=_fake_config(), logic_mod=_fake_logic(errs=[]),
+              job_builder_mod=jb, manifest_mod=_fake_manifest({}),
+              ledger_mod=_fake_ledger_register([]),
+              incar_builder_mod=_fake_incar_builder())
+    out = api.gen_run('/p/POSCAR', '/p/INCAR', str(tmp_path), '/lib')  # 无 solvation 参数
+    assert out['ok'] is True
+    assert 'LSOL' not in (tmp_path / 'INCAR').read_text(encoding='utf-8')
+
+
+# ── P1-1 conv_thickness 诚实化 ─────────────────────────────────────────────────
+def _fake_conv_scan_thickness_note():
+    m = _fake_conv_scan()
+    m.build_slab_thickness_series = lambda src, out_root, layers, **kw: {
+        'out_root': out_root, 'dirs': {}, 'series': [], 'results': {}, 'warnings': [],
+        'note': '层厚收敛需从建 slab 流程发起(裸 CONTCAR 无米勒面信息)'}
+    return m
+
+
+def test_derive_task_conv_thickness_honest_note(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(conv_scan_mod=_fake_conv_scan_thickness_note(),
+              ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('conv_thickness', str(tmp_path), {'layers': [3, 4, 5]})
+    assert out['ok'] is True and out['job_dirs'] == []       # 0 作业但不假成功
+    assert out['note'] and '层厚' in out['note']
+    assert any('层厚' in w for w in out['warnings'])          # note 并入 warnings,不再被吞
+
+
+def test_derive_task_conv_vacuum_no_spurious_note(tmp_path):
+    (tmp_path / 'CONTCAR').write_text('x', encoding='utf-8')
+    api = Api(conv_scan_mod=_fake_conv_scan(), ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('conv_vacuum', str(tmp_path), {'vacuums': [10, 12]})
+    assert out['ok'] is True and len(out['job_dirs']) == 2 and out.get('note') is None
+
+
+# ── Backlog #2:金属 slab 建模 + 层厚收敛可再生入口 ────────────────────────────
+def _fake_metal_slab(*, calls=None, boom=None):
+    calls = calls if calls is not None else {}
+    m = types.SimpleNamespace()
+    m.supported_surfaces = lambda: [{'structure': 'fcc', 'miller': '111'}]
+    m.LATTICE_GUESS = {'fcc': {'Pt': 3.924}}
+
+    def _build(element, structure='fcc', miller='111', layers=4, **kw):
+        if boom is not None:
+            raise ValueError(boom)
+        calls['build'] = {'element': element, 'structure': structure,
+                          'miller': miller, 'layers': layers, **kw}
+        recipe = {'kind': 'metal_slab', 'element': element, 'structure': structure,
+                  'miller': miller, 'layers': int(layers), 'nx': kw.get('nx', 3),
+                  'ny': kw.get('ny', 3), 'vacuum': kw.get('vacuum', 15.0),
+                  'a': 3.924, 'fix_bottom': kw.get('fix_bottom', 0)}
+        return {'poscar': f'{element} slab\n1.0\n', 'recipe': recipe,
+                'description': f'{element} {structure}({miller}) {layers} 层',
+                'warnings': ['晶格常数 a=3.924 Å 取自实验值初猜表'], 'natoms': 4 * int(layers)}
+    m.build_metal_slab = _build
+
+    def _from_recipe(recipe):
+        calls['recipe'] = dict(recipe)
+
+        def _fn(n):
+            calls.setdefault('regen', []).append(int(n))
+            return f'regen {n} layers\n1.0\n'
+        return _fn
+    m.slab_builder_from_recipe = _from_recipe
+    return m
+
+
+def _fake_manifest_recipe(store):
+    """manifest 假件(带 load/save):支持 _annotate_recipe 往 job.yaml 合入配方。"""
+    m = types.SimpleNamespace()
+    m.create_from_build = lambda jd, payload, *, poscar_path, validate: store.__setitem__(
+        str(jd), {'job_id': os.path.basename(str(jd)), 'inputs': {}})
+    m.new_manifest = lambda **kw: {'job_id': kw.get('job_id'),
+                                   'inputs': dict(kw.get('inputs') or {}),
+                                   'warnings': list(kw.get('warnings') or [])}
+    m.load_manifest = lambda jd: store.get(str(jd))
+    m.save_manifest = lambda jd, man: store.__setitem__(str(jd), man)
+    return m
+
+
+def test_metal_slab_catalog_shape():
+    api = Api(metal_slab_mod=_fake_metal_slab())
+    out = api.metal_slab_catalog()
+    assert out['ok'] is True
+    assert out['surfaces'] == [{'structure': 'fcc', 'miller': '111'}]
+    assert out['guess']['fcc']['Pt'] == 3.924
+
+
+def test_metal_slab_build_requires_out_dir_and_valid_incar(tmp_path):
+    api = Api(metal_slab_mod=_fake_metal_slab())
+    out = api.metal_slab_build('Pt', 'fcc', '111', 4)
+    assert out['ok'] is False and '输出目录' in out['error']
+    out2 = api.metal_slab_build('Pt', 'fcc', '111', 4, None, None, 3, 3, 15.0, 0,
+                                str(tmp_path / 'no_incar'), str(tmp_path / 'j'))
+    assert out2['ok'] is False and 'INCAR 不存在' in out2['error']
+
+
+def test_metal_slab_build_poscar_only_writes_recipe(tmp_path):
+    store = {}
+    d = tmp_path / 'Pt111'
+    api = Api(metal_slab_mod=_fake_metal_slab(),
+              manifest_mod=_fake_manifest_recipe(store))
+    out = api.metal_slab_build('Pt', 'fcc', '111', 4, None, None, 2, 2, 15.0, 0,
+                               None, str(d))
+    assert out['ok'] is True and out['job_dir'] == str(d)
+    assert (d / 'POSCAR').read_text(encoding='utf-8').startswith('Pt slab')
+    assert store[str(d)]['inputs']['recipe']['kind'] == 'metal_slab'   # 配方入 job.yaml
+    assert any('补全' in w for w in out['warnings'])                    # 提示去②生成输入
+    assert any('初猜' in w for w in out['warnings'])                    # 晶格常数口径提醒透传
+
+
+def test_metal_slab_build_with_incar_full_chain(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('ENCUT=500\n', encoding='utf-8')
+    store, registered, built = {}, [], []
+    d = tmp_path / 'Pt111'
+    api = Api(metal_slab_mod=_fake_metal_slab(), job_builder_mod=_fake_jb_text(built),
+              manifest_mod=_fake_manifest_recipe(store),
+              ledger_mod=_fake_ledger_register(registered),
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/lib'}))
+    out = api.metal_slab_build('Pt', 'fcc', '111', 4, None, None, 3, 3, 15.0, 2,
+                               str(incar), str(d))
+    assert out['ok'] is True and built == [str(d)]      # 走四件套链
+    assert registered == [str(d)]                        # 入台账
+    assert store[str(d)]['inputs']['recipe']['fix_bottom'] == 2
+
+
+def test_metal_slab_build_engine_error_caught():
+    api = Api(metal_slab_mod=_fake_metal_slab(boom='不支持的结构/晶面组合'))
+    out = api.metal_slab_build('Pt', 'fcc', '211', 4, None, None, 3, 3, 15.0, 0,
+                               None, '/tmp/x')
+    assert out['ok'] is False and '不支持' in out['error']
+
+
+def test_derive_conv_thickness_regenerates_from_recipe(tmp_path):
+    """核心接通:job.yaml 带 metal_slab 配方 → 层厚系列真生成(不再诚实报错)。"""
+    from vcstudio.shared import manifest as real_manifest
+    src = tmp_path / 'base'
+    src.mkdir()
+    (src / 'CONTCAR').write_text('x\n', encoding='utf-8')
+    (src / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    man = real_manifest.new_manifest(
+        job_id='base', system='Pt slab', task_type='relax', calc_type='slab',
+        inputs={'recipe': {'kind': 'metal_slab', 'element': 'Pt', 'structure': 'fcc',
+                           'miller': '111', 'layers': 4, 'nx': 1, 'ny': 1,
+                           'vacuum': 15.0, 'a': 3.924, 'fix_bottom': 0}})
+    real_manifest.save_manifest(str(src), man)
+    calls = {}
+    api = Api(metal_slab_mod=_fake_metal_slab(calls=calls),
+              ledger_mod=_fake_ledger_register([]))     # conv_scan 用真引擎
+    out = api.derive_task('conv_thickness', str(src), {'layers': [3, 4]})
+    assert out['ok'] is True and out.get('note') is None
+    assert len(out['job_dirs']) == 2                     # 系列真生成
+    assert calls['regen'] == [3, 4]                      # 配方再生器逐层调用
+    for jd, n in zip(out['job_dirs'], (3, 4)):
+        with open(os.path.join(jd, 'POSCAR'), encoding='utf-8') as f:
+            assert f.read().startswith(f'regen {n}')     # 各作业 POSCAR 为对应层数再生
+        assert os.path.isfile(os.path.join(jd, 'INCAR'))  # INCAR 同源复制
+
+
+def test_derive_conv_thickness_sac_recipe_targeted_note(tmp_path):
+    """SAC 石墨烯作业派层厚 → 0 作业 + 「单层无层厚概念」针对性说明(不套通用报错)。"""
+    from vcstudio.shared import manifest as real_manifest
+    src = tmp_path / 'fe_mn4_clean'
+    src.mkdir()
+    (src / 'CONTCAR').write_text('x\n', encoding='utf-8')
+    (src / 'INCAR').write_text('ENCUT = 500\n', encoding='utf-8')
+    man = real_manifest.new_manifest(
+        job_id='fe', system='Fe@MN4', task_type='relax', calc_type='slab',
+        inputs={'recipe': {'kind': 'sac', 'template': 'MN4', 'metal': 'Fe'}})
+    real_manifest.save_manifest(str(src), man)
+    api = Api(ledger_mod=_fake_ledger_register([]))
+    out = api.derive_task('conv_thickness', str(src), {'layers': [3, 4]})
+    assert out['ok'] is True and out['job_dirs'] == []
+    assert '层厚' in (out.get('note') or '') and 'SAC' in out['note']
+    assert any('SAC' in w for w in out['warnings'])
+
+
+def test_sac_matrix_generate_annotates_sac_recipe(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text('E\n', encoding='utf-8')
+    store = {}
+    api = Api(sac_mods=_fake_sac(), job_builder_mod=_fake_jb_text(),
+              manifest_mod=_fake_manifest_recipe(store),
+              ledger_mod=_fake_ledger_register([]),
+              adsorption_mod=_fake_ads_projects(), campaign_mods=_fake_campaign(),
+              config_mod=_fake_config())
+    out = api.sac_matrix_generate(['Fe'], ['MN4'], ['S8'], 'metal_top', 1,
+                                  str(incar), str(tmp_path))
+    assert out['ok'] is True and out['created'] == 2
+    kinds = {v['inputs'].get('recipe', {}).get('kind') for v in store.values()}
+    assert kinds == {'sac'}                              # 清洁面与构型作业均注记 SAC 来源
+
+
+# ── P2 任务性质徽标 ────────────────────────────────────────────────────────────
+def test_task_catalog_kind_badges():
+    api = Api()                                             # 真 task_catalog
+    out = api.task_catalog()
+    badges = {t['key']: t['kind_badge'] for t in out['tasks']}
+    assert badges['vaspsol'] == '作业生成'
+    assert badges['formation_binding'] == '结果计算器'
+    assert badges['surface_energy'] == '结果计算器'
+    assert badges['relax'] == '作业生成' and badges['chgdiff'] == '作业生成'
+    assert badges['neb'] == '作业生成'
+
+
+def test_task_badge_classifier():
+    assert Api._task_badge('vcstudio.generate.incar_builder:vaspsol_keys') == 'INCAR 顾问'
+    assert Api._task_badge('vcstudio.project.references:binding_energy') == '结果计算器'
+    assert Api._task_badge('vcstudio.project.surface_energy:surface_energy') == '结果计算器'
+    assert Api._task_badge('vcstudio.generate.job_builder:build_job_dir') == '作业生成'
+    assert Api._task_badge('') == '作业生成'
+
+
+# ═══ v3.3.0:实时能量曲线 / 剪贴板贴图 / 实耗核时 / BCP 表 ═══════════════════════
+_OSZ_TEXT = (
+    '       N       E                     dE\n'
+    'DAV:   1    -0.850181750000E+02   -0.85018E+02   -0.11945E+03  6280   0.259E+02\n'
+    '   1 F= -.85018175E+02 E0= -.85018175E+02  d E =-.850182E+02\n'
+    'DAV:   1    -0.851200000000E+02   -0.10182E+00   -0.63021E-02  1544   0.554E+00\n'
+    '   2 F= -.85120000E+02 E0= -.85120000E+02  d E =-.101825E+00\n')
+
+_MINI_POSCAR = 'sys\n1.0\n 3 0 0\n 0 3 0\n 0 0 3\n C O\n 1 1\nCartesian\n 0 0 0\n 1 1 1\n'
+
+
+def _fake_conn_read(content=b'', *, connect_boom=False, missing=False):
+    """connection 假件(实时曲线用):open_client → sftp.file 读远端 OSZICAR。"""
+    m = types.SimpleNamespace()
+
+    class _CE(Exception):
+        def __init__(self, msg, needs_trust=False):
+            super().__init__(msg)
+            self.needs_trust = needs_trust
+    m.ConnectError = _CE
+
+    class _F:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return content
+
+    class _SFTP:
+        def file(self, path, mode):
+            if missing:
+                raise FileNotFoundError(path)
+            return _F()
+
+        def close(self):
+            pass
+
+    class _Client:
+        def open_sftp(self):
+            return _SFTP()
+
+    def _open(prof, pw, trust_new=False):
+        if connect_boom:
+            raise _CE('无法确认主机指纹', needs_trust=True)
+        return _Client(), None
+    m.open_client = _open
+    m.close_quiet = lambda c, j: None
+    return m
+
+
+def test_job_live_energy_local_oszicar(tmp_path):
+    (tmp_path / 'OSZICAR').write_text(_OSZ_TEXT, encoding='utf-8')
+    (tmp_path / 'POSCAR').write_text(_MINI_POSCAR, encoding='utf-8')
+    api = Api()
+    out = api.job_live_energy(str(tmp_path))
+    assert out['ok'] is True and out['source'] == 'local'
+    assert [p['n'] for p in out['steps']] == [1, 2]
+    assert abs(out['steps'][0]['e0'] + 85.018175) < 1e-6
+    assert abs(out['steps'][1]['de'] - 0.101825) < 1e-6   # 相邻步 |ΔE0|
+    assert out['natoms'] == 2
+
+
+def test_job_live_energy_remote_via_manifest(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+    m = real_manifest.new_manifest(job_id='j', system='s', task_type='relax',
+                                   calc_type='slab', inputs={})
+    m['remote_dir'] = '/work/j'
+    m['cluster'] = 'hpc'
+    real_manifest.save_manifest(str(tmp_path), m)
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
+              connection_mod=_fake_conn_read(_OSZ_TEXT.encode('utf-8')))
+    out = api.job_live_energy(str(tmp_path))
+    assert out['ok'] is True and out['source'] == 'remote' and len(out['steps']) == 2
+
+
+def test_job_live_energy_remote_not_started_yet(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+    m = real_manifest.new_manifest(job_id='j', system='s', task_type='relax',
+                                   calc_type='slab', inputs={})
+    m['remote_dir'] = '/work/j'
+    m['cluster'] = 'hpc'
+    real_manifest.save_manifest(str(tmp_path), m)
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
+              connection_mod=_fake_conn_read(missing=True))
+    out = api.job_live_energy(str(tmp_path))
+    assert out['ok'] is False and '远端尚无 OSZICAR' in out['error']
+
+
+def test_job_live_energy_unsubmitted_honest(tmp_path):
+    (tmp_path / 'job.yaml').write_text('state: CREATED\n', encoding='utf-8')
+    out = Api().job_live_energy(str(tmp_path))
+    assert out['ok'] is False and '尚未提交' in out['error']
+
+
+def test_job_live_energy_legacy_remote_dir_requires_explicit_cluster_binding(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+
+    m = real_manifest.new_manifest(job_id='legacy', system='s', task_type='relax',
+                                   calc_type='slab', inputs={})
+    m['remote_dir'] = '/work/legacy'
+    real_manifest.save_manifest(str(tmp_path), m)
+    connection = types.SimpleNamespace(
+        open_client=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError('未绑定时不得联网')))
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc')}),
+              connection_mod=connection)
+
+    out = api.job_live_energy(str(tmp_path), name='hpc')
+
+    assert out['ok'] is False
+    assert '未记录所属服务器' in out['error']
+
+
+def test_api_poscar_volume_honors_negative_and_three_component_scaling(tmp_path):
+    negative = tmp_path / 'negative'
+    negative.mkdir()
+    (negative / 'POSCAR').write_text(
+        'target volume\n-125\n1 0 0\n0 1 0\n0 0 1\nH\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    anisotropic = tmp_path / 'anisotropic'
+    anisotropic.mkdir()
+    (anisotropic / 'POSCAR').write_text(
+        'three scales\n2 3 4\n1 0 0\n0 1 0\n0 0 1\nH\n1\nDirect\n0 0 0\n',
+        encoding='utf-8')
+    assert abs(Api._poscar_volume(str(negative)) - 125.0) < 1e-9
+    assert abs(Api._poscar_volume(str(anisotropic)) - 24.0) < 1e-9
+
+
+def test_job_live_energy_needs_trust_passthrough(tmp_path):
+    from vcstudio.shared import manifest as real_manifest
+    m = real_manifest.new_manifest(job_id='j', system='s', task_type='relax',
+                                   calc_type='slab', inputs={})
+    m['remote_dir'] = '/work/j'
+    m['cluster'] = 'hpc'
+    real_manifest.save_manifest(str(tmp_path), m)
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
+              connection_mod=_fake_conn_read(connect_boom=True))
+    out = api.job_live_energy(str(tmp_path))
+    assert out['ok'] is False and out['needs_trust'] is True
+
+
+def test_mol_image_b64_to_smiles_roundtrip():
+    import base64 as _b64
+    calls = {}
+    api = Api(molbuild_mods=_fake_molbuild(calls=calls))
+    payload = _b64.b64encode(b'\x89PNG fake image bytes' * 8).decode('ascii')
+    out = api.mol_image_b64_to_smiles('data:image/png;base64,' + payload)
+    assert out['ok'] is True and out['smiles']
+    assert calls['img'].endswith('.png') and os.path.isfile(calls['img'])
+    assert out['image_path'] == calls['img']              # 临时图片落盘供复查
+
+
+def test_mol_image_b64_to_smiles_rejects_bad_data():
+    api = Api(molbuild_mods=_fake_molbuild())
+    assert '没有图片' in api.mol_image_b64_to_smiles('')['error']
+    assert '不是合法 base64' in api.mol_image_b64_to_smiles('!!!not-b64!!!')['error']
+    import base64 as _b64
+    tiny = _b64.b64encode(b'xx').decode('ascii')
+    assert '过小' in api.mol_image_b64_to_smiles(tiny)['error']
+
+
+def test_usage_stats_api_totals():
+    now_iso = __import__('datetime').datetime.now()
+    t0 = (now_iso - __import__('datetime').timedelta(hours=2)).isoformat(timespec='seconds')
+    t1 = (now_iso - __import__('datetime').timedelta(hours=1)).isoformat(timespec='seconds')
+    entries = [('/j/a', {'state': 'DONE', 'cluster': 'hpc',
+                         'state_history': [{'state': 'RUNNING', 'at': t0},
+                                           {'state': 'DONE', 'at': t1}],
+                         'attempts': [{'cores': 64}]}),
+               ('/j/nc', {'state': 'DONE', 'cluster': 'nope',
+                          'state_history': [{'state': 'RUNNING', 'at': t0},
+                                            {'state': 'DONE', 'at': t1}],
+                          'attempts': []})]
+    api = Api(ledger_mod=_fake_ledger(entries, []),
+              profiles_mod=_fake_profiles({'hpc': types.SimpleNamespace(auth='key',
+                                                                        nodes=1, ppn=32)}))
+    out = api.usage_stats(30)
+    assert out['ok'] is True and out['jobs_counted'] == 1
+    assert abs(out['core_hours'] - 64.0) < 0.5            # 1h × 64 核(时间戳秒级误差容忍)
+    assert len(out['unknown']) == 1                       # 无核数作业单列,不编数
+
+
+def test_overview_stats_includes_actual_usage_fields():
+    import datetime
+    now = datetime.datetime.now().isoformat()
+    entries = [('/a', {'state': 'DONE', 'created_at': now})]
+    api = Api(ledger_mod=_fake_ledger(entries, []),
+              campaign_mods=_fake_campaign(campaigns={}),
+              config_mod=_fake_config(ui={'campaign_dirs': []}))
+    out = api.overview_stats()
+    assert out['ok'] is True
+    assert out['used_core_hours_30d'] == 0.0              # 无 state_history → 实耗 0,不编数
+    assert out['usage_unknown_n'] == 0
+
+
+def test_wavefn_bcp_parses_cpprop(tmp_path):
+    from vcstudio.external import multiwfn_driver as real_md
+    cpp = tmp_path / 'aim_cp_CPprop.txt'
+    cpp.write_text(' ----------------   CP     1,     Type (3,-1)   ----------------\n'
+                   ' Position (Bohr):   0.5 0.0 0.0\n'
+                   ' Density of all electrons:  0.6280000000E-01\n'
+                   ' Potential energy density V(r):  -0.2400000000E-01\n', encoding='utf-8')
+    mw = _fake_multiwfn(run_ret={'ok': True, 'outputs': [str(cpp)],
+                                 'stdout_tail': 'done', 'elapsed_s': 1.0, 'error': ''})
+    mw.cpprop_parse = real_md.cpprop_parse
+    api = Api(multiwfn_mod=mw, config_mod=_fake_config(cfg={}))
+    out = api.wavefn_bcp(str(tmp_path / 'mol.fchk'))
+    assert out['ok'] is True and len(out['cps']) == 1
+    assert out['cps'][0]['type'] == '(3,-1)'
+    assert out['cps'][0]['bond_energy_kcal'] is not None
+    assert 'Espinosa' in out['note']                      # 键能口径显式注明
+
+
+def test_wavefn_bcp_old_engine_honest(tmp_path):
+    api = Api(multiwfn_mod=_fake_multiwfn(), config_mod=_fake_config(cfg={}))
+    out = api.wavefn_bcp(str(tmp_path / 'mol.fchk'))
+    assert out['ok'] is False and '引擎待扩展' in out['error']
+
+
+# ── Li-S 一站式项目后端 ─────────────────────────────────────────────────────
+def test_proj_scan_structures_api_uses_recursive_read_only_scanner(tmp_path):
+    folder = tmp_path / 'Li2S8_top'
+    folder.mkdir()
+    structure = folder / 'POSCAR'
+    structure.write_text('x', encoding='utf-8')
+
+    out = Api().proj_scan_structures(str(tmp_path))
+
+    assert out['ok'] is True and out['error'] is None
+    assert len(out['items']) == 1
+    assert {key: out['items'][0][key] for key in ('path', 'name', 'species')} == {
+        'path': str(structure.resolve()), 'name': 'POSCAR', 'species': 'Li2S8'}
+    assert out['items'][0]['species_source'] == 'path_name'
+
+
+def test_proj_scan_lis_inputs_api_returns_one_folder_bundle(tmp_path):
+    payload = {
+        'root': str(tmp_path), 'incar': str(tmp_path / 'INCAR'),
+        'incar_candidates': [str(tmp_path / 'INCAR')],
+        'clean_slab': str(tmp_path / 'clean' / 'POSCAR'),
+        'clean_candidates': [], 'configs': [{'path': '/ads/POSCAR'}],
+        'structures': [], 'warnings': [], 'source_read_only': True,
+    }
+    adsorption = types.SimpleNamespace(scan_lis_input_bundle=lambda root: {
+        **payload, 'root': str(root)})
+
+    out = Api(adsorption_mod=adsorption).proj_scan_lis_inputs(str(tmp_path))
+
+    assert out['ok'] is True and out['incar'] == str(tmp_path / 'INCAR')
+    assert out['clean_slab'].endswith(os.path.join('clean', 'POSCAR'))
+    assert out['configs'] == [{'path': '/ads/POSCAR'}]
+
+
+def _lis_reference_fake(tmp_path, states, create_calls):
+    project_path = str(tmp_path / 'reference' / 'project.yaml')
+    ref_jobs = {species: str(tmp_path / 'reference' / 'molecules' / f'mol_{species}')
+                for species in states}
+    reference = {'root': str(tmp_path / 'reference'),
+                 'molecules_dir': str(tmp_path / 'reference' / 'molecules'),
+                 'species_ref_jobs': ref_jobs, 'members': {'configs': []}}
+    adsorption = types.SimpleNamespace()
+    adsorption.load_project = lambda path: reference if path == project_path else None
+
+    def create(root, name, **kwargs):
+        create_calls.update(root=root, name=name, **kwargs)
+        generated = [('lis_slab_clean', os.path.join(root, 'lis_slab_clean'), []),
+                     ('lis_ads_Li2S8_top', os.path.join(root, 'lis_ads_Li2S8_top'), [])]
+        return {'ok': True, 'project_path': os.path.join(root, 'project.yaml'),
+                'generated': generated, 'errors': [], 'advisories': []}
+
+    adsorption.create_project = create
+    manifest_states = {
+        ref_jobs[species]: {'state': state,
+                            'results': {
+                                'energy_e0_eV': -30.0 - index,
+                                'reference_method_signature': {
+                                    'functional': 'RPBE', 'ivdw': 0, 'ispin': 1,
+                                    'ldau': 'F', 'encut': 400.0,
+                                    'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+                                }}}
+        for index, (species, state) in enumerate(states.items())
+    }
+    for job_dir, item in manifest_states.items():
+        os.makedirs(job_dir, exist_ok=True)
+        energy = item['results']['energy_e0_eV']
+        with open(os.path.join(job_dir, 'OSZICAR'), 'w', encoding='utf-8') as handle:
+            handle.write(f' 1 F= {energy:.12f} E0= {energy:.12f} d E =0\n')
+        with open(os.path.join(job_dir, 'OUTCAR'), 'w', encoding='utf-8') as handle:
+            handle.write('General timing and accounting information for this job\n')
+    manifests = types.SimpleNamespace(load_manifest=lambda path: manifest_states.get(path))
+    return project_path, adsorption, manifests
+
+
+def _write_lis_prepare_inputs(slab, config, incar):
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    incar.write_text('ENCUT = 400\nGGA = RP\nISPIN = 1\nIVDW = 0\n', encoding='utf-8')
+
+
+def _write_lis_potcar_library(root):
+    for element, enmax in {'C': 300.0, 'Li': 250.0, 'S': 400.0}.items():
+        folder = root / element
+        folder.mkdir(parents=True)
+        (folder / 'POTCAR').write_text(
+            f'TITEL = PAW_PBE {element}\nENMAX = {enmax}; ENMIN = 100\n',
+            encoding='utf-8')
+
+
+def test_proj_prepare_lis_reuses_only_required_done_reference_jobs_and_persists_mapping(
+        tmp_path):
+    slab = tmp_path / 'slab.vasp'
+    config = tmp_path / 'Li2S8_top.vasp'
+    incar = tmp_path / 'INCAR'
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE', 'S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': '/potentials'}))
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '单测假赝势库无法核对 TITEL'})
+
+    assert out['ok'] is True and out['reference_species'] == ['Li2S8']
+    assert len(out['job_dirs']) == 2
+    assert calls['root'] == str(tmp_path / 'out' / 'lis')
+    assert calls['config_species'] == {str(config.resolve()): 'Li2S8'}
+    assert calls['species_refs'] == {'Li2S8': -30.0}
+    assert set(calls['species_ref_jobs']) == {'Li2S8'}
+    assert calls['species_ref_jobs']['Li2S8'].endswith('mol_Li2S8')
+    assert calls['reference_project'] == reference_path
+    assert calls['lib_root'] == '/potentials'
+
+
+def test_proj_prepare_lis_binds_each_member_incar_and_keeps_runtime_controls_independent(
+        tmp_path):
+    clean_dir = tmp_path / 'inputs' / 'clean'
+    config_dir = tmp_path / 'inputs' / 'Li2S8_top'
+    clean_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True)
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    clean_incar = clean_dir / 'INCAR'
+    config_incar = config_dir / 'incar'
+    common = 'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n'
+    clean_incar.write_text(common + 'NSW=40\nIBRION=2\n', encoding='utf-8')
+    config_incar.write_text(common + 'NSW=120\nIBRION=1\n', encoding='utf-8')
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    evidence = {
+        'clean_slab': {'path': str(clean_incar), 'sha256': _sha256_file(clean_incar)},
+        'configs': [{'path': str(config), 'incar_path': str(config_incar),
+                     'incar_sha256': _sha256_file(config_incar)}],
+    }
+
+    out = api.proj_prepare_lis(
+        'per-member', str(slab),
+        [{'path': str(config), 'species': 'Li2S8',
+          'incar_path': str(config_incar), 'incar_sha256': _sha256_file(config_incar)}],
+        '', str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '逐成员只调整 NSW/IBRION；硬方法已核对一致'},
+        evidence)
+
+    assert out['ok'] is True
+    assert calls['member_incars'] == {
+        str(slab.resolve()): str(clean_incar.resolve()),
+        str(config.resolve()): str(config_incar.resolve()),
+    }
+    assert calls['member_source_evidence'] == {
+        str(slab.resolve()): {
+            'poscar': {'path': str(slab.resolve()), 'sha256': _sha256_file(slab)},
+            'incar': {'path': str(clean_incar.resolve()),
+                      'sha256': _sha256_file(clean_incar)},
+        },
+        str(config.resolve()): {
+            'poscar': {'path': str(config.resolve()), 'sha256': _sha256_file(config)},
+            'incar': {'path': str(config_incar.resolve()),
+                      'sha256': _sha256_file(config_incar)},
+        },
+    }
+    prepared_members = calls['preparation']['inputs']['members']
+    assert [row['incar']['sha256'] for row in prepared_members] == [
+        _sha256_file(clean_incar), _sha256_file(config_incar)]
+    assert calls['preparation']['schema'] == 2
+    assert not out['method_check']['issues']
+
+
+def test_proj_prepare_lis_rejects_quartet_changed_after_browser_scan(tmp_path):
+    from vcstudio.project import adsorption as real_adsorption
+
+    clean_dir = tmp_path / 'inputs' / 'clean'
+    config_dir = tmp_path / 'inputs' / 'Li2S8_top'
+    clean_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True)
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    common = 'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\n'
+    for folder, elements in ((clean_dir, ('C',)), (config_dir, ('C', 'Li', 'S'))):
+        (folder / 'INCAR').write_text(common, encoding='utf-8')
+        (folder / 'KPOINTS').write_text(
+            'reviewed mesh\n0\nGamma\n3 3 1\n0 0 0\n', encoding='utf-8')
+        (folder / 'POTCAR').write_text(''.join(
+            f'TITEL = PAW_PBE {element}\nENMAX = 400\n' for element in elements),
+            encoding='utf-8')
+    scanned_clean = real_adsorption.resolve_structure_quartet(slab)
+    scanned_config = real_adsorption.resolve_structure_quartet(config)
+    (clean_dir / 'KPOINTS').write_text(
+        'changed after review\n0\nGamma\n5 5 1\n0 0 0\n', encoding='utf-8')
+
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    adsorption.resolve_structure_quartet = real_adsorption.resolve_structure_quartet
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    evidence = {
+        'clean_slab': {
+            'path': str(clean_dir / 'INCAR'),
+            'sha256': _sha256_file(clean_dir / 'INCAR'),
+            'quartet': scanned_clean,
+        },
+        'configs': [{
+            'path': str(config), 'incar_path': str(config_dir / 'INCAR'),
+            'incar_sha256': _sha256_file(config_dir / 'INCAR'),
+            'quartet': scanned_config,
+        }],
+    }
+
+    out = api.proj_prepare_lis(
+        'changed-after-scan', str(slab),
+        [{'path': str(config), 'species': 'Li2S8'}], '',
+        str(tmp_path / 'out'), reference_path, member_incars=evidence)
+
+    assert out['ok'] is False
+    assert 'KPOINTS' in out['error'] and '扫描后已变化' in out['error']
+    assert not calls
+
+
+def test_proj_prepare_lis_allows_clean_config_ispin_difference_as_advisory(tmp_path):
+    clean_dir = tmp_path / 'clean'
+    config_dir = tmp_path / 'Li2S8_top'
+    clean_dir.mkdir()
+    config_dir.mkdir()
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    clean_incar, config_incar = clean_dir / 'INCAR', config_dir / 'INCAR'
+    base = 'ENCUT=400\nGGA=RP\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\nNSW=40\n'
+    clean_incar.write_text(base + 'ISPIN=1\n', encoding='utf-8')
+    config_incar.write_text(base + 'ISPIN=2\n', encoding='utf-8')
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    out = api.proj_prepare_lis(
+        'spin-mismatch', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        '', str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and calls
+    assert out['method_check']['status'] == 'advisory'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is True
+    assert not out['method_check']['issues']
+    assert any('clean slab' in advisory and 'ISPIN' in advisory
+               and '吸附诱导磁性' in advisory
+               for advisory in out['method_check']['advisories'])
+
+
+def test_proj_prepare_lis_previews_and_applies_only_managed_copy_encut_repair(
+        tmp_path):
+    clean_dir = tmp_path / 'clean'
+    config_dir = tmp_path / 'Li2S8_top'
+    clean_dir.mkdir()
+    config_dir.mkdir()
+    slab, config = clean_dir / 'POSCAR', config_dir / 'POSCAR'
+    clean_incar, config_incar = clean_dir / 'INCAR', config_dir / 'INCAR'
+    header = '1.0\n10 0 0\n0 10 0\n0 0 20\n'
+    slab.write_text('slab\n' + header + 'C\n1\nDirect\n0 0 0\n', encoding='utf-8')
+    config.write_text(
+        'ads\n' + header + 'C Li S\n1 2 8\nDirect\n' + '0 0 0\n' * 11,
+        encoding='utf-8')
+    common = 'GGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n'
+    clean_incar.write_text('ENCUT=400\n' + common, encoding='utf-8')
+    config_incar.write_text('ENCUT=450\n' + common, encoding='utf-8')
+    before = {clean_incar: clean_incar.read_bytes(), config_incar: config_incar.read_bytes()}
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    ref_job = str(tmp_path / 'reference' / 'molecules' / 'mol_Li2S8')
+    ref_manifest = manifests.load_manifest(ref_job)
+    ref_manifest['results']['reference_method_signature']['encut'] = 450.0
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    preview = api.proj_prepare_lis(
+        'repair-preview', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        '', str(tmp_path / 'out'), reference_path)
+
+    assert preview['ok'] is False and preview['needs_repair_decision'] is True
+    assert not calls
+    actions = preview['repair_plan']['actions']
+    assert [(item['key'], item['old'], item['new'], item['risk']) for item in actions] == [
+        ('ENCUT', 400.0, 450, 'low')]
+
+    applied = api.proj_prepare_lis(
+        'repair-preview', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        '', str(tmp_path / 'out'), reference_path,
+        repair_request={'plan_id': preview['repair_plan']['plan_id'], 'mode': 'apply'})
+
+    assert applied['ok'] is True and calls
+    assert calls['member_incar_patches'] == {str(slab.resolve()): {'ENCUT': 450}}
+    assert applied['method_check']['analysis_ready'] is True
+    assert applied['method_check']['comparability_status'] == 'verified'
+    assert not applied['method_check']['issues']
+    assert calls['preparation']['inputs']['planned_methods']['clean_slab']['encut'] == 450.0
+    assert before == {clean_incar: clean_incar.read_bytes(),
+                      config_incar: config_incar.read_bytes()}
+
+
+def test_lis_repair_plan_id_binds_the_entire_member_input_evidence():
+    clean = '/inputs/clean/POSCAR'
+    config = '/inputs/Li2S8_top/POSCAR'
+    paths = [clean, config]
+    plans = {clean: {'encut': 400.0}, config: {'encut': 450.0}}
+    parsed = {clean: {'ENCUT': 400}, config: {'ENCUT': 450}}
+    compositions = {clean: {'C': 1}, config: {'C': 1, 'Li': 2, 'S': 8}}
+    incars = {
+        clean: {'path': '/inputs/clean/INCAR', 'sha256': '1' * 64},
+        config: {'path': '/inputs/Li2S8_top/INCAR', 'sha256': '2' * 64},
+    }
+
+    def evidence(kpoints_hash):
+        return {
+            clean: {
+                'poscar': {'path': clean, 'sha256': '3' * 64},
+                'incar': incars[clean],
+                'kpoints': {'path': '/inputs/clean/KPOINTS',
+                            'sha256': kpoints_hash},
+                'potcar': {'path': '/inputs/clean/POTCAR', 'sha256': '5' * 64},
+            },
+            config: {
+                'poscar': {'path': config, 'sha256': '6' * 64},
+                'incar': incars[config],
+                'kpoints': {'path': '/inputs/Li2S8_top/KPOINTS',
+                            'sha256': '7' * 64},
+                'potcar': {'path': '/inputs/Li2S8_top/POTCAR',
+                           'sha256': '8' * 64},
+            },
+        }
+
+    first = Api._lis_repair_plan(
+        paths, plans, parsed, compositions, incars, evidence('4' * 64))
+    second = Api._lis_repair_plan(
+        paths, plans, parsed, compositions, incars, evidence('9' * 64))
+
+    assert first['plan_id'] != second['plan_id']
+    assert set(first['evidence'][clean]['files']) == {
+        'POSCAR', 'INCAR', 'KPOINTS', 'POTCAR'}
+
+
+def test_proj_prepare_lis_generates_with_reference_encut_analysis_blocked(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'GGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = F\nMETAGGA = F\nLHFCALC = F\n',
+        encoding='utf-8')
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and out['method_check']['status'] == 'analysis_blocked'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is False
+    assert out['method_check']['planned']['encut'] == 550
+    assert out['method_check']['planned']['encut_source'] == (
+        'potcar_enmax_1.3_round_up_50')
+    assert any('ENCUT' in issue for issue in out['method_check']['issues'])
+    assert calls
+
+
+def test_proj_prepare_lis_auto_effective_encut_can_be_fully_verified(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'GGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = F\nMETAGGA = F\nLHFCALC = F\n',
+        encoding='utf-8')
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    signature = manifests.load_manifest(
+        reference['species_ref_jobs']['Li2S8'])['results']['reference_method_signature']
+    signature.update({'encut': 550.0, 'metagga': 'F', 'lhfcalc': 'F'})
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and out['method_check']['status'] == 'verified'
+    planned = calls['preparation']['method_check']['planned']
+    assert planned['encut'] == 550
+    assert planned['encut_source'] == 'potcar_enmax_1.3_round_up_50'
+    assert calls['preparation']['inputs']['planned_method']['encut'] == 550
+
+
+def test_proj_prepare_lis_molecular_ispin_difference_is_advisory_without_confirmation(
+        tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=2\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    potcars = tmp_path / 'potcars'
+    _write_lis_potcar_library(potcars)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    signature = manifests.load_manifest(
+        reference['species_ref_jobs']['Li2S8'])['results']['reference_method_signature']
+    signature.update({'metagga': 'F', 'lhfcalc': 'F'})
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config(cfg={'potcar_lib_root': str(potcars)}))
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and calls
+    assert out['needs_method_confirmation'] is False
+    assert out['method_check']['status'] == 'advisory'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is True
+    assert not out['method_check']['issues']
+    assert not out['method_check']['warnings']
+    assert any('参考分子 ISPIN=1' in advisory and '不是自动不兼容' in advisory
+               for advisory in out['method_check']['advisories'])
+    assert 'confirmation' not in calls['preparation']['method_check']
+
+
+def test_proj_prepare_lis_shared_element_dft_u_mismatch_allows_generation_but_blocks_analysis(
+        tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    incar.write_text(
+        'ENCUT = 400\nGGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = T\n'
+        'LDAUTYPE = 2\nLDAUL = -1 0 -1\nLDAUU = 0 5 0\nLDAUJ = 0 0 0\n',
+        encoding='utf-8')
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    signature = manifests.load_manifest(
+        reference['species_ref_jobs']['Li2S8'])['results']['reference_method_signature']
+    signature.update({
+        'ldau': 'T', 'ldautype': 2, 'ldaul': [0, -1],
+        'ldauu': [3.0, 0.0], 'ldauj': [0.0, 0.0],
+        'potcar_elements': ['Li', 'S'],
+    })
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and out['method_check']['status'] == 'analysis_blocked'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is False
+    assert any('Li DFT+U' in issue and '3.0' in issue and '5.0' in issue
+               for issue in out['method_check']['issues'])
+    assert calls
+
+
+def test_reference_method_check_uses_vasp_defaults_for_omitted_dft_u_vectors(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT = 400\nGGA = RP\nISPIN = 1\nIVDW = 0\nLDAU = T\n'
+        'LDAUTYPE = 2\nLDAUL = 0 -1\nLDAUU = 5 0\nLDAUJ = 0 0\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'T',
+        'ldautype': 2, 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'incompatible'
+    assert any('Li DFT+U' in issue for issue in check['issues'])
+    assert not any('DFT+U' in warning for warning in check['warnings'])
+
+
+def test_reference_method_check_allows_molecular_ispin_1_with_magnetic_adsorption(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=2\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'F', 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'verified' and not check['issues'] and not check['warnings']
+    assert any('参考分子 ISPIN=1' in advisory and '不是自动不兼容' in advisory
+               for advisory in check['advisories'])
+
+
+def test_reference_method_check_records_generated_magnetic_spin_completion(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nIVDW=0\nLDAU=F\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']], effective_ispin=2)
+
+    assert check['planned']['ispin'] == 2
+    assert check['planned']['ispin_source'] == 'generated_completion'
+    assert check['status'] == 'verified'
+    assert not check['issues'] and not check['warnings']
+    assert any('ISPIN=1' in item and 'ISPIN=2' in item
+               for item in check['advisories'])
+
+
+def test_reference_method_check_keeps_hard_conflicts_with_soft_ispin_warning(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=2\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'F', 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('functional' in issue for issue in check['issues'])
+    assert any('ISPIN=1' in advisory for advisory in check['advisories'])
+
+
+def test_reference_method_check_rejects_invalid_ispin_value(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=3\nIVDW=0\nLDAU=F\nMETAGGA=F\nLHFCALC=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'F', 'encut': 400.0,
+        'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('新任务 ISPIN=3' in issue and '无效' in issue
+               for issue in check['issues'])
+
+
+def test_reference_method_check_hse_aexx_difference_is_incompatible(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\n'
+        'LHFCALC=T\nAEXX=0.30\nHFSCREEN=0.2\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'T', 'aexx': 0.25, 'hfscreen': 0.2,
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('AEXX' in issue and '0.25' in issue and '0.3' in issue
+               for issue in check['issues'])
+
+
+def test_reference_method_check_hybrid_omitted_aexx_uses_vasp_default(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\n'
+        'LHFCALC=T\nAEXX=0.25\nHFSCREEN=0.2\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'T', 'hfscreen': 0.2,
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'verified' and not check['issues']
+    assert not any('AEXX' in warning for warning in check['warnings'])
+
+
+def test_reference_method_check_rejects_malformed_planned_hybrid_number(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nLDAU=F\n'
+        'LHFCALC=T\nAEXX=bad\n', encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'PBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('AEXX' in issue and '有限数值' in issue for issue in check['issues'])
+
+
+def test_reference_method_check_legacy_hse_label_is_not_plain_pbe(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'HSE06', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'])
+
+    assert check['status'] == 'incompatible'
+    assert any('functional' in issue and 'hybrid:base=PBE' in issue
+               for issue in check['issues'])
+
+
+def test_reference_method_check_planned_hybrid_defaults_equal_explicit_signature(tmp_path):
+    incar = tmp_path / 'INCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=RP\nISPIN=1\nIVDW=0\nLDAU=F\nLHFCALC=T\n',
+        encoding='utf-8')
+    signatures = {'Li2S8': {
+        'functional': 'RPBE', 'ivdw': 0, 'ispin': 1, 'ldau': 'F',
+        'metagga': 'F', 'lhfcalc': 'T', 'aexx': 0.25, 'hfscreen': 0.0,
+        'encut': 400.0, 'potcar_titel': ['PAW_PBE Li', 'PAW_PBE S'],
+        'potcar_elements': ['Li', 'S'],
+    }}
+
+    check = Api._reference_method_check(
+        signatures, str(incar), planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert check['status'] == 'verified'
+    assert check['planned']['aexx'] == 0.25
+    assert check['planned']['hfscreen'] == 0.0
+
+
+def test_reference_method_check_accepts_real_imported_hse_signature(tmp_path):
+    from vcstudio.project import result_import
+
+    incar = tmp_path / 'INCAR'
+    kpoints = tmp_path / 'KPOINTS'
+    potcar = tmp_path / 'POTCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\nMETAGGA=F\n'
+        'LHFCALC=T\nHFSCREEN=0.2\n', encoding='utf-8')
+    kpoints.write_text('Gamma\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    potcar.write_text(
+        'TITEL = PAW_PBE Li\nENMAX=250\nTITEL = PAW_PBE S\nENMAX=400\n',
+        encoding='utf-8')
+    signature = result_import._input_method_signature({
+        'INCAR': incar, 'KPOINTS': kpoints, 'POTCAR': potcar})
+
+    check = Api._reference_method_check(
+        {'Li2S8': signature}, str(incar),
+        planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert signature['functional'] == 'HSE06'
+    assert signature['base_functional'] == 'PBE'
+    assert check['status'] == 'verified'
+
+
+def test_reference_method_check_accepts_real_imported_metagga_signature(tmp_path):
+    from vcstudio.project import result_import
+
+    incar = tmp_path / 'INCAR'
+    kpoints = tmp_path / 'KPOINTS'
+    potcar = tmp_path / 'POTCAR'
+    incar.write_text(
+        'ENCUT=400\nGGA=PE\nISPIN=1\nIVDW=0\nLDAU=F\n'
+        'METAGGA=R2SCAN\nLASPH=T\nLHFCALC=F\n', encoding='utf-8')
+    kpoints.write_text('Gamma\n0\nGamma\n1 1 1\n0 0 0\n', encoding='utf-8')
+    potcar.write_text(
+        'TITEL = PAW_PBE Li\nENMAX=250\nTITEL = PAW_PBE S\nENMAX=400\n',
+        encoding='utf-8')
+    signature = result_import._input_method_signature({
+        'INCAR': incar, 'KPOINTS': kpoints, 'POTCAR': potcar})
+
+    check = Api._reference_method_check(
+        {'Li2S8': signature}, str(incar),
+        planned_potcar=['PAW_PBE Li', 'PAW_PBE S'],
+        planned_element_orders=[['Li', 'S']])
+
+    assert signature['functional'] == 'r2SCAN'
+    assert check['status'] == 'verified'
+
+
+def test_proj_prepare_lis_ignores_unfinished_reference_species_not_used_by_batch(tmp_path):
+    slab, config, incar = (tmp_path / name for name in ('slab.vasp', 'Li2S8.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE', 'S8': 'NEEDS_HUMAN'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+
+    assert out['ok'] is True and out['reference_species'] == ['Li2S8']
+    assert calls['species_refs'] == {'Li2S8': -30.0}
+    assert set(calls['species_ref_jobs']) == {'Li2S8'}
+
+
+def test_proj_prepare_lis_rejects_missing_species_and_existing_target(tmp_path):
+    slab, config, incar = (tmp_path / name for name in ('slab.vasp', 'Li2S6.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    missing = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S6'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+    assert missing['ok'] is False and 'Li2S6' in missing['error']
+
+    target = tmp_path / 'out' / 'lis'
+    target.mkdir(parents=True)
+    existing = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path,
+        {'confirmed': True, 'reason': '单测假赝势库无法核对 TITEL'})
+    assert existing['ok'] is False and '不会覆盖' in existing['error']
+
+
+def test_submit_project_resources_are_ephemeral_retry_safe_and_enable_autopilot(tmp_path):
+    dirs = {name: str(tmp_path / name)
+            for name in ('clean', 'running', 'done', 'owned', 'retry')}
+    states = {
+        dirs['clean']: {'state': 'CREATED', 'scheduler_job_id': None},
+        dirs['running']: {'state': 'RUNNING', 'scheduler_job_id': None},
+        dirs['done']: {'state': 'DONE', 'scheduler_job_id': None},
+        dirs['owned']: {'state': 'FAILED', 'scheduler_job_id': '99'},
+        dirs['retry']: {'state': 'CREATED', 'scheduler_job_id': None},
+    }
+    project = {'name': 'lis', 'root': str(tmp_path), 'members': {
+        'clean_slab': dirs['clean'], 'gas_ref': None,
+        'configs': [dirs['running'], dirs['done'], dirs['owned'], dirs['retry']]}}
+    saved = []
+    adsorption = types.SimpleNamespace(
+        load_project=lambda path: project if path == '/p/project.yaml' else None,
+        save_project=lambda root, data: saved.append((root, dict(data))))
+    manifests = types.SimpleNamespace(load_manifest=lambda path: states.get(path))
+    captured = []
+
+    def submit_batch(profile, _password, eligible, _trust):
+        captured.append((profile, list(eligible)))
+        results = []
+        for job_dir in eligible:
+            success = job_dir == dirs['clean'] or len(captured) > 1
+            if success:
+                states[job_dir]['scheduler_job_id'] = str(100 + len(captured))
+                states[job_dir]['state'] = 'SUBMITTED'
+            results.append((job_dir, success, 'ok' if success else 'network blip'))
+        return {'needs_trust': False, 'results': results}
+
+    original = ClusterProfile(name='hpc', auth='password', nodes=2, ppn=96,
+                              walltime='72:00:00')
+    config_backing = {}
+    passwords = {}
+    secrets = types.SimpleNamespace(
+        get_password=lambda name: passwords.get(name),
+        set_password=lambda name, value: passwords.__setitem__(name, value))
+    api = Api(profiles_mod=_fake_profiles({'hpc': original}), adsorption_mod=adsorption,
+              manifest_mod=manifests,
+              batch_ops_mod=types.SimpleNamespace(submit_batch=submit_batch),
+              config_mod=_fake_config_rw(config_backing), secrets_mod=secrets)
+
+    first = api.submit_project_with_resources(
+        '/p/project.yaml', 'hpc', 32, '48:00:00', password='cluster-secret')
+    assert first['ok'] is False
+    assert first['submitted'] == [dirs['clean']]
+    assert captured[0][1] == [dirs['clean'], dirs['retry']]
+    assert (captured[0][0].nodes, captured[0][0].ppn,
+            captured[0][0].walltime) == (1, 32, '48:00:00')
+    assert (original.nodes, original.ppn, original.walltime) == (2, 96, '72:00:00')
+    assert {row['dir'] for row in first['skipped']} == {
+        dirs['running'], dirs['done'], dirs['owned']}
+    assert project['launch']['resources']['cores'] == 32 and saved
+    ui = config_backing['ui']
+    assert all(ui[key] for key in ('autopilot', 'autopilot_continue',
+                                   'autopilot_fetch', 'autopilot_report'))
+    assert passwords == {'hpc': 'cluster-secret'}
+
+    second = api.submit_project_with_resources('/p/project.yaml', 'hpc', 32, '48:00:00')
+    assert second['ok'] is True and second['submitted'] == [dirs['retry']]
+    assert captured[1][1] == [dirs['retry']]
+    assert project['launch']['submitted_job_dirs'] == [dirs['clean'], dirs['retry']]
+
+
+def test_submit_project_same_basename_members_are_not_rejected(tmp_path):
+    first = str(tmp_path / 'left' / 'calc')
+    second = str(tmp_path / 'right' / 'calc')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': first, 'gas_ref': None, 'configs': [second]}}
+    states = {path: {'state': 'CREATED', 'scheduler_job_id': None}
+              for path in (first, second)}
+    submitted = []
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    batch = types.SimpleNamespace(submit_batch=lambda _profile, _pw, dirs, _trust:
+        submitted.extend(dirs) or {'needs_trust': False,
+                                   'results': [(d, True, 'ok') for d in dirs]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(
+                  name='hpc', remote_root='/work', queue='q', ppn=16,
+                  vasp_cmd='mpirun -np {cores} vasp_std')}),
+              adsorption_mod=adsorption,
+              manifest_mod=types.SimpleNamespace(load_manifest=lambda path: states[path]),
+              batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+
+    assert out['ok'] is True
+    assert submitted == [first, second]
+
+
+def test_submit_project_includes_created_species_refs_and_skips_done_refs(tmp_path):
+    clean = str(tmp_path / 'clean')
+    config = str(tmp_path / 'config')
+    created_ref = str(tmp_path / 'Li2S4')
+    done_ref = str(tmp_path / 'S8')
+    project = {'root': str(tmp_path),
+               'members': {'clean_slab': clean, 'gas_ref': None, 'configs': [config]},
+               'species_ref_jobs': {'Li2S4': created_ref, 'S8': done_ref}}
+    states = {
+        clean: {'state': 'CREATED', 'scheduler_job_id': None},
+        config: {'state': 'CREATED', 'scheduler_job_id': None},
+        created_ref: {'state': 'CREATED', 'scheduler_job_id': None},
+        # 已完成只读参考可来自另一服务器；不能把其旧 job_id 当成本项目串服。
+        done_ref: {'state': 'DONE', 'scheduler_job_id': '778',
+                   'cluster': 'reference-server'},
+    }
+    submitted = []
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    batch = types.SimpleNamespace(submit_batch=lambda _profile, _pw, dirs, _trust:
+        submitted.extend(dirs) or {'needs_trust': False,
+                                   'results': [(d, True, 'ok') for d in dirs]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': ClusterProfile(
+                  name='hpc', remote_root='/work', queue='q', ppn=16,
+                  vasp_cmd='mpirun -np {cores} vasp_std')}),
+              adsorption_mod=adsorption,
+              manifest_mod=types.SimpleNamespace(load_manifest=lambda path: states[path]),
+              batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+
+    assert out['ok'] is True
+    assert submitted == [clean, config, created_ref]
+    assert any(row['dir'] == done_ref and 'DONE' in row['reason'] for row in out['skipped'])
+
+
+def test_submit_project_rejects_switching_managed_project_to_other_profile(tmp_path):
+    job = str(tmp_path / 'clean')
+    project = {
+        'root': str(tmp_path), 'autopilot_managed': True,
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+        'launch': {'resources': {'profile': 'server-a'},
+                   'submitted_job_dirs': [job]},
+    }
+    manifest = {'state': 'SUBMITTED', 'scheduler_job_id': '42',
+                'cluster': 'server-a'}
+    batch = types.SimpleNamespace(submit_batch=lambda *_a, **_k:
+        (_ for _ in ()).throw(AssertionError('跨服务器护栏必须在联网前生效')))
+    api = Api(
+        profiles_mod=_fake_profiles({'server-b': ClusterProfile(
+            name='server-b', remote_root='/work', queue='q', ppn=16,
+            vasp_cmd='mpirun -np {cores} vasp_std')}),
+        adsorption_mod=types.SimpleNamespace(load_project=lambda _path: project),
+        manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: manifest),
+        batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources(
+        '/p/project.yaml', 'server-b', 16, '10:00:00')
+
+    assert out['ok'] is False
+    assert 'server-a' in out['error'] and 'server-b' in out['error']
+
+
+def test_submit_project_retry_repairs_launch_after_persistence_failure(tmp_path):
+    job = str(tmp_path / 'clean')
+    disk = {'project': {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}}
+    manifest = {'state': 'CREATED', 'scheduler_job_id': None,
+                'cluster': None, 'remote_dir': None}
+    saves = {'count': 0}
+
+    def _load(_path):
+        return copy.deepcopy(disk['project'])
+
+    def _save(_root, project):
+        saves['count'] += 1
+        if saves['count'] == 1:
+            raise OSError('disk temporarily unavailable')
+        disk['project'] = copy.deepcopy(project)
+
+    def _submit(profile, _pw, dirs, _trust):
+        assert dirs == [job]
+        manifest.update({'state': 'SUBMITTED', 'scheduler_job_id': '900',
+                         'cluster': profile.name, 'remote_dir': '/work/clean'})
+        return {'needs_trust': False, 'results': [(job, True, 'ok')]}
+
+    submissions = []
+    batch = types.SimpleNamespace(submit_batch=lambda *args:
+        submissions.append(args[2]) or _submit(*args))
+    api = Api(
+        profiles_mod=_fake_profiles({'hpc': ClusterProfile(
+            name='hpc', remote_root='/work', queue='q', ppn=16,
+            vasp_cmd='mpirun -np {cores} vasp_std')}),
+        adsorption_mod=types.SimpleNamespace(load_project=_load, save_project=_save),
+        manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: manifest),
+        batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+
+    first = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+    second = api.submit_project_with_resources('/p/project.yaml', 'hpc', 16, '10:00:00')
+
+    assert first['ok'] is False and 'launch' in first['error']
+    assert second['ok'] is True and second['submitted'] == []
+    assert submissions == [[job]]
+    assert disk['project']['autopilot_managed'] is True
+    assert disk['project']['launch']['submitted_job_dirs'] == [job]
+
+
+def test_submit_project_round_trips_host_key_evidence_and_exact_pin(tmp_path):
+    job = str(tmp_path / 'clean')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    seen = {}
+    evidence = {'host': 'target', 'fingerprint': 'SHA256:def',
+                'algorithm': 'ssh-ed25519'}
+
+    def _submit(_profile, _password, _dirs, trust):
+        seen['trust'] = trust
+        return {'needs_trust': True, 'message': '请核对', 'results': [], **evidence}
+
+    pin = {'host': 'bastion', 'fingerprint': 'SHA256:abc',
+           'algorithm': 'ssh-rsa'}
+    profile = ClusterProfile(
+        name='hpc', auth='key', remote_root='/work', queue='q', ppn=32,
+        vasp_cmd='mpirun -np {cores} vasp_std')
+    api = Api(
+        profiles_mod=_fake_profiles({'hpc': profile}),
+        adsorption_mod=types.SimpleNamespace(load_project=lambda _path: project),
+        manifest_mod=types.SimpleNamespace(load_manifest=lambda _path: {
+            'state': 'CREATED', 'scheduler_job_id': None}),
+        batch_ops_mod=types.SimpleNamespace(submit_batch=_submit),
+        config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources(
+        '/p/project.yaml', 'hpc', 32, '24:00:00', trust_new=pin)
+
+    assert seen['trust'] is pin
+    assert out['needs_trust'] is True
+    assert {key: out[key] for key in evidence} == evidence
+
+
+def test_submit_blocks_literal_mpi_count_and_renders_cores_placeholder(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    state = {'state': 'CREATED', 'scheduler_job_id': None}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: state)
+    for command in ('mpirun -np96 vasp_std', 'mpirun -np=96 vasp_std',
+                    'srun -n96 vasp_std', 'srun --ntasks=96 vasp_std',
+                    'srun --ntasks 96 vasp_std'):
+        hardcoded = ClusterProfile(name='hpc', remote_root='/work', queue='q', ppn=16,
+                                   vasp_cmd=command)
+        api = Api(profiles_mod=_fake_profiles({'hpc': hardcoded}),
+                  adsorption_mod=adsorption, manifest_mod=manifests,
+                  config_mod=_fake_config_rw({}))
+        blocked = api.submit_project_with_resources(
+            '/p/project.yaml', 'hpc', 32, '24:00:00')
+        assert blocked['ok'] is False and '不一致' in blocked['error']
+
+    captured = []
+    template = ClusterProfile(name='hpc', remote_root='/work', queue='q', ppn=16,
+                              vasp_cmd='mpirun -np {cores} vasp_std')
+    batch = types.SimpleNamespace(submit_batch=lambda profile, _pw, dirs, _trust:
+        captured.append((profile.vasp_cmd, dirs)) or
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': template}), adsorption_mod=adsorption,
+              manifest_mod=manifests, batch_ops_mod=batch,
+              config_mod=_fake_config_rw({}))
+    submitted = api.submit_project_with_resources('/p/project.yaml', 'hpc', 32, '24:00:00')
+    assert submitted['ok'] and captured[0][0] == 'mpirun -np 32 vasp_std'
+
+
+def test_submit_project_renders_mapped_vasp_command_without_mutating_profile(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: {
+        'state': 'CREATED', 'scheduler_job_id': None})
+    original = ClusterProfile(
+        name='hpc', remote_root='/work', queue='q', ppn=16,
+        vasp_cmd='legacy vasp_std',
+        engine_commands={'vasp': 'srun -n {cores} vasp_std'})
+    captured = []
+    batch = types.SimpleNamespace(submit_batch=lambda profile, _pw, dirs, _trust:
+        captured.append((profile, dirs)) or
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+    api = Api(profiles_mod=_fake_profiles({'hpc': original}),
+              adsorption_mod=adsorption, manifest_mod=manifests,
+              batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources('/p/project.yaml', 'hpc', 24, '12:00:00')
+
+    assert out['ok'] is True
+    assert captured[0][0].engine_commands['vasp'] == 'srun -n 24 vasp_std'
+    assert original.engine_commands['vasp'] == 'srun -n {cores} vasp_std'
+
+
+def test_submit_template_requires_effective_resource_placeholders_and_no_conflicts(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    state = {'state': 'CREATED', 'scheduler_job_id': None}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: state)
+    submitted = []
+    batch = types.SimpleNamespace(submit_batch=lambda profile, _pw, dirs, _trust:
+        submitted.append((profile, list(dirs))) or
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+
+    def _run(text):
+        template_path = tmp_path / 'submit.sh'
+        template_path.write_text(text, encoding='utf-8')
+        profile = ClusterProfile(
+            name='hpc', remote_root='/work', scheduler='Slurm',
+            script_mode='template', template_path=str(template_path))
+        api = Api(profiles_mod=_fake_profiles({'hpc': profile}),
+                  adsorption_mod=adsorption, manifest_mod=manifests,
+                  batch_ops_mod=batch, config_mod=_fake_config_rw({}))
+        return api.submit_project_with_resources(
+            '/p/project.yaml', 'hpc', 32, '24:00:00')
+
+    valid = _run(
+        '#!/bin/bash\n#SBATCH --nodes=1\n#SBATCH --ntasks={cores}\n'
+        '#SBATCH --time={walltime}\nsrun --ntasks={cores} vasp_std\n')
+    assert valid['ok'] is True and submitted
+
+    missing_wall_placeholder = _run(
+        '#!/bin/bash\n#SBATCH --ntasks={cores}\n#SBATCH --time=24:00:00\n')
+    assert missing_wall_placeholder['ok'] is False
+    assert '{walltime}' in missing_wall_placeholder['error']
+
+    ineffective = _run(
+        '# selected {cores} / {walltime}\n#SBATCH --ntasks=32\n'
+        '#SBATCH --time=24:00:00\n')
+    assert ineffective['ok'] is False and '有效' in ineffective['error']
+
+    conflicting = _run(
+        '#!/bin/bash\n#SBATCH --ntasks={cores}\n#SBATCH --time={walltime}\n'
+        'mpirun -np=16 vasp_std\n')
+    assert conflicting['ok'] is False and '冲突' in conflicting['error']
+
+    conflicting_wall = _run(
+        '#!/bin/bash\n#SBATCH --ntasks={cores}\n#SBATCH --time={walltime}\n'
+        '#SBATCH -t 01:00:00\n')
+    assert conflicting_wall['ok'] is False and '墙时' in conflicting_wall['error']
+
+
+def test_submit_reports_keyring_setter_success_without_readback_as_failure(tmp_path):
+    job = str(tmp_path / 'job')
+    project = {'root': str(tmp_path), 'members': {
+        'clean_slab': job, 'gas_ref': None, 'configs': []}}
+    adsorption = types.SimpleNamespace(
+        load_project=lambda _path: project,
+        save_project=lambda _root, _project: None)
+    manifests = types.SimpleNamespace(load_manifest=lambda _path: {
+        'state': 'CREATED', 'scheduler_job_id': None})
+    batch = types.SimpleNamespace(submit_batch=lambda *_a:
+        {'needs_trust': False, 'results': [(job, True, 'ok')]})
+    secrets = types.SimpleNamespace(
+        set_password=lambda _name, _password: None,
+        get_password=lambda _name: None)
+    profile = ClusterProfile(
+        name='hpc', auth='password', remote_root='/work', queue='q', ppn=32,
+        vasp_cmd='mpirun -np {cores} vasp_std')
+    api = Api(profiles_mod=_fake_profiles({'hpc': profile}),
+              adsorption_mod=adsorption, manifest_mod=manifests,
+              batch_ops_mod=batch, secrets_mod=secrets,
+              config_mod=_fake_config_rw({}))
+
+    out = api.submit_project_with_resources(
+        '/p/project.yaml', 'hpc', 32, '24:00:00', password='secret')
+
+    assert out['submitted'] == [job] and out['ok'] is False
+    assert '回读不一致' in out['error']
+
+
+def test_exhausted_restartable_project_moves_to_human_analysis():
+    api = Api()
+    stage, needs_human, rounds = api._project_stage([
+        {'state': 'UNCONVERGED', 'restartable': True, 'rounds': 3}], False)
+    assert stage == 'analysis' and needs_human is True and rounds == 3
+
+
+def test_missing_reference_method_evidence_allows_generation_in_review_state(tmp_path):
+    slab, config, incar = (tmp_path / name for name in
+                           ('slab.vasp', 'Li2S8_top.vasp', 'INCAR'))
+    _write_lis_prepare_inputs(slab, config, incar)
+    calls = {}
+    reference_path, adsorption, manifests = _lis_reference_fake(
+        tmp_path, {'Li2S8': 'DONE'}, calls)
+    reference = adsorption.load_project(reference_path)
+    ref_manifest = manifests.load_manifest(reference['species_ref_jobs']['Li2S8'])
+    ref_manifest['results']['reference_method_signature'] = {}
+    api = Api(adsorption_mod=adsorption, manifest_mod=manifests,
+              config_mod=_fake_config())
+    out = api.proj_prepare_lis(
+        'lis', str(slab), [{'path': str(config), 'species': 'Li2S8'}],
+        str(incar), str(tmp_path / 'out'), reference_path)
+    assert out['ok'] is True and calls
+    assert out['needs_method_confirmation'] is False
+    assert out['method_check']['status'] == 'review'
+    assert out['method_check']['submission_allowed'] is True
+    assert out['method_check']['analysis_ready'] is False
+    assert not out['method_check']['issues']
+    assert any('缺方法签名' in warning for warning in out['method_check']['warnings'])
+
+
+def test_pipeline_done_jobs_backfill_missing_local_results_after_restart(tmp_path):
+    complete = tmp_path / 'complete'
+    missing_timestamp = tmp_path / 'missing_timestamp'
+    missing_file = tmp_path / 'missing_file'
+    for folder in (complete, missing_timestamp, missing_file):
+        folder.mkdir()
+        for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
+            (folder / filename).write_text('x', encoding='utf-8')
+    (missing_file / 'OUTCAR').unlink()
+    entries = [
+        (str(complete), {'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/a',
+                         'scheduler_job_id': '101', 'task_type': 'relax',
+                         'results': {'fetched_at': 'now', 'fetched_job_id': '101',
+                                     'fetched_remote_dir': '/r/a',
+                                     'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'],
+                                     'fetched_missing': []}}),
+        (str(missing_timestamp), {'cluster': 'hpc', 'state': 'DONE',
+                                  'remote_dir': '/r/b', 'scheduler_job_id': '102',
+                                  'task_type': 'relax', 'results': {}}),
+        (str(missing_file), {'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/c',
+                             'scheduler_job_id': '103', 'task_type': 'relax',
+                             'results': {'fetched_at': 'old', 'fetched_job_id': '103',
+                                         'fetched_remote_dir': '/r/c',
+                                         'fetched': ['CONTCAR', 'OSZICAR', 'OUTCAR'],
+                                         'fetched_missing': []}}),
+    ]
+    _attach_final_fetch_evidence(str(complete), entries[0][1])
+    fetched = []
+    batch = types.SimpleNamespace(fetch_batch=lambda _p, _pw, dirs, _trust:
+        fetched.extend(dirs) or {'needs_trust': False,
+                                 'results': [(d, True, 'fetched') for d in dirs]})
+    managed = [str(complete), str(missing_timestamp), str(missing_file)]
+    project = {'autopilot_managed': True,
+               'launch': {'resources': {'profile': 'hpc'},
+                          'submitted_job_dirs': managed},
+               'members': {'clean_slab': managed[0], 'gas_ref': None,
+                           'configs': managed[1:]}}
+    adsorption = _fake_adsorption(
+        projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project})
+    api = Api(ledger_mod=_fake_ledger(entries, []), batch_ops_mod=batch,
+              adsorption_mod=adsorption,
+              manifest_mod=_fake_manifest_mod(dict(entries)))
+
+    events, errors = [], []
+    ok = api._tick_cluster('hpc', ClusterProfile(name='hpc'), None,
+                           {'cont': False, 'fetch': True}, events, errors)
+
+    assert ok is True and errors == []
+    assert fetched == [str(missing_timestamp), str(missing_file)]
+    assert len([event for event in events if event['kind'] == 'fetch']) == 2
+
+
+def test_pipeline_monitors_project_allowlist_even_when_ledger_entry_is_missing(tmp_path):
+    job = str(tmp_path / 'active')
+    manifest = {
+        'cluster': 'hpc', 'state': 'RUNNING', 'remote_dir': '/r/active',
+        'scheduler_job_id': '501', 'results': {},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    refreshed = []
+    batch = types.SimpleNamespace(
+        refresh_batch=lambda _p, _pw, dirs, _trust:
+            refreshed.extend(dirs) or {'needs_trust': False,
+                                        'results': [(d, 'RUNNING') for d in dirs]})
+    api = Api(
+        ledger_mod=_fake_ledger([], []),
+        manifest_mod=_fake_manifest_mod({job: manifest}),
+        batch_ops_mod=batch,
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': False, 'fetch': False}, [], [])
+
+    assert synced is True and refreshed == [job]
+
+
+def test_pipeline_continue_needs_trust_marks_cluster_unsynced(tmp_path):
+    job = str(tmp_path / 'restartable')
+    manifest = {
+        'cluster': 'hpc', 'state': 'UNCONVERGED', 'remote_dir': '/r/restartable',
+        'scheduler_job_id': '101',
+        'results': {'diagnosis': {'restartable': True}, 'continue_rounds': 0},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    batch = types.SimpleNamespace(
+        filter_continuable=lambda dirs: (list(dirs), 0),
+        continue_batch=lambda *_a: {'needs_trust': True, 'results': [],
+                                    'fingerprint': 'SHA256:abc'},
+    )
+    api = Api(
+        ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        manifest_mod=_fake_manifest_mod({job: manifest}),
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+    events, errors = [], []
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': True, 'fetch': False}, events, errors)
+
+    assert synced is False
+    assert any('主机指纹未信任' in error for error in errors)
+    assert any(event['kind'] == 'continue' for event in events)
+
+
+def test_pipeline_fetch_exception_marks_cluster_unsynced(tmp_path):
+    job_dir = tmp_path / 'done'
+    job_dir.mkdir()
+    job = str(job_dir)
+    manifest = {
+        'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/done',
+        'scheduler_job_id': '102', 'task_type': 'relax', 'results': {},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    batch = types.SimpleNamespace(fetch_batch=lambda *_a:
+        (_ for _ in ()).throw(RuntimeError('network down')))
+    api = Api(
+        ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        manifest_mod=_fake_manifest_mod({job: manifest}),
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+    events, errors = [], []
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': False, 'fetch': True}, events, errors)
+
+    assert synced is False
+    assert any('network down' in error for error in errors)
+    assert any(event['kind'] == 'fetch' for event in events)
+
+
+def test_pipeline_fetch_needs_trust_marks_cluster_unsynced(tmp_path):
+    job_dir = tmp_path / 'done_trust'
+    job_dir.mkdir()
+    job = str(job_dir)
+    manifest = {
+        'cluster': 'hpc', 'state': 'DONE', 'remote_dir': '/r/done-trust',
+        'scheduler_job_id': '103', 'task_type': 'relax', 'results': {},
+    }
+    project = {
+        'autopilot_managed': True,
+        'launch': {'resources': {'profile': 'hpc'}, 'submitted_job_dirs': [job]},
+        'members': {'clean_slab': job, 'gas_ref': None, 'configs': []},
+    }
+    batch = types.SimpleNamespace(fetch_batch=lambda *_a: {
+        'needs_trust': True, 'results': [], 'fingerprint': 'SHA256:def'})
+    api = Api(
+        ledger_mod=_fake_ledger([(job, manifest)], []), batch_ops_mod=batch,
+        manifest_mod=_fake_manifest_mod({job: manifest}),
+        adsorption_mod=_fake_adsorption(
+            projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project}))
+    errors = []
+
+    synced = api._tick_cluster(
+        'hpc', ClusterProfile(name='hpc'), None,
+        {'cont': False, 'fetch': True}, [], errors)
+
+    assert synced is False
+    assert any('主机指纹未信任' in error for error in errors)
+
+
+def test_pipeline_cluster_empty_or_nonmember_allowlist_fails_closed(tmp_path):
+    active = str(tmp_path / 'active')
+    done = str(tmp_path / 'done')
+    outsider = str(tmp_path / 'outsider')
+    entries = [
+        (active, {'cluster': 'hpc', 'state': 'RUNNING',
+                  'scheduler_job_id': '1', 'remote_dir': '/r/active'}),
+        (done, {'cluster': 'hpc', 'state': 'DONE', 'scheduler_job_id': '2',
+                'remote_dir': '/r/done', 'results': {}}),
+    ]
+    calls = []
+    batch = types.SimpleNamespace(
+        refresh_batch=lambda *_a: calls.append('refresh') or {'results': []},
+        filter_continuable=lambda dirs: (list(dirs), []),
+        continue_batch=lambda *_a: calls.append('continue') or {'results': []},
+        fetch_batch=lambda *_a: calls.append('fetch') or {'results': []})
+    project = {'autopilot_managed': True,
+               'launch': {'resources': {'profile': 'hpc'},
+                          # outsider 被写入也不是该项目成员，不能扩大自动托管范围。
+                          'submitted_job_dirs': [outsider]},
+               'members': {'clean_slab': active, 'gas_ref': None, 'configs': [done]}}
+    ads = _fake_adsorption(
+        projects=['/p/project.yaml'], proj_map={'/p/project.yaml': project})
+    api = Api(ledger_mod=_fake_ledger(entries, []), batch_ops_mod=batch,
+              adsorption_mod=ads)
+
+    api._tick_cluster('hpc', ClusterProfile(name='hpc'), None,
+                      {'cont': True, 'fetch': True}, [], [])
+
+    assert calls == []
+
+
+def test_local_results_ready_requires_current_job_remote_and_complete_file_evidence(tmp_path):
+    for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
+        (tmp_path / filename).write_text('result', encoding='utf-8')
+    manifest = {
+        'state': 'DONE', 'scheduler_job_id': '42',
+        'remote_dir': '/remote/job', 'task_type': 'relax', 'results': {},
+    }
+    _attach_final_fetch_evidence(str(tmp_path), manifest)
+    assert Api._local_results_ready(str(tmp_path), manifest) is True
+
+    for key, bad_value in (('fetched_job_id', 'old-job'),
+                           ('fetched_remote_dir', '/remote/old')):
+        changed = {**manifest, 'results': {**manifest['results'], key: bad_value}}
+        assert Api._local_results_ready(str(tmp_path), changed) is False
+    missing = {**manifest, 'results': {**manifest['results'],
+                                      'fetched_missing': ['OUTCAR']}}
+    assert Api._local_results_ready(str(tmp_path), missing) is False
+    no_timestamp = {**manifest, 'results': {**manifest['results'], 'fetched_at': ''}}
+    assert Api._local_results_ready(str(tmp_path), no_timestamp) is False
+    (tmp_path / 'OUTCAR').write_text('mutated after fetch', encoding='utf-8')
+    assert Api._local_results_ready(str(tmp_path), manifest) is False
+
+
+def test_pipeline_reports_skip_unmanaged_or_incomplete_delta_projects(tmp_path):
+    projects = {
+        '/unmanaged/project.yaml': {
+            'name': 'unmanaged', 'root': str(tmp_path / 'unmanaged'),
+            'members': {'clean_slab': '/u/s', 'gas_ref': None, 'configs': ['/u/c']}},
+        '/invalid/project.yaml': {
+            'name': 'invalid', 'root': str(tmp_path / 'invalid'),
+            'autopilot_managed': True,
+            'members': {'clean_slab': '/i/s', 'gas_ref': None, 'configs': ['/i/c']}},
+    }
+    manifests = {path: {'state': 'DONE', 'results': {}}
+                 for path in ('/u/s', '/u/c', '/i/s', '/i/c')}
+    adsorption = _fake_adsorption(
+        projects=list(projects), proj_map=projects,
+        delta_ret={'slab': ('DONE', -10.0), 'ref': ('无', None), 'has_ref': False,
+                   'rows': [{'name': 'invalid_ads', 'state': 'DONE',
+                             'delta_e': None, 'note': '参考态无效'}]})
+    saved, calls = [], {'reports': 0}
+    adsorption.save_project = lambda root, project: saved.append(
+        (root, project.get('name')))
+    report = _fake_report_full()
+    report.generate_project_report = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError('诊断报告不能标记为最终报告'))
+    api = Api(adsorption_mod=adsorption,
+              manifest_mod=_fake_manifest_mod(manifests), report_full_mod=report)
+    _install_fake_report_bundle(api, calls)
+    events, errors = [], []
+
+    api._tick_reports(events, errors)
+
+    assert errors == []
+    assert len(events) == 1 and events[0]['project'] == 'invalid'
+    assert events[0]['report_kind'] == 'diagnostic'
+    assert calls['reports'] == 1
+    assert saved == [(str(tmp_path / 'invalid'), 'invalid')]
+    assert 'autopilot_report' not in projects['/unmanaged/project.yaml']
+    invalid_marker = projects['/invalid/project.yaml']['autopilot_report']
+    assert invalid_marker['kind'] == 'diagnostic'
+    assert set(invalid_marker['files']) == {'html', 'docx', 'pdf'}
+
+
+def test_pipeline_reports_only_after_done_outputs_are_fetched_in_same_tick(tmp_path):
+    job_dirs = [str(tmp_path / 'clean'), str(tmp_path / 'config')]
+    for job_dir in job_dirs:
+        os.makedirs(job_dir)
+    manifests = {
+        job_dir: {'cluster': 'hpc', 'state': 'DONE', 'remote_dir': f'/remote/{index}',
+                  'scheduler_job_id': str(200 + index),
+                  'task_type': 'relax', 'results': {}}
+        for index, job_dir in enumerate(job_dirs)
+    }
+    project_path = str(tmp_path / 'project.yaml')
+    project = {'name': 'lis', 'root': str(tmp_path), 'autopilot_managed': True,
+               'launch': {'resources': {'profile': 'hpc'},
+                          'submitted_job_dirs': list(job_dirs)},
+               'members': {
+                   'clean_slab': job_dirs[0], 'gas_ref': None,
+                   'configs': [job_dirs[1]]}}
+    order, mode = [], {'fetch_ok': False}
+
+    def fetch_batch(_profile, _password, dirs, _trust):
+        order.append('fetch')
+        results = []
+        for job_dir in dirs:
+            if mode['fetch_ok']:
+                for filename in ('CONTCAR', 'OSZICAR', 'OUTCAR'):
+                    (tmp_path / os.path.basename(job_dir) / filename).write_text(
+                        'result', encoding='utf-8')
+                _attach_final_fetch_evidence(job_dir, manifests[job_dir])
+            results.append((job_dir, mode['fetch_ok'], 'ok' if mode['fetch_ok'] else 'offline'))
+        return {'needs_trust': False, 'results': results}
+
+    batch = types.SimpleNamespace(
+        fetch_batch=fetch_batch,
+        filter_continuable=lambda dirs: ([], len(dirs)),
+        continue_batch=lambda *_args: {'needs_trust': False, 'results': []})
+    adsorption = types.SimpleNamespace(
+        list_projects=lambda: [project_path],
+        load_project=lambda path: project if path == project_path else None,
+        save_project=lambda _root, _project: order.append('save-project'),
+        delta_e_rows=lambda _project: {
+            'slab': ('DONE', -10.0), 'ref': ('DONE', -5.0), 'has_ref': True,
+            'reference_mode': 'single',
+            'method_consistency': {'status': 'verified', 'issues': [], 'warnings': []},
+            'rows': [{'name': 'ads', 'state': 'DONE', 'delta_e': -1.0,
+                      'e_config': -16.0, 'reference_valid': True, 'note': ''}]})
+    manifest_mod = types.SimpleNamespace(load_manifest=lambda path: manifests.get(path))
+    def generate_report(_project, out, config=None):
+        order.append('report')
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w', encoding='utf-8') as handle:
+            handle.write('<html>final adsorption report</html>')
+        return out
+
+    report_full = types.SimpleNamespace(
+        _member_dirs=lambda _project: list(job_dirs),
+        generate_project_report=generate_report)
+
+    def auto_figures(_project, _scenario, out_dir, **_kwargs):
+        order.append('figures')
+        return {'ok': True, 'out_dir': out_dir, 'files': [], 'panel': None,
+                'manifest': []}
+
+    api = Api(
+        profiles_mod=_fake_profiles({'hpc': ClusterProfile(name='hpc', auth='key')}),
+        ledger_mod=_fake_ledger([(job_dir, manifests[job_dir]) for job_dir in job_dirs], []),
+        batch_ops_mod=batch, adsorption_mod=adsorption, manifest_mod=manifest_mod,
+        report_full_mod=report_full,
+        auto_figures_mod=types.SimpleNamespace(run_auto_figures=auto_figures),
+        config_mod=_fake_config(ui={'autopilot': True,
+                                    'autopilot_continue': False,
+                                    'autopilot_fetch': True,
+                                    'autopilot_report': True}))
+    bundle_calls = {'reports': 0}
+    _install_fake_report_bundle(api, bundle_calls, order=order)
+
+    first = api.pipeline_tick()
+    assert not any(event['kind'] == 'report_done' for event in first['events'])
+    assert 'report' not in order
+
+    mode['fetch_ok'] = True
+    order.clear()
+    second = api.pipeline_tick()
+    assert any(event['kind'] == 'report_done' for event in second['events'])
+    assert order.index('fetch') < order.index('report') < order.index('save-project')
+    assert bundle_calls['reports'] == 1
+    assert project['autopilot_report']['kind'] == 'final'
+    assert set(project['autopilot_report']['files']) == {'html', 'docx', 'pdf'}
+
+
+def test_auto_figures_prefers_project_molecules_dir_over_global(tmp_path):
+    project_molecules = tmp_path / 'project-molecules'
+    global_molecules = tmp_path / 'global-molecules'
+    project_molecules.mkdir()
+    global_molecules.mkdir()
+    calls = {}
+    api = Api(config_mod=_fake_config(
+                  cfg={'lis_molecules_dir': str(global_molecules)},
+                  ui={'auto_figures': True}),
+              auto_figures_mod=_fake_auto_figures(calls=calls),
+              adsorption_mod=_fake_adsorption())
+    project = {'name': 'lis', 'root': str(tmp_path),
+               'molecules_dir': str(project_molecules)}
+
+    api._auto_figures_for_project(project, '/p/project.yaml', str(tmp_path / 'figs'))
+
+    assert calls['run']['molecules_dir'] == str(project_molecules)

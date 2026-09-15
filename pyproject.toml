@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vcstudio"
-version = "0.1.0"
+dynamic = ["version"]
 description = "VASP Catalyst Studio — 轻量化 DFT 自动化:POSCAR+用户INCAR → 输入四件套 / 多集群提交 / 零token监控 / LLM分析"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -25,10 +25,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+# GUI 运行(默认 Web 入口需 pywebview;旧版 tkinter 用标准库 tkinter,无需额外声明)
+gui = ["pywebview>=4"]
+# 打包单文件 EXE
+packaging = ["pyinstaller>=6"]
+# 原生论文级出图引擎(external/native_charts.py;函数内延迟 import,core 零重依赖)
+charts = ["matplotlib>=3.6", "numpy>=1.23"]
+# 不含 matplotlib 的数值生成能力，供 --no-charts 打包配置使用
+numeric = ["numpy>=1.23"]
+# 分子建模引擎链(molbuild/smiles3d:SMILES→3D、2D SVG 预览;函数内延迟 import,core 零重依赖)
+mol = ["rdkit"]
+# 论文文档能力：Word 写出、PDF 写出/读取；完整版 EXE 会显式收录
+docs = ["python-docx", "pypdf", "reportlab>=4"]
+# 图片识别 OCSR(molbuild/ocsr:图片→SMILES);体积大,含 TensorFlow 模型,不进默认依赖
+ocsr = ["decimer"]
+# 开发:测试 + 覆盖率 + lint + ASE(解析器交叉校验对拍,可选;缺失则相关测试 skip)
+dev = ["pytest>=7", "pytest-cov>=4", "ruff>=0.4", "ase>=3.22"]
 
 [project.urls]
-Repository = "https://github.com/vasp-catalyst-studio/vcstudio"
+Repository = "https://github.com/2067169120-png/vasp-catalyst-studio-v3"
 
 [project.scripts]
 vcs = "vcstudio.cli.main:main"
@@ -37,5 +52,29 @@ vcs-gui = "vcstudio.gui.app:main"
 [tool.setuptools.packages.find]
 include = ["vcstudio*"]
 
+# wheel/sdist 必须携带界面资源与语言包(缺了 pip 安装版 GUI 白屏)
+[tool.setuptools.package-data]
+vcstudio = [
+    "gui_web/assets/*",
+    "gui_web/assets/fonts/*",
+    "gui_web/assets/vendor/*",
+    "shared/locales/*.json",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "vcstudio.__version__"}
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+# 保守规则集:pyflakes(F,未用导入/未定义名)+ pycodestyle 错误类(E)。
+# 存量代码已满足此集(仅修了 3 处未用导入 + 2 处 E741)。
+# 更严的 isort(I)/bugbear(B) 会命中 ~80 处存量风格问题,留作后续专项清理再开启。
+[tool.ruff.lint]
+select = ["E", "F"]
+# E501 行宽不强制报错(存量长行较多,line-length 仅作格式化目标)
+ignore = ["E501"]

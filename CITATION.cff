@@ -1,12 +1,15 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "VASP Catalyst Studio"
-version: 0.1.0
-date-released: 2026-07-15
+version: 3.3.0
+date-released: 2026-07-17
 license: MIT
-repository-code: "https://github.com/vasp-catalyst-studio/vcstudio"
+repository-code: "https://github.com/2067169120-png/vasp-catalyst-studio-v3"
 authors:
-  - name: "VASP Catalyst Studio Contributors"
+  # AUTHOR-TODO:投稿/发布前补填 ORCID(取消下一条 orcid 注释并填真实 ID,勿编造)。
+  - given-names: Yuhao
+    family-names: Chen
+    # orcid: "https://orcid.org/0000-0000-0000-0000"
 keywords:
   - VASP
   - density functional theory

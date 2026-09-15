@@ -34,8 +34,10 @@ def test_validate_generate_inputs_collects_errors(tmp_path):
 
 
 def test_validate_generate_inputs_ok(tmp_path):
-    p = tmp_path / 'POSCAR'; p.write_text('x')
-    i = tmp_path / 'INCAR'; i.write_text('x')
+    p = tmp_path / 'POSCAR'
+    p.write_text('x')
+    i = tmp_path / 'INCAR'
+    i.write_text('x')
     assert validate_generate_inputs(str(p), str(i), str(tmp_path / 'out'), 'D:/lib') == []
 
 

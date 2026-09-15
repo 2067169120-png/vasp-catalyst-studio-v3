@@ -50,7 +50,8 @@ def _render_incar(original_text, incar_dict, completions, system_name):
 
 def build_job_dir(poscar_path, incar, out_dir, *,
                   calc_type: str = 'slab', kpoints=None, validate: bool = True,
-                  lib_root: str | None = None, system_name: str = '') -> dict:
+                  lib_root: str | None = None, system_name: str = '',
+                  force_encut: int | None = None) -> dict:
     """生成 VASP 输入四件套到 out_dir。
 
     Args:
@@ -61,6 +62,8 @@ def build_job_dir(poscar_path, incar, out_dir, *,
         kpoints: 显式 [kx,ky,kz];缺省则按 cell 自动推荐。
         validate: 是否校验补全用户 INCAR(缺 ENCUT/MAGMOM 等)。
         lib_root: POTCAR 库根(缺省从 config 读)。
+        force_encut: 项目级统一 ENCUT(吸附能项目各成员一致,保 ΔE 可比);
+            仅当用户 INCAR 未显式给 ENCUT 时生效。见 validate_and_complete_incar。
 
     Returns:
         {'ok','out_dir','warnings','kpoints','elements','completions','calc_type'}。
@@ -78,7 +81,7 @@ def build_job_dir(poscar_path, incar, out_dir, *,
     completions, warnings = OrderedDict(), []
     if validate:
         completions, warnings = validate_and_complete_incar(
-            incar_dict, elements, counts, lib_root)
+            incar_dict, elements, counts, lib_root, force_encut=force_encut)
 
     # ENCUT(仅供 POTCAR 的 ENMAX≤ENCUT 检查;从不写入 INCAR)。用成员判断避免把
     # 用户 ENCUT=0 等假值吞掉;三种来源互斥:用户显式 > 校验补全 > (无则)VASP 默认 max ENMAX。
@@ -108,7 +111,7 @@ def build_job_dir(poscar_path, incar, out_dir, *,
     # 方法学顾问(warn-only;项目页已有,单作业生成同样要抓 LDIPOL/ISMEAR/ISPIN 类
     # "不崩但算错"的坑——多数人先逐个 slab 建模,这里正是最常见路径)
     warnings += _single_job_advisories(incar_dict, calc_type, elements, counts,
-                                       read_cell_vectors(content))
+                                       read_cell_vectors(content), content)
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, 'INCAR'), 'w', encoding='utf-8') as f:
@@ -149,17 +152,19 @@ def _infer_task_type(incar_dict) -> str:
     return 'relax'
 
 
-def _single_job_advisories(incar_dict, calc_type, elements, counts, cell) -> list:
+def _single_job_advisories(incar_dict, calc_type, elements, counts, cell,
+                           poscar_text=None) -> list:
     """单作业防呆(warn-only):复用 project.advisor 规则于单目录生成路径。
 
-    calc_type='molecule' 按气相参考口径查(ISMEAR/开壳层/盒子);slab 查偶极修正。
+    calc_type='molecule' 按气相参考口径查(ISMEAR/开壳层/盒子);slab 查偶极修正 + 真空层。
     advisor 失败静默(顾问绝不挡生成)。"""
     try:
         from vcstudio.project import advisor
         gas = None
         if calc_type == 'molecule':
             gas = {'elements': elements, 'counts': counts, 'cell': cell}
-        tips = advisor.advise(incar_dict, has_configs=(calc_type == 'slab'), gas=gas)
+        tips = advisor.advise(incar_dict, has_configs=(calc_type == 'slab'), gas=gas,
+                              calc_type=calc_type, poscar_text=poscar_text)
         return [f'[{p}] {msg}' for p, _name, msg in tips]
     except Exception:                                    # noqa: BLE001
         return []

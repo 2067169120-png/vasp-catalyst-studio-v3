@@ -15,27 +15,44 @@
     const pre = $('gen-preview');
     if (!pre) return;
     const poscar = val('gen-poscar'), incar = val('gen-incar');
+    const calc = val('gen-calc') || 'slab';
+    // 预览区改为可编辑 textarea(用 .value);setTxt 兼容 <pre>/<textarea>
+    const setTxt = t => { if ('value' in pre) pre.value = t; else pre.textContent = t; };
     if (!poscar || !incar) {
       State.previewKey = null;
       pre.style.color = '';
-      pre.textContent = '(选择 POSCAR / INCAR 后自动解析预览)';
+      setTxt('(选择 POSCAR / INCAR 后自动解析预览)');
       return;
     }
-    const key = poscar + '\n' + incar;
+    const key = poscar + '\n' + incar + '\n' + calc;
     if (key === State.previewKey) return;   // 相同输入不重复解析(镜像 _preview_memo)
     State.previewKey = key;
     pre.style.color = '';
-    pre.textContent = '正在解析…';
-    const r = await VCS.call('gen_preview', poscar, incar);
+    setTxt('正在解析…');
+    const r = await VCS.call('gen_preview', poscar, incar, calc);
     if (State.previewKey !== key) return;   // 期间用户又改了路径 → 丢弃旧响应
     if (!r || r.ok === false || r.error) {
       pre.style.color = 'var(--fail)';
-      pre.textContent = '预览失败:' + ((r && r.error) || '未知错误');
+      setTxt('预览失败:' + ((r && r.error) || '未知错误'));
       return;
     }
     const s = r.summary || {};
     pre.style.color = '';
-    pre.textContent = [s.poscar, s.incar].filter(Boolean).join('\n\n') || '(无预览内容)';
+    setTxt([s.poscar, s.incar].filter(Boolean).join('\n\n') || '(无预览内容)');
+  }
+
+  // 保存预览到文件(可编辑预览区内容 → save_text)
+  async function savePreview() {
+    const pre = $('gen-preview');
+    const txt = pre ? ('value' in pre ? pre.value : pre.textContent) : '';
+    if (!txt || !txt.trim()) { VCS.log('预览为空,无内容可保存', 'failc'); return; }
+    const d = await VCS.call('pick_dir');
+    if (!d || !d.path) return;
+    const sep = d.path.indexOf('\\') >= 0 ? '\\' : '/';
+    const dest = d.path + sep + 'preview.txt';
+    const r = await VCS.call('save_text', dest, txt);
+    if (r && r.ok) { VCS.log('预览已保存:' + r.path, 'okc'); VCS.toast('已保存预览'); }
+    else VCS.log('保存失败:' + ((r && r.error) || '未知'), 'failc');
   }
 
   // ── 浏览:pick_file(文件)/ pick_dir(目录)→ 回填输入;取消(path=null)不改值、不崩 ──
@@ -51,14 +68,37 @@
   }
 
   // ── 一键生成:gen_run → 成功落台账 + 逐条 warnings + 提示去任务页;失败 log 错误 ──
+  // 隐式溶剂化(VASPsol)勾选状态 → gen_run 的 solvation 参数(默认关)
+  function solvationParam() {
+    const on = $('gen-solvation') && $('gen-solvation').checked;
+    if (!on) return null;
+    const ebk = parseFloat(val('gen-solvation-ebk') || '78.4');
+    return { enabled: true, eb_k: isNaN(ebk) ? 78.4 : ebk };
+  }
+  // 勾选/改介电常数时预览将写入的键 + 补丁编译 warning(诚实提醒真空陷阱)
+  async function refreshSolvationNote() {
+    const note = $('gen-solvation-note');
+    if (!note) return;
+    const on = $('gen-solvation') && $('gen-solvation').checked;
+    if (!on) { note.hidden = true; note.textContent = ''; return; }
+    const ebk = parseFloat(val('gen-solvation-ebk') || '78.4');
+    const r = await VCS.call('vaspsol_preview', isNaN(ebk) ? 78.4 : ebk, true);
+    if (!r || r.ok === false) { note.hidden = true; return; }
+    note.hidden = false;
+    note.textContent = '将追加:' + (r.incar_lines || []).join(' · ') + '。' + (r.warning || '');
+  }
+
   async function run() {
     const btn = $('gen-run');
     const poscar = val('gen-poscar'), incar = val('gen-incar');
     const out = val('gen-out'), lib = val('gen-lib');
+    const calc = val('gen-calc') || 'slab';
+    const extraKw = val('gen-extra-kw');
+    const solvation = solvationParam();
     if (btn) btn.disabled = true;
-    VCS.log('生成中…');
+    VCS.log('生成中(' + calc + (solvation ? ',VASPsol' : '') + ')…');
     try {
-      const r = await VCS.call('gen_run', poscar, incar, out, lib);
+      const r = await VCS.call('gen_run', poscar, incar, out, lib, calc, extraKw, solvation);
       if (!r || r.ok === false || r.error) {
         VCS.log('生成失败:' + ((r && r.error) || '未知错误'), 'failc');
         return;
@@ -66,11 +106,505 @@
       VCS.log('已生成:' + r.job_dir, 'okc');
       (r.warnings || []).forEach(w => VCS.log(w));
       VCS.log('作业已入台账,去任务页提交', 'okc');
+      VCS.call('open_dir', r.job_dir);          // 输出反馈统一:打开四件套所在目录
+      VCS.toast('已生成四件套');
       // 同步任务页台账(若已加载)
+      if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+      // 生成是流程中点,不让新手只在日志里猜后续步骤。主按钮走 app.js
+      // 统一导航,进任务页后自动选中刚生成的 CREATED 作业。
+      if (typeof VCS.nextStep === 'function') {
+        VCS.nextStep({
+          title: '四件套已生成',
+          message: '作业已加入任务列表。',
+          detail: '下一步：前往任务页，确认目标集群，然后点击“上传并提交”。',
+          primaryLabel: '前往任务页并提交',
+          page: 'jobs',
+          focusJobDir: r.job_dir,
+        });
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // ── SAC 批量建模:chips 多选 + 预览矩阵 + 生成矩阵(生成前弹确认显示预估) ──
+  const SAC_METALS = ['Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Mo', 'W'];
+  const SAC_TEMPLATES = ['MN4', 'MN3', 'MP1N3', 'MS1N3', 'MB1N3', 'MN4+B'];
+
+  // chips 墙 → 多选下拉(保留原容器 id,只改内部渲染;被 api 消费的选中值数组契约不变)
+  function renderChips(id, items, preselect) {
+    const box = $(id);
+    if (!box) return;
+    if (window.VCS && VCS.ui && VCS.ui.multiselect) {
+      VCS.ui.multiselect(box, {
+        items: items.map(v => ({ val: v, label: v })),
+        selected: (preselect || []).filter(v => items.indexOf(v) >= 0),
+        placeholder: '点此选择(可多选)',
+      });
+    } else {                                   // 兜底:ui.js 缺失时退回 chips
+      box.innerHTML = '';
+      items.forEach(it => {
+        const c = document.createElement('span');
+        c.className = 'chip' + (preselect && preselect.indexOf(it) >= 0 ? ' on' : '');
+        c.textContent = it; c.dataset.val = it;
+        c.addEventListener('click', () => c.classList.toggle('on'));
+        box.appendChild(c);
+      });
+    }
+  }
+  function chipVals(id) {
+    const box = $(id);
+    if (!box) return [];
+    if (box._ms) return box._ms.getSelected();
+    return Array.from(box.querySelectorAll('.chip.on')).map(c => c.dataset.val);
+  }
+  function sacMetals() {
+    const base = chipVals('sac-metals');
+    const extra = (val('sac-metal-more') || '').split(',').map(s => s.trim()).filter(Boolean);
+    return Array.from(new Set(base.concat(extra)));
+  }
+  function sacParams() {
+    return {
+      metals: sacMetals(), templates: chipVals('sac-templates'), ads: chipVals('sac-ads'),
+      sites: val('sac-sites') || 'metal_top', rot: parseInt(val('sac-rot') || '1', 10) || 1,
+    };
+  }
+
+  async function loadSacAdsorbates() {
+    const r = await VCS.call('molecule_list');
+    const mols = (r && r.molecules) || [];
+    renderChips('sac-ads', mols.map(m => m.name), []);
+  }
+
+  async function sacPreview() {
+    const p = sacParams();
+    const box = $('sac-preview');
+    if (!p.metals.length || !p.templates.length) {
+      if (box) box.textContent = '请至少选择一个金属与一个模板';
+      return null;
+    }
+    if (box) box.textContent = '估算中…';
+    const r = await VCS.call('sac_matrix_preview', p.metals, p.templates, p.ads, p.sites, p.rot);
+    if (!r || r.ok === false || r.error) {
+      if (box) box.textContent = '预览失败:' + ((r && r.error) || '未知错误');
+      return null;
+    }
+    if (box) {
+      const eg = (r.names || []).slice(0, 6).join('、');
+      box.innerHTML = `矩阵规模:<b>${r.n_slabs}</b> 清洁面 + <b>${r.n_configs}</b> 吸附构型 = ` +
+        `<b>${r.n_total_jobs}</b> 个作业<br>${VCS.esc(r.estimate_note)}` +
+        (eg ? `<br>示例:${VCS.esc(eg)} …` : '');
+    }
+    return r;
+  }
+
+  async function sacGenerate() {
+    const p = sacParams();
+    const incar = val('sac-incar'), out = val('sac-out');
+    if (!p.metals.length || !p.templates.length) {
+      VCS.log('SAC:请至少选择一个金属与一个模板', 'failc'); return;
+    }
+    if (!incar) { VCS.log('SAC:请选择共享 INCAR', 'failc'); return; }
+    if (!out) { VCS.log('SAC:请选择输出根目录', 'failc'); return; }
+    const pv = await sacPreview();     // 生成前弹确认显示预估(规模 + 粗估机时)
+    const msg = pv
+      ? `将生成约 ${pv.n_total_jobs} 个作业(${pv.n_slabs} 清洁面 + ${pv.n_configs} 构型)。\n` +
+        `${pv.estimate_note}\n\n继续?`
+      : `将生成 SAC 候选矩阵(${p.metals.length} 金属 × ${p.templates.length} 模板)。继续?`;
+    if (!await VCS.confirm(msg)) return;
+    const btn = $('sac-gen-btn');
+    if (btn) btn.disabled = true;
+    VCS.log('SAC 批量建模生成中…');
+    try {
+      const r = await VCS.call('sac_matrix_generate', p.metals, p.templates, p.ads,
+        p.sites, p.rot, incar, out);
+      if (!r || r.ok === false || r.error) {
+        VCS.log('SAC 生成失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      }
+      VCS.log('SAC 已生成 ' + r.created + ' 个作业,入台账', 'okc');
+      (r.project_paths || []).forEach(pp => VCS.log('已建吸附能项目:' + pp, 'okc'));
+      (r.skipped || []).forEach(s => VCS.log('跳过 ' + (s.name || '') + ':' + s.reason, 'warnc'));
+      if (r.campaign) VCS.log('已注册批次(campaign):' + r.campaign, 'okc');
+      VCS.toast('SAC 已生成 ' + r.created + ' 个作业');
+      VCS.call('open_dir', out);
       if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
     } finally {
       if (btn) btn.disabled = false;
     }
+  }
+
+  // ── 金属 slab 建模:fcc/bcc/hcp 低指数面(层厚收敛的可再生入口,Backlog #2) ──
+  const MSlab = { surfaces: [], guess: {} };
+  async function loadMetalSlabCatalog() {
+    const sel = $('mslab-surface');
+    if (!sel) return;
+    const r = await VCS.call('metal_slab_catalog');
+    if (!r || r.ok === false) {
+      sel.innerHTML = '<option value="">(晶面目录加载失败)</option>';
+      return;
+    }
+    MSlab.surfaces = r.surfaces || [];
+    MSlab.guess = r.guess || {};
+    sel.innerHTML = MSlab.surfaces.map(s =>
+      `<option value="${VCS.esc(s.structure + ':' + s.miller)}">` +
+      `${VCS.esc(s.structure + '(' + s.miller + ')')}</option>`).join('');
+    onMslabChange();
+  }
+  function mslabSel() {
+    const v = (val('mslab-surface') || 'fcc:111').split(':');
+    return { structure: v[0] || 'fcc', miller: v[1] || '111' };
+  }
+  // 元素/晶面联动:hcp 显示 c 输入;提示晶格常数初猜(实验值,发表口径须 EOS/晶胞优化)
+  function onMslabChange() {
+    const s = mslabSel().structure;
+    const cIpt = $('mslab-c');
+    if (cIpt) cIpt.hidden = s !== 'hcp';
+    const tip = $('mslab-guess');
+    if (!tip) return;
+    const el = val('mslab-el');
+    if (!el) { tip.textContent = ''; return; }
+    const g = (MSlab.guess[s] || {})[el];
+    if (g === undefined) {
+      tip.textContent = el + ' 不在 ' + s + ' 初猜表:请显式填晶格常数(建议来自同泛函 EOS/晶胞优化)。';
+    } else if (typeof g === 'object') {
+      tip.textContent = '初猜:a=' + g.a + ' Å、c=' + g.c + ' Å(实验值;发表口径须晶胞优化定终值)。';
+    } else {
+      tip.textContent = '初猜:a=' + g + ' Å(实验值;发表口径须 EOS/晶胞优化定终值)。';
+    }
+  }
+  async function mslabGenerate() {
+    const el = val('mslab-el'), out = val('mslab-out');
+    if (!el) { VCS.log('金属 slab:请填元素符号', 'failc'); return; }
+    if (!out) { VCS.log('金属 slab:请选择输出作业目录', 'failc'); return; }
+    const s = mslabSel();
+    const btn = $('mslab-gen-btn');
+    if (btn) btn.disabled = true;
+    VCS.log('金属 slab 建模:' + el + ' ' + s.structure + '(' + s.miller + ')…');
+    try {
+      const r = await VCS.call('metal_slab_build', el, s.structure, s.miller,
+        parseInt(val('mslab-layers') || '4', 10) || 4,
+        val('mslab-a') || null, val('mslab-c') || null,
+        parseInt(val('mslab-nx') || '3', 10) || 3,
+        parseInt(val('mslab-ny') || '3', 10) || 3,
+        parseFloat(val('mslab-vac') || '15') || 15,
+        parseInt(val('mslab-fix') || '0', 10) || 0,
+        val('mslab-incar') || null, out);
+      if (!r || r.ok === false || r.error) {
+        VCS.log('金属 slab 生成失败:' + ((r && r.error) || '未知错误'), 'failc');
+        return;
+      }
+      VCS.log('已生成:' + r.description, 'okc');
+      (r.warnings || []).forEach(w => VCS.log('⚠ ' + w, 'warnc'));
+      VCS.log('作业目录:' + r.job_dir + '(job.yaml 带可再生配方;层厚收敛可从此作业一键派生)', 'okc');
+      VCS.toast('金属 slab 已生成');
+      if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // ── 多自旋并跑:生成 NM/LS/HS 家族 ────────────────────────────────────────
+  async function spinGenerate() {
+    const pos = val('spin-poscar'), incar = val('spin-incar'), out = val('spin-out');
+    if (!pos) { VCS.log('自旋:请选择结构 POSCAR', 'failc'); return; }
+    if (!incar) { VCS.log('自旋:请选择 INCAR', 'failc'); return; }
+    if (!out) { VCS.log('自旋:请选择输出根目录', 'failc'); return; }
+    const btn = $('spin-gen-btn');
+    if (btn) btn.disabled = true;
+    VCS.log('多自旋家族生成中…');
+    try {
+      const r = await VCS.call('spin_family_generate', pos, incar, out);
+      if (!r || r.ok === false || r.error) {
+        VCS.log('自旋家族生成失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      }
+      (r.variants || []).forEach(v => {
+        VCS.log('已生成自旋变体 ' + v.name + ':' + v.job_dir +
+          (v.magmom ? '(MAGMOM ' + v.magmom + ')' : ''), 'okc');
+        (v.warnings || []).forEach(w => VCS.log('  ⚠ ' + w, 'warnc'));
+      });
+      VCS.log('自旋家族已入台账;全部 DONE 后在作业页对该家族「自旋对比」判基态', 'okc');
+      VCS.toast('已生成 ' + (r.variants || []).length + ' 个自旋变体');
+      VCS.call('open_dir', out);
+      if (window.Jobs && typeof window.Jobs.reload === 'function') window.Jobs.reload();
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // ── 引擎选择器:VASP(用上方四件套)/ CP2K / Gaussian / CASTEP(文件级适配,简化表单) ──
+  const State2 = { engine: 'vasp', sceneKey: null, engines: [], capabilities: {} };
+  // 引擎选择器:VASP 置顶(主引擎)的下拉,替代原 chips 墙。默认 VASP。
+  async function loadEngines() {
+    const sel = $('engine-select');
+    if (!sel) return;
+    const sceneKey = (window.VCS && VCS.scenario && VCS.scenario.key) || null;
+    const [r, current] = await Promise.all([
+      VCS.call('engine_list', sceneKey), VCS.call('engine_get')]);
+    let engines = ((r && r.engines) || []).filter(e => e.visible !== false);
+    if (!engines.length) engines = [{ key: 'vasp', name: 'VASP', experimental: false }];
+    // VASP 恒置顶醒目;其余引擎(实验性)靠后
+    engines = engines.slice().sort((a, b) => (a.key === 'vasp' ? -1 : b.key === 'vasp' ? 1 : 0));
+    State2.engines = engines;
+    State2.capabilities = Object.fromEntries(engines.map(row => [row.key, row]));
+    sel.innerHTML = engines.map(e =>
+      '<option value="' + VCS.esc(e.key) + '">' + VCS.esc(e.name) +
+      (e.key === 'vasp' ? '（推荐·完整）' : '（文件级适配）') + '</option>').join('');
+    sel.disabled = engines.length < 2;
+    const modeChanged = State2.sceneKey !== sceneKey;
+    State2.sceneKey = sceneKey;
+    const preferred = (current && current.engine) || VCS.activeEngine ||
+      (r && r.default) || engines[0].key;
+    const has = engines.some(e => e.key === State2.engine);
+    if (!has || modeChanged) {
+      State2.engine = engines.some(e => e.key === preferred) ? preferred : engines[0].key;
+    }
+    sel.value = State2.engine;
+    await selectEngine(sel.value, false);
+  }
+  function syncEngineTask() {
+    const sel = $('eng-task');
+    const cap = State2.capabilities[State2.engine] || {};
+    if (!sel) return;
+    const tasks = cap.tasks || [];
+    sel.innerHTML = tasks.map(task =>
+      `<option value="${VCS.esc(task.key)}">${VCS.esc(task.name)}</option>`).join('');
+    const active = VCS.activeCalculation || '';
+    if (tasks.some(task => task.key === active)) sel.value = active;
+    else if (tasks.length) sel.value = tasks[0].key;
+  }
+  async function saveEngineTask() {
+    const sel = $('eng-task');
+    if (!sel || !sel.value || sel.value === VCS.activeCalculation) return;
+    const r = await VCS.call('calculation_set', sel.value);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('切换任务类型失败:' + ((r && r.error) || '未知'), 'failc');
+      syncEngineTask();
+      return;
+    }
+    if (VCS.applyCalculation) VCS.applyCalculation(r.active_calculation || sel.value);
+  }
+  function renderEngineCapability(key) {
+    const cap = State2.capabilities[key] || {};
+    const note = $('engine-capability-note');
+    const title = $('engine-card-title');
+    const sub = $('engine-card-sub');
+    const top = $('engine-note');
+    const summary = $('generate-engine-summary');
+    const name = ((State2.engines.find(row => row.key === key) || {}).name || key.toUpperCase());
+    if (title) title.textContent = name + ' 输入准备';
+    if (sub) sub.textContent = cap.input_contract && cap.result_contract
+      ? `${cap.input_contract}；结果：${cap.result_contract}` : (cap.summary || '');
+    if (top) top.textContent = key === 'vasp'
+      ? 'VASP 为默认完整工作流；下方仅显示当前任务需要的 VASP 入口'
+      : `${name}：${cap.support_label || '文件级适配'}；未接通的 VASP 专用任务已隐藏`;
+    if (summary) summary.textContent = key === 'vasp'
+      ? 'VASP · 完整输入、提交、回收与结果工作流'
+      : `${name} · ${cap.input_contract || '专属输入'} → 登记 → 提交 → 回收`;
+    if (note) {
+      const limits = cap.limitations || [];
+      note.hidden = key === 'vasp' || (!cap.summary && !limits.length);
+      note.innerHTML = key === 'vasp' ? '' : `<b>${VCS.esc(cap.summary || '')}</b>` +
+        limits.map(line => `<br>${VCS.esc(line)}`).join('');
+    }
+  }
+  async function selectEngine(key, persist = true) {
+    if (persist) {
+      const saved = await VCS.call('engine_set', key);
+      if (!saved || saved.ok === false || saved.error) {
+        VCS.log('切换计算引擎失败:' + ((saved && saved.error) || '未知'), 'failc');
+        const sel = $('engine-select'); if (sel) sel.value = State2.engine;
+        return;
+      }
+      key = saved.engine || key;
+      if (saved.capability) State2.capabilities[key] = Object.assign(
+        {}, State2.capabilities[key] || {}, saved.capability);
+      if (saved.active_calculation && VCS.applyCalculation) {
+        VCS.applyCalculation(saved.active_calculation);
+      }
+    }
+    State2.engine = key;
+    const sel = $('engine-select');
+    if (sel && sel.value !== key) sel.value = key;
+    if (VCS.applyEngine) VCS.applyEngine(key, State2.capabilities[key] || {});
+    renderEngineCapability(key);
+    syncEngineTask();
+    const isGauss = (key === 'gaussian');
+    // 非 VASP:展开「引擎参数」折叠分区,让简化表单可见
+    const card = $('engine-card');
+    if (card && key !== 'vasp') card.setAttribute('data-open', '1');
+    // 通用简化表单:cp2k/castep 用;vasp 走上方四件套;gaussian 走专属分子面板
+    const form = $('engine-form');
+    if (form) form.hidden = (key === 'vasp' || isGauss);
+    const gp = $('gauss-panel');
+    if (gp) gp.hidden = !isGauss;
+    if (isGauss && window.GaussMol && window.GaussMol.onShow) window.GaussMol.onShow();
+    document.querySelectorAll('[data-engine-field]').forEach(row => {
+      const engines = String(row.getAttribute('data-engine-field') || '').split(/\s+/);
+      row.hidden = engines.indexOf(key) < 0;
+    });
+    const periodic = $('eng-periodic');
+    const cap = State2.capabilities[key] || {};
+    if (periodic && !isGauss) {
+      const boundaries = cap.boundaries || ['periodic', 'molecule'];
+      periodic.disabled = boundaries.length === 1;
+      Array.from(periodic.options).forEach(option => {
+        const boundary = option.value === '1' ? 'periodic' : 'molecule';
+        option.hidden = boundaries.indexOf(boundary) < 0;
+      });
+      const currentBoundary = periodic.value === '1' ? 'periodic' : 'molecule';
+      if (boundaries.indexOf(currentBoundary) < 0) {
+        periodic.value = boundaries.indexOf('periodic') >= 0 ? '1' : '0';
+      }
+    }
+    const banner = $('engine-nonequiv');
+    if (banner) {
+      if (key === 'vasp') { banner.hidden = true; }
+      else {
+        const nr = await VCS.call('engine_nonequiv', 'vasp', key);
+        const rep = (nr && nr.report) || [];
+        banner.hidden = !rep.length;
+        banner.innerHTML = '<b>跨引擎不等价(需逐项人工确认):</b><br>' +
+          rep.map(x => VCS.esc(x)).join('<br>');
+      }
+    }
+  }
+  async function engineGenerate() {
+    const eng = State2.engine;
+    const out = val('eng-out');
+    if (!val('eng-poscar')) { VCS.log('引擎:请选择结构 POSCAR', 'failc'); return; }
+    if (!out) { VCS.log('引擎:请选择输出目录', 'failc'); return; }
+    if (eng !== 'cp2k' && eng !== 'castep') {
+      VCS.log('请使用当前引擎的专属输入面板', 'failc'); return;
+    }
+    const periodic = (val('eng-periodic') || '1') === '1';
+    const strictNumber = raw => {
+      const text = String(raw == null ? '' : raw).trim();
+      if (!text) return null;
+      const number = Number(text);
+      return Number.isFinite(number) ? number : null;
+    };
+    const strictInteger = raw => {
+      const number = strictNumber(raw);
+      return number !== null && Number.isInteger(number) ? number : null;
+    };
+    const grid = id => {
+      const tokens = val(id).split(/[\s,]+/).filter(Boolean);
+      if (tokens.length !== 3) return null;
+      const numbers = tokens.map(strictInteger);
+      return numbers.every(number => number !== null && number > 0) ? numbers : null;
+    };
+    const multiplicity = strictInteger(val('eng-multiplicity') || '1');
+    const charge = strictInteger(val('eng-charge') || '0');
+    if (multiplicity === null || multiplicity < 1) {
+      VCS.log('自旋多重度必须是正整数（2S+1）', 'failc'); return;
+    }
+    if (charge === null) {
+      VCS.log('体系净电荷必须是整数', 'failc'); return;
+    }
+    const kpts = eng === 'cp2k' ? grid('eng-cp2k-kpts') : grid('eng-kpts');
+    const extras = {};
+    if (eng === 'cp2k') {
+      const cutoffRy = strictNumber(val('eng-cutoff-ry'));
+      const relCutoffRy = strictNumber(val('eng-rel-cutoff-ry'));
+      if (!(cutoffRy > 0) || !(relCutoffRy > 0)) {
+        VCS.log('CP2K：CUTOFF 与 REL_CUTOFF 必须是正数（单位 Ry）', 'failc'); return;
+      }
+      if (periodic && !kpts) {
+        VCS.log('CP2K：周期计算请输入三个正整数 k 点网格', 'failc'); return;
+      }
+      extras.cutoff_ry = cutoffRy;
+      extras.rel_cutoff_ry = relCutoffRy;
+      if (val('eng-basis-file')) extras.basis_set_file = val('eng-basis-file');
+      if (val('eng-potential-file')) extras.potential_file = val('eng-potential-file');
+    }
+    const castepCutoff = strictNumber(val('eng-cutoff'));
+    if (eng === 'castep' && periodic && !(castepCutoff > 0)) {
+      VCS.log('CASTEP：周期计算必须填写正数 cut_off_energy（eV）', 'failc'); return;
+    }
+    if (eng === 'castep' && periodic && !kpts) {
+      VCS.log('CASTEP：周期计算请输入三个正整数 k 点网格', 'failc'); return;
+    }
+    const params = {
+      poscar: val('eng-poscar'), task: val('eng-task') || 'relax',
+      functional: val('eng-func') || 'PBE',
+      dispersion: val('eng-disp') || null,
+      cutoff_ev: eng === 'castep' ? castepCutoff : null,
+      kpoints: periodic ? kpts : null,
+      periodic: periodic,
+      spin: ($('eng-spin') ? $('eng-spin').checked : false) || multiplicity > 1,
+      charge: charge,
+      multiplicity: multiplicity, extras: extras,
+      calc_type: periodic ? 'slab' : 'molecule',
+    };
+    const btn = $('engine-gen-btn');
+    if (btn) btn.disabled = true;
+    VCS.log('生成 ' + eng + ' 引擎输入(文件级适配)…');
+    try {
+      const r = await VCS.call('engine_generate', eng, params, out);
+      if (!r || r.ok === false || r.error) {
+        VCS.log('引擎生成失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+      }
+      (r.files || []).forEach(f => VCS.log('已生成:' + f, 'okc'));
+      (r.issues || []).forEach(i => VCS.log('自洽校验:' + i, 'warnc'));
+      (r.warnings || []).forEach(w => VCS.log(w, 'warnc'));
+      if (!r.registered) {
+        VCS.log(eng + ' 输入文件已生成，但 job.yaml/台账登记失败；已打开目录，请先处理日志中的登记问题，不能直接提交', 'failc');
+        VCS.call('open_dir', out);
+        VCS.toast('输入已生成，但尚未纳管', 'fail');
+        return;
+      }
+      VCS.log(eng + ' 引擎输入已生成并加入任务列表', 'okc');
+      VCS.toast('已生成并纳管 ' + eng + ' 作业');
+      if (VCS.nextStep) VCS.nextStep({
+        title: eng.toUpperCase() + ' 作业已就绪',
+        message: '输入文件、job.yaml 和输出下载契约已生成。',
+        detail: '下一步：前往任务页选择服务器并提交；完成后可按该引擎解析能量和生成报告。',
+        primaryLabel: '前往任务页提交', page: 'jobs', focusJobDir: out,
+      });
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // ── 计算活动模板(SAC 卡):选模板 → instantiate 全链 DAG ──
+  const CampState = { templates: [] };
+  async function loadCampaignTemplates() {
+    const sel = $('camp-tpl-sel');
+    if (!sel) return;
+    const r = await VCS.call('campaign_templates');
+    CampState.templates = (r && r.templates) || [];
+    sel.innerHTML = '<option value="">不使用模板(仅建吸附能项目矩阵)</option>' +
+      CampState.templates.map(t => `<option value="${VCS.esc(t.key)}">${VCS.esc(t.name_zh)}</option>`).join('');
+  }
+  function onCampTplChange() {
+    const sel = $('camp-tpl-sel');
+    const desc = $('camp-tpl-desc');
+    if (!sel || !desc) return;
+    const t = CampState.templates.find(x => x.key === sel.value);
+    if (!t) { desc.hidden = true; return; }
+    desc.hidden = false;
+    desc.innerHTML = `<b>${VCS.esc(t.name_zh)}</b>:${VCS.esc(t.description)}<br>` +
+      `阶段数 ${t.n_stages} · 汇总 ${(t.analyses || []).join('、')} · 图场景 ${VCS.esc(t.figures_scenario || '—')}`;
+  }
+  async function instantiateCampaign() {
+    const sel = $('camp-tpl-sel');
+    const key = sel ? sel.value : '';
+    if (!key) { VCS.log('请先选计算活动模板', 'failc'); return; }
+    const p = sacParams();
+    const out = val('sac-out');
+    if (!p.metals.length || !p.templates.length) { VCS.log('请先在下方选金属与配位模板', 'failc'); return; }
+    if (!out) { VCS.log('请选输出根目录', 'failc'); return; }
+    const systems = [];
+    p.metals.forEach(m => p.templates.forEach(t => systems.push(m + '@' + t)));
+    const spec = { systems: systems, adsorbates: p.ads, clean: true };
+    if (!await VCS.confirm('将按模板「' + sel.options[sel.selectedIndex].text + '」生成 ' +
+      systems.length + ' 体系的全链任务 DAG(relax→静态→频率→汇总)。继续?')) return;
+    VCS.log('按模板实例化全链 DAG…');
+    const r = await VCS.call('campaign_instantiate', key, spec, out, null);
+    if (!r || r.ok === false || r.error) { VCS.log('实例化失败:' + ((r && r.error) || '未知'), 'failc'); return; }
+    const est = (r.estimate && r.estimate.total) || 0;
+    VCS.log('已生成全链 DAG:' + r.n_jobs + ' 个作业,约 ' + est + ' 核时 → ' + r.campaign_dir, 'okc');
+    VCS.toast('已按模板生成全链批次');
   }
 
   // ── 初始化:回填上次路径 + 首帧预览,绑定浏览/生成/输入监听 ──
@@ -92,6 +626,46 @@
       const el = $(id);
       if (el) { el.addEventListener('change', refreshPreview); el.addEventListener('blur', refreshPreview); }
     });
+    // 切换计算类型即刷新预览(KPOINTS 随之变化)
+    { const el = $('gen-calc'); if (el) el.addEventListener('change', refreshPreview); }
+    // 隐式溶剂化(VASPsol):勾选/改介电常数即预览将写入的键 + 补丁编译 warning
+    { const el = $('gen-solvation'); if (el) el.addEventListener('change', refreshSolvationNote); }
+    { const el = $('gen-solvation-ebk'); if (el) el.addEventListener('input', refreshSolvationNote); }
+
+    // SAC 批量建模:chips 预置 + 吸附质从分子库载入 + 浏览/预览/生成
+    renderChips('sac-metals', SAC_METALS, ['Fe']);
+    renderChips('sac-templates', SAC_TEMPLATES, ['MN4']);
+    loadSacAdsorbates();
+    wire('sac-incar-btn', () => pickFile('sac-incar', 'incar'));
+    wire('sac-out-btn', () => pickDir('sac-out'));
+    wire('sac-preview-btn', sacPreview);
+    wire('sac-gen-btn', sacGenerate);
+    // 计算活动模板 + 预览保存
+    loadCampaignTemplates();
+    { const el = $('camp-tpl-sel'); if (el) el.addEventListener('change', onCampTplChange); }
+    wire('camp-tpl-inst', instantiateCampaign);
+    wire('gen-preview-save', savePreview);
+    // 金属 slab 建模:晶面目录 + 元素/晶面联动 + 浏览/生成
+    loadMetalSlabCatalog();
+    { const el = $('mslab-surface'); if (el) el.addEventListener('change', onMslabChange); }
+    { const el = $('mslab-el');
+      if (el) { el.addEventListener('input', onMslabChange); el.addEventListener('change', onMslabChange); } }
+    wire('mslab-incar-btn', () => pickFile('mslab-incar', 'incar'));
+    wire('mslab-out-btn', () => pickDir('mslab-out'));
+    wire('mslab-gen-btn', mslabGenerate);
+    // 多自旋并跑:浏览/生成
+    wire('spin-poscar-btn', () => pickFile('spin-poscar', 'poscar'));
+    wire('spin-incar-btn', () => pickFile('spin-incar', 'incar'));
+    wire('spin-out-btn', () => pickDir('spin-out'));
+    wire('spin-gen-btn', spinGenerate);
+
+    // 引擎选择器(生成页):载入引擎下拉(VASP 优先)+ 浏览/生成
+    { const esel = $('engine-select'); if (esel) esel.addEventListener('change', () => selectEngine(esel.value)); }
+    loadEngines();
+    wire('eng-poscar-btn', () => pickFile('eng-poscar', 'poscar'));
+    wire('eng-out-btn', () => pickDir('eng-out'));
+    wire('engine-gen-btn', engineGenerate);
+    { const task = $('eng-task'); if (task) task.addEventListener('change', saveEngineTask); }
 
     const st = await VCS.call('gen_state');
     if (st) {
@@ -107,5 +681,32 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  window.Generate = { reload: () => refreshPreview() };
+  // 工作模式晚于页面脚本加载：切换后重拉严格白名单，并应用该模式默认体系类型。
+  document.addEventListener('vcs:scenario', e => {
+    const sc = e.detail && e.detail.scenario;
+    const defaults = (sc && sc.defaults) || {};
+    const calc = $('gen-calc');
+    if (calc && defaults.calc_type && Array.from(calc.options).some(o => o.value === defaults.calc_type)) {
+      calc.value = defaults.calc_type;
+      refreshPreview();
+    }
+    loadEngines();
+  });
+  document.addEventListener('vcs:calculation', syncEngineTask);
+  document.addEventListener('vcs:engine', e => {
+    const engine = e.detail && e.detail.engine;
+    if (engine && engine !== State2.engine) loadEngines();
+  });
+
+  // 供 molbuild.js(①分子建模「下一步」)携分子进 Gaussian 面板:选 Gaussian 引擎 + 载分子
+  async function useMolecule(struct) {
+    await loadEngines();
+    await selectEngine('gaussian');
+    if (window.GaussMol && typeof window.GaussMol.useMolecule === 'function') {
+      window.GaussMol.useMolecule(struct);
+    }
+  }
+
+  window.Generate = { reload: () => refreshPreview(), useMolecule,
+    selectEngine: async key => { await loadEngines(); return selectEngine(key); } };
 })();

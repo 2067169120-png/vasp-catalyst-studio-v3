@@ -1,9 +1,11 @@
-// jobs.js — 任务页:台账表 + 全部批量动作 + 密码/信任流 + 自动刷新 + 集群队列/认领。
+// jobs.js — 作业页:台账表 + 全部批量动作 + 密码/信任流 + 自动刷新 + 集群队列/认领。
 // 只依赖 app.js 暴露的 VCS.* 与 api 桥方法。行为逐条对齐 vcstudio/gui/jobs_tab.py。
 // 全部数据插值走 VCS.esc(注入防御);零 emoji;中文文案。
 'use strict';
 (function () {
   const PROFILE_KEY = 'vcs.jobs.profile';
+  const AUTO_KEY = 'vcs.jobs.auto';         // 自动刷新开关(持久化;默认开)
+  const INT_KEY = 'vcs.jobs.interval';      // 自动刷新间隔(分钟,持久化)
   const $ = sel => document.querySelector(sel);
 
   const State = {
@@ -11,6 +13,7 @@
     stale: [],           // 失效条目目录
     profiles: {},        // name -> profile dict
     selected: new Set(), // 选中的 dir
+    expanded: new Set(), // 展开的项目组 key(默认全部折叠;本会话内记忆)
     refreshing: false,   // 查询在飞(auto 跳过本轮的护栏)
     autoTimer: null,
   };
@@ -19,6 +22,30 @@
   function base(p) { return String(p).replace(/[\\/]+$/, '').split(/[\\/]/).pop(); }
   function currentProfile() { const s = $('#jobs-profile'); return s ? s.value : ''; }
   function selectedDirs() { return Array.from(State.selected); }
+
+  // 所有破坏性/远程动作都必须与 job.yaml 绑定的服务器一致。后端还会做同样的
+  // 硬校验；这里先给用户可理解的提示，避免输完密码后才发现选错服务器。
+  function actionDirs(name, action, mode) {
+    const rows = selectedDirs().map(d => State.rows.find(r => r.dir === d)).filter(Boolean);
+    if (!rows.length) return [];
+    let invalid;
+    if (mode === 'new') {
+      invalid = rows.filter(r => r.cluster || r.state !== 'CREATED');
+      if (invalid.length) {
+        VCS.log(`${action}仅适用于尚未提交的 CREATED 作业；已绑定/已提交的作业请走续算流程：` +
+          invalid.map(r => r.name).join('、'), 'failc');
+        return null;
+      }
+    } else {
+      invalid = rows.filter(r => r.cluster !== name);
+      if (invalid.length) {
+        VCS.log(`${action}已阻止：所选作业不属于当前服务器「${name}」：` +
+          invalid.map(r => `${r.name}(${r.cluster || '尚未提交'})`).join('、'), 'failc');
+        return null;
+      }
+    }
+    return rows.map(r => r.dir);
+  }
 
   function requireProfile() {
     const name = currentProfile();
@@ -61,9 +88,101 @@
     State.rows = (r && r.jobs) || [];
     State.stale = (r && r.stale) || [];
     if (r && r.error) VCS.log('读取台账失败:' + r.error, 'failc');
+    refreshClusterFilter();
+    if (typeof fmClusters === 'function') fmClusters();
     renderTable();
     renderStats();
     renderStale();
+  }
+
+  // 成员角色 → 中文标签(list_jobs 注入的 role 字段)
+  const ROLE_LABEL = {
+    clean: '清洁表面', gas: '气相参考', config: '吸附构型',
+    molecule: '物种参考态',
+  };
+
+  // 单行作业 HTML。grpKey 非空 → 属于某折叠组(data-grp);hidden → 组当前折叠
+  function rowHtml(r, grpKey, hidden) {
+    const task = r.task && r.task !== '/' ? r.task : '';
+    const checked = State.selected.has(r.dir);
+    const sel = checked ? ' class="sel"' : '';
+    const role = ROLE_LABEL[r.role] || '';
+    const isQuick = String(r.task || '').startsWith('quick');
+    return `<tr data-dir="${VCS.esc(r.dir)}" data-name="${VCS.esc(r.name)}"` +
+      (grpKey ? ` data-grp="${VCS.esc(grpKey)}"` : '') +
+      (hidden ? ' hidden' : '') + `${sel}>` +
+      `<td class="chk"><input type="checkbox" class="jrow-chk"${checked ? ' checked' : ''}></td>` +
+      `<td>${VCS.elementBadge(r.name)}<span class="name">${VCS.esc(r.name)}</span>` +
+      (role ? ` <span class="role-tag">${VCS.esc(role)}</span>` : '') +
+      (r.cluster ? ` <span class="role-tag" title="该作业绑定的服务器">${VCS.esc(r.cluster)}</span>` : '') +
+      (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') +
+      ` <button class="lnk conv" title="查看收敛过程(E0/ΔE/|F|max vs 离子步)">收敛</button>` +
+      (['RUNNING', 'QUEUED', 'SUBMITTED', 'UPLOADED'].indexOf(r.state) >= 0
+        ? `<button class="lnk live" title="实时能量曲线:本地无 OSZICAR 时经 SSH 读远端,可轮询">实时</button>` : '') +
+      `<button class="lnk struct" title="3D 结构预览(CONTCAR 优先,自动检查分子-衬底距离)">结构</button>` +
+      `<button class="lnk meth" title="生成中英双语 Methods 段 + BibTeX(读真实 INCAR/KPOINTS/POTCAR)">方法</button>` +
+      `<button class="lnk dos" title="总 DOS 出图(需本地 vasprun.xml)">DOS</button>` +
+      (isQuick
+        ? `<button class="lnk localrun" title="在本机跑该作业(需设置页配置本地软件命令)">本机运行</button>` : '') +
+      (r.state === 'DONE'
+        ? `<button class="lnk derive" title="派生频率(ZPE)/电子结构静态/AIMD 作业">派生</button>` : '') +
+      `</td>` +
+      `<td>${VCS.pill(r.state)}</td>` +
+      `<td class="mono">${r.job_id ? VCS.esc(r.job_id) : '—'}</td>` +
+      `<td class="num">${r.steps != null ? VCS.esc(r.steps) : '—'}</td>` +
+      `<td class="num">${r.fmax != null ? VCS.esc(r.fmax) : '—'}</td>` +
+      `<td class="num">${r.energy !== '' && r.energy != null ? VCS.esc(r.energy) : '—'}</td>` +
+      `<td class="diag">${VCS.esc(r.diag || '')}</td>` +
+      `<td class="mono">${VCS.esc(r.updated || '')}</td></tr>`;
+  }
+
+  // 组内状态计数(与 renderStats 同口径)
+  function groupStats(rows) {
+    const c = s => rows.filter(r => r.state === s).length;
+    return {
+      total: rows.length,
+      done: c('DONE'),
+      run: c('RUNNING'),
+      queue: c('QUEUED') + c('SUBMITTED') + c('UPLOADED'),
+      need: c('FAILED') + c('UNCONVERGED') + c('NEEDS_HUMAN'),
+    };
+  }
+
+  function projectKindForGroup(group) {
+    const allRows = State.rows.filter(row => group.path
+      ? row.project_path === group.path
+      : (!row.project_path && row.project === group.label));
+    return allRows.length && allRows.every(row => row.role === 'molecule')
+      ? 'molecule_library' : 'adsorption';
+  }
+
+  // 组头行:项目名 + done/total 进度 + 细进度条 + 聚合状态;全 DONE 给「算 ΔE」
+  function groupHeadHtml(key, label, rows, isProject, projectPath, projectKind) {
+    const st = groupStats(rows);
+    const open = State.expanded.has(key);
+    const pct = st.total ? Math.round(st.done / st.total * 100) : 0;
+    let agg;
+    if (st.need) agg = `<span class="pill fail"><i></i>需处理 ${st.need}</span>`;
+    else if (st.run) agg = VCS.pill('RUNNING');
+    else if (st.queue) agg = VCS.pill('QUEUED');
+    else if (st.done === st.total) agg = VCS.pill('DONE');
+    else agg = `<span class="pill q"><i></i>待提交</span>`;
+    const allDone = st.total > 0 && st.done === st.total;
+    return `<tr class="grp-head" data-grp="${VCS.esc(key)}" ` +
+      `title="点击${open ? '折叠' : '展开'}组内 ${st.total} 个作业">` +
+      `<td colspan="9"><span class="caret">${open ? '▾' : '▸'}</span>` +
+      `<b class="grp-name">${VCS.esc(label)}</b>` +
+      (isProject ? `<span class="grp-tag">${projectKind === 'molecule_library'
+        ? '分子参考库' : '吸附能项目'}</span>` : '') +
+      `<span class="grp-prog">${st.done}/${st.total} 完成</span>` +
+      `<span class="grp-bar"><i style="width:${pct}%"></i></span>` +
+      agg +
+      (isProject && projectKind !== 'molecule_library' && allDone
+        ? ` <button class="btn grp-de" data-proj="${VCS.esc(label)}" ` +
+          `data-proj-path="${VCS.esc(projectPath || '')}" ` +
+          'title="切到吸附能项目页并选中该项目">算 ΔE</button>'
+        : '') +
+      `</td></tr>`;
   }
 
   function renderTable() {
@@ -79,30 +198,114 @@
     const present = new Set(State.rows.map(r => r.dir));
     State.selected.forEach(d => { if (!present.has(d)) State.selected.delete(d); });
 
+    const rows0 = visibleRows();
+    if (!rows0.length) {
+      card.innerHTML = '<div class="empty"><p>当前筛选无匹配作业 — 调整上方筛选条件</p></div>';
+      return;
+    }
+
+    // 按吸附能项目分桶(project=null → 单独作业桶);保持筛选后次序
+    const groups = new Map();
+    const single = [];
+    rows0.forEach(r => {
+      if (r.project) {
+        const groupKey = r.project_path ? 'path:' + r.project_path : 'name:' + r.project;
+        if (!groups.has(groupKey)) {
+          groups.set(groupKey, { label: r.project, path: r.project_path || '', rows: [] });
+        }
+        groups.get(groupKey).rows.push(r);
+      } else {
+        single.push(r);
+      }
+    });
+
     let h = '<table><thead><tr>' +
-      '<th>作业</th><th>状态</th><th class="mono">作业号</th>' +
+      '<th class="chk"></th><th>作业</th><th>状态</th><th class="mono">作业号</th>' +
       '<th class="num">步</th><th class="num">|F|max</th><th class="num">E0 (eV)</th>' +
       '<th>诊断</th><th class="mono">更新</th></tr></thead><tbody>';
-    State.rows.forEach(r => {
-      const task = r.task && r.task !== '/' ? r.task : '';
-      const sel = State.selected.has(r.dir) ? ' class="sel"' : '';
-      h += `<tr data-dir="${VCS.esc(r.dir)}" data-name="${VCS.esc(r.name)}"${sel}>` +
-        `<td><span class="name">${VCS.esc(r.name)}</span>` +
-        (task ? ` <span class="sub">${VCS.esc(task)}</span>` : '') +
-        ` <button class="lnk conv" title="查看收敛过程(E0/ΔE/|F|max vs 离子步)">收敛</button>` +
-        `<button class="lnk struct" title="3D 结构预览(CONTCAR 优先,自动检查分子-衬底距离)">结构</button>` +
-        `<button class="lnk meth" title="生成中英双语 Methods 段 + BibTeX(读真实 INCAR/KPOINTS/POTCAR)">方法</button>` +
-        `<button class="lnk dos" title="总 DOS 出图(需本地 vasprun.xml)">DOS</button></td>` +
-        `<td>${VCS.pill(r.state)}</td>` +
-        `<td class="mono">${r.job_id ? VCS.esc(r.job_id) : '—'}</td>` +
-        `<td class="num">${r.steps != null ? VCS.esc(r.steps) : '—'}</td>` +
-        `<td class="num">${r.fmax != null ? VCS.esc(r.fmax) : '—'}</td>` +
-        `<td class="num">${r.energy !== '' && r.energy != null ? VCS.esc(r.energy) : '—'}</td>` +
-        `<td class="diag">${VCS.esc(r.diag || '')}</td>` +
-        `<td class="mono">${VCS.esc(r.updated || '')}</td></tr>`;
-    });
+    if (!groups.size) {
+      // 没有任何项目组 → 保持旧平铺观感,不加组头
+      rows0.forEach(r => { h += rowHtml(r, null, false); });
+    } else {
+      groups.forEach((group, groupKey) => {
+        const rows = group.rows;
+        const key = 'p:' + groupKey;
+        const open = State.expanded.has(key);
+        const projectKind = projectKindForGroup(group);
+        h += groupHeadHtml(key, group.label, rows, true, group.path, projectKind);
+        rows.forEach(r => { h += rowHtml(r, key, !open); });
+      });
+      if (single.length) {
+        const key = 's:_single';
+        const open = State.expanded.has(key);
+        h += groupHeadHtml(key, '单独作业', single, false, '', '');
+        single.forEach(r => { h += rowHtml(r, key, !open); });
+      }
+    }
     h += '</tbody></table>';
     card.innerHTML = h;
+  }
+
+  // ── 筛选(集群 / 状态)+ 排序(时间↓/名称/状态) ──
+  const STATUS_GROUP = {
+    run: ['RUNNING'], queue: ['QUEUED', 'SUBMITTED', 'UPLOADED'], done: ['DONE'],
+    fail: ['FAILED', 'UNCONVERGED'], need: ['NEEDS_HUMAN'],
+  };
+  function visibleRows() {
+    const fc = ($('#jf-cluster') && $('#jf-cluster').value) || '';
+    const fs = ($('#jf-status') && $('#jf-status').value) || '';
+    const so = ($('#jf-sort') && $('#jf-sort').value) || 'time';
+    let rows = State.rows.slice();
+    if (fc) rows = rows.filter(r => (r.cluster || '') === fc);
+    if (fs && STATUS_GROUP[fs]) rows = rows.filter(r => STATUS_GROUP[fs].indexOf(r.state) >= 0);
+    if (so === 'name') rows.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    else if (so === 'state') rows.sort((a, b) => String(a.state).localeCompare(String(b.state)));
+    else rows.sort((a, b) => String(b.updated || '').localeCompare(String(a.updated || '')));
+    return rows;
+  }
+  function refreshClusterFilter() {
+    const sel = $('#jf-cluster');
+    if (!sel) return;
+    const cur = sel.value;
+    const clusters = Array.from(new Set(State.rows.map(r => r.cluster).filter(Boolean)));
+    sel.innerHTML = '<option value="">全部集群</option>' +
+      clusters.map(c => `<option value="${VCS.esc(c)}">${VCS.esc(c)}</option>`).join('');
+    if (clusters.indexOf(cur) >= 0) sel.value = cur;
+  }
+
+  // 组头折叠开关:记忆到 State.expanded(重载/自动刷新后保持)
+  function toggleGroup(key) {
+    if (State.expanded.has(key)) State.expanded.delete(key);
+    else State.expanded.add(key);
+    renderTable();
+  }
+
+  // 「算 ΔE」:切到吸附能项目页并尽量选中该项目
+  function gotoProject(name, path) {
+    const a = document.querySelector('nav a[data-page=project]');
+    if (a) a.click();
+    if (path && window.Project && typeof window.Project.selectByPath === 'function') {
+      window.Project.selectByPath(path);
+    } else if (window.Project && typeof window.Project.selectByName === 'function') {
+      window.Project.selectByName(name);
+    }
+  }
+
+  // 「导出报告」:报告在项目页生成 —— 跳项目页 + toast + 选中选中作业所属项目
+  function doReport() {
+    const dirs = selectedDirs();
+    let projName = '';
+    let projPath = '';
+    if (dirs.length) {
+      const row = State.rows.find(r => r.dir === dirs[0]);
+      if (row && row.project) {
+        projName = row.project;
+        projPath = row.project_path || '';
+      }
+    }
+    gotoProject(projName, projPath);
+    VCS.toast('报告在项目页生成');
+    VCS.log('报告在「吸附能项目」页生成' + (projName ? '(已为你选中项目「' + projName + '」)' : ''));
   }
 
   function renderStats() {
@@ -131,8 +334,27 @@
     const card = $('#jobs-card');
     if (!card) return;
     card.addEventListener('click', e => {
+      // 组头行:点「算 ΔE」跳项目页,其余区域折叠/展开组
+      const gh = e.target.closest('tr.grp-head');
+      if (gh) {
+        const de = e.target.closest('.grp-de');
+        if (de) {
+          e.stopPropagation();
+          gotoProject(de.dataset.proj, de.dataset.projPath || '');
+          return;
+        }
+        toggleGroup(gh.dataset.grp);
+        return;
+      }
       const tr = e.target.closest('tr[data-dir]');
       if (!tr) return;
+      // 「实时」按钮:打开实时能量曲线面板(v3.3.0,不参与行选中)
+      if (e.target.closest('.live')) {
+        e.stopPropagation();
+        const row = State.rows.find(x => x.dir === tr.dataset.dir) || {};
+        liveOpen(tr.dataset.dir, tr.dataset.name || tr.dataset.dir, row.cluster || '');
+        return;
+      }
       // 「收敛」/「结构」按钮:打开对应视图,不参与行选中
       if (e.target.closest('.conv')) {
         e.stopPropagation();
@@ -154,7 +376,24 @@
         VCS.showDos(tr.dataset.dir, tr.dataset.name || tr.dataset.dir);
         return;
       }
+      if (e.target.closest('.derive')) {
+        e.stopPropagation();
+        toggleDeriveRow(tr);
+        return;
+      }
+      if (e.target.closest('.localrun')) {
+        e.stopPropagation();
+        toggleLocalRow(tr);
+        return;
+      }
       const dir = tr.dataset.dir;
+      // 勾选框:切换选中(不清空其他选中)
+      if (e.target.closest('.jrow-chk')) {
+        if (State.selected.has(dir)) State.selected.delete(dir);
+        else State.selected.add(dir);
+        tr.classList.toggle('sel', State.selected.has(dir));
+        return;
+      }
       if (e.ctrlKey || e.metaKey) {
         if (State.selected.has(dir)) State.selected.delete(dir);
         else State.selected.add(dir);
@@ -162,8 +401,11 @@
         State.selected.clear();
         State.selected.add(dir);
       }
-      card.querySelectorAll('tr[data-dir]').forEach(t =>
-        t.classList.toggle('sel', State.selected.has(t.dataset.dir)));
+      card.querySelectorAll('tr[data-dir]').forEach(t => {
+        t.classList.toggle('sel', State.selected.has(t.dataset.dir));
+        const cb = t.querySelector('.jrow-chk');
+        if (cb) cb.checked = State.selected.has(t.dataset.dir);
+      });
     });
     card.addEventListener('dblclick', async e => {
       const tr = e.target.closest('tr[data-dir]');
@@ -196,10 +438,9 @@
       if (res.cancelled) return null;
       if (res.needPassword) { password = res.password; res = await invoke(password, trust); continue; }
       if (res.needs_trust) {
-        const ok = await VCS.confirm('未知主机指纹:' + (res.message || '') +
-          '\n\n信任该主机并重试?');
-        if (!ok) { VCS.log('已取消(未信任主机)', 'failc'); return null; }
-        trust = true;
+        const pin = await VCS.confirmHostKey(res);
+        if (!pin) { VCS.log('已取消或阻止未知主机连接', 'failc'); return null; }
+        trust = pin;
         res = await invoke(password, trust);
         continue;
       }
@@ -220,11 +461,187 @@
     });
   }
 
+  // ── 派生计算展开区(DONE 作业):频率(ZPE)/ 电子结构静态多选 ────────────────
+  function fmtChange(c) {
+    if (typeof c === 'string') return c;             // estatic 改动为字符串
+    const key = c.key, act = c.action;
+    if (act === 'add') return '新增 ' + key + ' = ' + c.new + (c.reason ? '(' + c.reason + ')' : '');
+    if (act === 'strip') return '剥离 ' + key + '(原 ' + c.old + ')' + (c.reason ? ':' + c.reason : '');
+    return key + ':' + c.old + ' → ' + c.new + (c.reason ? '(' + c.reason + ')' : '');
+  }
+
+  function toggleDeriveRow(tr) {
+    const dir = tr.dataset.dir, name = tr.dataset.name || dir;
+    const next = tr.nextElementSibling;
+    if (next && next.classList.contains('derive-row') && next.dataset.for === dir) {
+      next.remove(); return;                         // 再点收起
+    }
+    const row = document.createElement('tr');
+    row.className = 'derive-row';
+    row.dataset.for = dir;
+    row.innerHTML = '<td colspan="9"><div class="derive-box">' +
+      '<span class="derive-lbl">派生计算:</span>' +
+      '<button class="btn quiet" data-dfreq>频率 (ZPE)</button>' +
+      '<span class="derive-sep">电子结构静态:</span>' +
+      '<label><input type="checkbox" data-k="pdos" checked> PDOS</label>' +
+      '<label><input type="checkbox" data-k="bader"> Bader</label>' +
+      '<label><input type="checkbox" data-k="chgdiff"> 差分电荷</label>' +
+      '<button class="btn quiet" data-dstatic>派生静态</button>' +
+      '<span class="derive-sep">AIMD 热稳定性:</span>' +
+      '<label>系综 <select class="ipt" data-aimd-ens style="width:auto;display:inline-block">' +
+      '<option value="nvt">NVT</option><option value="nve">NVE</option></select></label>' +
+      '<label>温度 <input class="ipt" data-aimd-temp value="300" style="width:56px"> K</label>' +
+      '<label>步数 <input class="ipt" data-aimd-steps value="10000" style="width:72px"></label>' +
+      '<button class="btn quiet" data-daimd>派生 AIMD</button></div></td>';
+    tr.parentNode.insertBefore(row, tr.nextSibling);
+    row.querySelector('[data-dfreq]').addEventListener('click', () => doDeriveFreq(dir, name));
+    row.querySelector('[data-dstatic]').addEventListener('click', () => {
+      const kinds = Array.from(row.querySelectorAll('input[data-k]:checked')).map(c => c.dataset.k);
+      doDeriveEstatic(dir, name, kinds);
+    });
+    row.querySelector('[data-daimd]').addEventListener('click', () => {
+      const ens = row.querySelector('[data-aimd-ens]').value;
+      const temp = parseFloat(row.querySelector('[data-aimd-temp]').value) || 300;
+      const steps = parseInt(row.querySelector('[data-aimd-steps]').value, 10) || 10000;
+      doDeriveAimd(dir, name, ens, temp, steps);
+    });
+  }
+
+  async function doDeriveAimd(dir, name, ens, temp, steps) {
+    VCS.log('派生 AIMD 作业(' + ens.toUpperCase() + ' ' + temp + 'K ' + steps + '步):' + name + ' …');
+    const r = await VCS.call('derive_aimd', dir, ens, temp, null, steps, 1.0, null);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('派生 AIMD 失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    VCS.log('已派生 AIMD 作业:' + r.job_dir, 'okc');
+    (r.changes || []).forEach(c => VCS.log('  · ' + fmtChange(c)));
+    (r.warnings || []).forEach(w => VCS.log('  ⚠ ' + w, 'warnc'));
+    VCS.log('AIMD 作业已入台账,去列表提交', 'okc');
+    await reload();
+  }
+
+  // ── 本机运行展开区(quick/gaussian 作业):启动 / 轮询状态 / 停止 ──
+  const LocalRun = { timers: {} };
+  function toggleLocalRow(tr) {
+    const dir = tr.dataset.dir, name = tr.dataset.name || dir;
+    const next = tr.nextElementSibling;
+    if (next && next.classList.contains('localrun-row') && next.dataset.for === dir) {
+      stopLocalPoll(dir); next.remove(); return;
+    }
+    const row = document.createElement('tr');
+    row.className = 'localrun-row';
+    row.dataset.for = dir;
+    row.innerHTML = '<td colspan="9"><div class="derive-box">' +
+      '<span class="derive-lbl">本机运行:</span>' +
+      '<label>命令模板 <input class="ipt" data-lr-cmd placeholder="如 g16 或 g16 {input} {output}" style="width:280px"></label>' +
+      '<button class="btn quiet" data-lr-start>启动</button>' +
+      '<button class="btn quiet" data-lr-stop>停止</button>' +
+      '<span class="lr-state sub" data-lr-state>未运行</span>' +
+      '<pre class="mono lr-log" data-lr-log style="margin:6px 0 0;max-height:16vh"></pre></div></td>';
+    tr.parentNode.insertBefore(row, tr.nextSibling);
+    row.querySelector('[data-lr-start]').addEventListener('click', () => localStart(dir, name, row));
+    row.querySelector('[data-lr-stop]').addEventListener('click', () => localStop(dir, row));
+    localPoll(dir, row);   // 立即拉一次状态
+  }
+  async function localStart(dir, name, row) {
+    const tmpl = (row.querySelector('[data-lr-cmd]').value || '').trim();
+    if (!tmpl) { VCS.toast('请填入本机命令模板(如 g16)', 'fail'); return; }
+    VCS.log('本机运行启动:' + name + '(' + tmpl + ')…');
+    const r = await VCS.call('local_run_start', dir, tmpl);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('本机运行启动失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    VCS.log('本机运行已启动:pid ' + r.pid + '(' + (r.cmd || []).join(' ') + ')', 'okc');
+    startLocalPoll(dir, row);
+  }
+  async function localStop(dir, row) {
+    const r = await VCS.call('local_run_cancel', dir);
+    if (r && r.ok) { VCS.log('已停止本机作业:' + base(dir), 'okc'); localPoll(dir, row); }
+    else VCS.log('停止失败:' + ((r && r.error) || '未知'), 'failc');
+  }
+  async function localPoll(dir, row) {
+    const r = await VCS.call('local_run_status', dir);
+    if (!r || !r.ok) return;
+    const st = row.querySelector('[data-lr-state]');
+    if (st) st.textContent = '状态:' + (r.state || '?') +
+      (r.exit_code != null ? '(退出码 ' + r.exit_code + ')' : '');
+    const log = row.querySelector('[data-lr-log]');
+    if (log) log.textContent = r.log_tail || '';
+    if (r.state === 'DONE' || r.state === 'FAILED') stopLocalPoll(dir);
+  }
+  function startLocalPoll(dir, row) {
+    stopLocalPoll(dir);
+    LocalRun.timers[dir] = setInterval(() => localPoll(dir, row), 4000);
+    localPoll(dir, row);
+  }
+  function stopLocalPoll(dir) {
+    if (LocalRun.timers[dir]) { clearInterval(LocalRun.timers[dir]); delete LocalRun.timers[dir]; }
+  }
+
+  async function doDeriveFreq(dir, name) {
+    VCS.log('派生频率作业(ZPE):' + name + ' …');
+    const r = await VCS.call('derive_freq', dir);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('派生频率失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    VCS.log('已派生频率作业:' + r.job_dir, 'okc');
+    (r.changes || []).forEach(c => VCS.log('  · ' + fmtChange(c)));
+    (r.warnings || []).forEach(w => VCS.log('  ⚠ ' + w, 'warnc'));
+    VCS.log('频率作业已入台账,去列表提交', 'okc');
+    await reload();
+  }
+
+  async function doDeriveEstatic(dir, name, kinds) {
+    if (!kinds.length) { VCS.toast('请至少勾选一种静态类型', 'fail'); return; }
+    VCS.log('派生静态作业(' + kinds.join('、') + '):' + name + ' …');
+    const r = await VCS.call('derive_estatic', dir, kinds);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('派生静态失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    (r.jobs || []).forEach(j => {
+      VCS.log('已派生 ' + j.kind + ' 静态作业:' + j.job_dir, 'okc');
+      (j.changes || []).forEach(c => VCS.log('  · ' + fmtChange(c)));
+      (j.warnings || []).forEach(w => VCS.log('  ⚠ ' + w, 'warnc'));
+    });
+    (r.skipped || []).forEach(s => VCS.log('跳过 ' + s.kind + ':' + s.reason, 'warnc'));
+    VCS.log('静态作业已入台账,去列表提交', 'okc');
+    await reload();
+  }
+
+  // ── 自旋对比:对选中的自旋家族判基态 + 磁矩审计 ────────────────────────────
+  async function doSpinCompare() {
+    const dirs = selectedDirs();
+    if (dirs.length < 2) {
+      VCS.log('自旋对比:请选中同一家族的多个自旋变体(_spin_nm/_ls/_hs)', 'failc'); return;
+    }
+    VCS.log('自旋对比(' + dirs.length + ' 个变体)…');
+    const r = await VCS.call('spin_family_compare', dirs);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('自旋对比失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    const g = r.ground || {};
+    if (g.pending && g.pending.length) {
+      VCS.log('尚未全部 DONE,待完成:' + g.pending.join('、'), 'warnc');
+    } else if (g.winner) {
+      VCS.log('自旋基态:' + g.winner + '(相对能量 ' +
+        Object.entries(g.de_meV || {}).map(kv => kv[0] + '=' + kv[1] + ' meV').join(', ') + ')', 'okc');
+      if (g.warning) VCS.log('⚠ ' + g.warning, 'warnc');
+    }
+    (r.audits || []).forEach(a => {
+      if (!a.audited) VCS.log('磁矩审计 ' + a.name + ':' + (a.warning || '无法审计'), 'warnc');
+      else if (a.warning) VCS.log('磁矩审计 ' + a.name + ':⚠ ' + a.warning, 'warnc');
+      else VCS.log('磁矩审计 ' + a.name + ':末态 ' + a.final_magnetization + ' μB,正常', 'okc');
+    });
+    if (r.report_file) VCS.log('多自旋态可追溯报告:' + r.report_file, 'okc');
+    if (r.report_error) VCS.log('多自旋报告生成失败:' + r.report_error, 'warnc');
+  }
+
   // ── 上传并提交 ─────────────────────────────────────────────────────────────
   async function doSubmit() {
     const name = requireProfile();
     if (!name) return;
-    const dirs = selectedDirs();
+    const dirs = actionDirs(name, '提交', 'new');
+    if (dirs === null) return;
     if (!dirs.length) { VCS.log('请先在列表中选中要提交的作业(可多选)', 'failc'); return; }
     const prof = State.profiles[name];
     const ok = await VCS.confirm(
@@ -262,7 +679,12 @@
       if (!auto) VCS.log('查询作业状态…');
       const res = await remote(name, (pw, trust) => VCS.call('refresh_status', name, pw, trust));
       if (!res) return;
-      if (res.error) { VCS.log((auto ? '自动刷新' : '查询') + '异常:' + res.error, 'failc'); return; }
+      if (res.error) {
+        VCS.log((auto ? '自动刷新' : '查询') + '异常:' + res.error, 'failc');
+        // 自动刷新失败在别页也要可见(此前只写日志,用户看不到)
+        if (auto) VCS.toast('自动刷新失败:' + res.error, 'fail');
+        return;
+      }
       const results = res.results || [];
       if (!results.length) {
         if (!auto) VCS.log(`「${name}」没有待查询的作业(SUBMITTED/QUEUED/RUNNING)`);
@@ -275,19 +697,59 @@
     }
   }
 
-  // ── 拉回结果:预设弹窗(轻量 / DOS·Bader 全家桶 / 自定义) ─────────────────
+  async function runAllStatus(auto) {
+    if (State.refreshing) {
+      if (!auto) VCS.log('上一轮查询仍在进行,请稍候');
+      return;
+    }
+    State.refreshing = true;
+    try {
+      if (!auto) VCS.log('并行查询所有服务器上的活跃作业…');
+      const res = await VCS.call('refresh_all_status');
+      if (!res || res.error) {
+        VCS.log('全部服务器查询失败:' + ((res && res.error) || '未知错误'), 'failc');
+        return;
+      }
+      let count = 0;
+      (res.profiles || []).forEach(server => {
+        if (server.error) {
+          const next = server.error === 'NEED_PASSWORD'
+            ? '请在目标集群下手动查询一次并保存密码'
+            : server.needs_trust ? '请先选择该集群手动查询并核对 SHA256 指纹' : server.error;
+          VCS.log(`[${server.name}] 查询失败:${next}`, 'failc');
+          return;
+        }
+        (server.results || []).forEach(row => {
+          count++;
+          VCS.log(`[${server.name}] ${row[0]}: ${row[1]}`);
+        });
+      });
+      if (!count && !auto && !(res.errors || []).length) {
+        VCS.log('所有服务器都没有待查询的活跃作业');
+      }
+      if ((res.errors || []).length && auto) {
+        VCS.toast(`多服务器监控：${res.errors.length} 台需要处理，其它服务器已正常刷新`, 'fail');
+      }
+      await reload();
+    } finally {
+      State.refreshing = false;
+    }
+  }
+
+  // ── 拉回结果:默认按每个 job.yaml 的任务类型选择关键产物 ─────────────────
   function askFetchFiles(n) {
     return new Promise(resolve => {
       const presets = [
-        ['轻量(默认):CONTCAR + OSZICAR + OUTCAR', ['CONTCAR', 'OSZICAR', 'OUTCAR']],
-        ['DOS/Bader 全家桶:轻量 + vasprun.xml + DOSCAR + CHGCAR + AECCAR0/2(大文件,较慢)',
-          ['CONTCAR', 'OSZICAR', 'OUTCAR', 'vasprun.xml', 'DOSCAR', 'CHGCAR', 'AECCAR0', 'AECCAR2']],
+        ['按任务自动（推荐）：能带 / DOS / Bader / ELF / 功函数 / AIMD 各取自己的关键文件', null],
+        ['仅轻量：CONTCAR + OSZICAR + OUTCAR', ['CONTCAR', 'OSZICAR', 'OUTCAR']],
+        ['电子结构全家桶：轻量 + vasprun.xml + DOSCAR + EIGENVAL + CHGCAR + AECCAR0/2 + ELFCAR + LOCPOT',
+          ['CONTCAR', 'OSZICAR', 'OUTCAR', 'vasprun.xml', 'DOSCAR', 'EIGENVAL',
+            'CHGCAR', 'AECCAR0', 'AECCAR2', 'ACF.dat', 'ELFCAR', 'LOCPOT', 'XDATCAR']],
       ];
       let done = false;
       const finish = v => { if (!done) { done = true; resolve(v); } };
       const body =
-        `<label style="display:block;margin-bottom:8px"><input type="radio" name="fp" value="0" checked> ${VCS.esc(presets[0][0])}</label>` +
-        `<label style="display:block;margin-bottom:8px"><input type="radio" name="fp" value="1"> ${VCS.esc(presets[1][0])}</label>` +
+        presets.map((p, i) => `<label style="display:block;margin-bottom:8px"><input type="radio" name="fp" value="${i}"${i === 0 ? ' checked' : ''}> ${VCS.esc(p[0])}</label>`).join('') +
         `<label style="display:block;margin-bottom:6px"><input type="radio" name="fp" value="99"> 自定义(逗号分隔文件名):</label>` +
         `<input id="fp-custom" class="ipt" value="CONTCAR, OUTCAR, vasprun.xml">`;
       const m = VCS.modal({
@@ -305,7 +767,7 @@
               } else {
                 files = presets[+c][1];
               }
-              mm.close(); finish(files);
+              mm.close(); finish({ files, label: c === '99' ? '自定义结果包' : presets[+c][0] });
             } },
         ],
       });
@@ -316,11 +778,13 @@
   async function doFetch() {
     const name = requireProfile();
     if (!name) return;
-    const dirs = selectedDirs();
+    const dirs = actionDirs(name, '拉回结果', 'bound');
+    if (dirs === null) return;
     if (!dirs.length) { VCS.log('请先选中要拉回结果的作业(通常是 DONE/未收敛 的)', 'failc'); return; }
-    const files = await askFetchFiles(dirs.length);
-    if (!files) return;
-    VCS.log(`拉回 ${dirs.length} 个作业的 ${files.join('、')}…`);
+    const choice = await askFetchFiles(dirs.length);
+    if (!choice) return;
+    const files = choice.files;
+    VCS.log(`拉回 ${dirs.length} 个作业：${files ? files.join('、') : choice.label}…`);
     const res = await remote(name, (pw, trust) =>
       VCS.call('fetch_jobs', dirs, name, pw, trust, files));
     if (!res) return;
@@ -333,7 +797,8 @@
   async function doContinue() {
     const name = requireProfile();
     if (!name) return;
-    const dirs = selectedDirs();
+    const dirs = actionDirs(name, '续算', 'bound');
+    if (dirs === null) return;
     if (!dirs.length) { VCS.log('请先选中要续算的作业(仅未收敛/墙钟/ZBRENT 等可续算)', 'failc'); return; }
     const ok = await VCS.confirm(
       `将对选中的 ${dirs.length} 个作业从 CONTCAR 续算并重投到「${name}」\n` +
@@ -477,7 +942,7 @@
     const body =
       `<div style="margin-bottom:10px"><div class="sub" style="margin-bottom:4px">远程目录(绝对路径,以 / 开头)</div>` +
       `<input id="ad-remote" class="ipt" value="${VCS.esc(j.workdir || '')}" ` +
-      `placeholder="${hasWd ? '/home/Maple123/...' : '查询中…'}"></div>` +
+      `placeholder="${hasWd ? '/home/<用户名>/runs' : '查询中…'}"></div>` +
       `<div><div class="sub" style="margin-bottom:4px">本地目录(结果将拉回到这里;不存在会新建)</div>` +
       `<input id="ad-local" class="ipt" value="${VCS.esc(localDefault)}" placeholder="例如 E:\\runs\\claimed_${VCS.esc(j.job_id)}"></div>`;
     const m = VCS.modal({
@@ -506,7 +971,7 @@
         .then(res => {
           if (!inp) return;
           if (res && res.workdir && !inp.value.trim()) inp.value = res.workdir;
-          inp.placeholder = '/home/Maple123/...';
+          inp.placeholder = '/home/<用户名>/runs';
         });
     }
   }
@@ -543,50 +1008,496 @@
   }
 
   // ── 自动刷新 ───────────────────────────────────────────────────────────────
-  function autoTick() { runStatus(true); }
+  function autoTick() { runAllStatus(true); }
 
-  function applyAuto() {
+  // silent=true(启动装载时):只起停定时器,不写日志——启动时可见页是仪表盘,
+  // 此刻 VCS.log 会给无日志区的仪表盘凭空插一个日志框,故静默。
+  function applyAuto(silent) {
     const cb = $('#jb-auto');
     const sel = $('#jb-interval');
     if (State.autoTimer) { clearInterval(State.autoTimer); State.autoTimer = null; }
     if (cb && cb.checked) {
-      const mins = parseInt(sel.value, 10) || 15;
+      const mins = parseInt(sel.value, 10) || 10;
       State.autoTimer = setInterval(autoTick, mins * 60000);
-      VCS.log(`自动刷新开启(每 ${mins} 分钟)`);
-    } else {
+      if (!silent) VCS.log(`自动刷新开启(每 ${mins} 分钟)`);
+    } else if (!silent) {
       VCS.log('自动刷新已关闭');
     }
   }
 
+  // ── 全选/反选 + 批量取消勾选作业 ──
+  function checkAll() {
+    const name = currentProfile();
+    // 全选不会跨服务器；未提交作业仍可勾选后提交到当前服务器。
+    const rows = visibleRows().filter(r => !r.cluster || r.cluster === name);
+    const allSel = rows.length && rows.every(r => State.selected.has(r.dir));
+    if (allSel) rows.forEach(r => State.selected.delete(r.dir));
+    else rows.forEach(r => State.selected.add(r.dir));
+    renderTable();
+  }
+  async function batchCancel() {
+    const name = requireProfile();
+    if (!name) return;
+    const dirs = actionDirs(name, '批量取消', 'bound');
+    if (dirs === null) return;
+    if (!dirs.length) { VCS.log('批量取消:请先勾选要取消的作业', 'failc'); return; }
+    if (!await VCS.confirm('确认取消勾选的 ' + dirs.length + ' 个作业?(qdel/scancel + 台账标记 FAILED/用户取消)')) return;
+    const res = await remote(name, (pw, trust) => VCS.call('jobs_cancel_batch', dirs, name, pw, trust));
+    if (!res) return;
+    if (res.error) { VCS.log('批量取消失败:' + res.error, 'failc'); return; }
+    (res.cancelled || []).forEach(j => VCS.log('已取消作业号 ' + j, 'okc'));
+    (res.failed || []).forEach(f => VCS.log('取消失败 ' + f.job_id + ':' + f.reason, 'failc'));
+    await reload();
+  }
+
+  // ── 快速批量提交:父目录扫描 → 四件套补齐 → 建作业 → 自动勾选 ──
+  const QS = { files: [], scan: null, scanSeq: 0, scanning: false };
+  function qsSharedIncar() { return ($('#qs-incar') && $('#qs-incar').value.trim()) || ''; }
+  function qsBuildable() {
+    return (((QS.scan || {}).items) || []).filter(i => i && i.can_build).length;
+  }
+  function qsUpdateBuildButton() {
+    const btn = $('#qs-build');
+    if (!btn) return;
+    const n = qsBuildable();
+    btn.disabled = QS.scanning || n === 0;
+    btn.textContent = QS.scanning ? '正在扫描…' :
+      (n ? `生成 / 导入 ${n} 个作业` : '请先选择并预检');
+  }
+  function renderQsFiles() {
+    const box = $('#qs-filelist');
+    const cnt = $('#qs-count');
+    if (cnt) cnt.textContent = QS.files.length + ' 个入口';
+    if (!box) return;
+    box.innerHTML = QS.files.map((f, i) =>
+      `<span class="qs-file" data-i="${i}">${VCS.esc(f)} <b data-rm="${i}">×</b></span>`).join('') ||
+      '<span class="sub">尚未选择。优先选择包含多个计算目录的父文件夹</span>';
+  }
+  function qsStatus(item) {
+    if (item.status === 'ready') return ['ready', '四件套完整'];
+    if (item.status === 'generatable') return ['generatable', '可自动补齐'];
+    return ['blocked', '需要处理'];
+  }
+  function renderQsPreview(r) {
+    const box = $('#qs-preview');
+    if (!box) return;
+    if (!QS.files.length) { box.hidden = true; box.innerHTML = ''; qsUpdateBuildButton(); return; }
+    box.hidden = false;
+    if (!r || r.error || r.ok === false) {
+      box.innerHTML = `<div class="qs-preview-head"><strong>预检失败</strong>` +
+        `<span class="qs-stat bad">${VCS.esc((r && r.error) || '无法读取输入')}</span></div>`;
+      qsUpdateBuildButton();
+      return;
+    }
+    const s = r.summary || {};
+    const items = r.items || [];
+    let h = '<div class="qs-preview-head"><strong>预检结果：发现 ' +
+      VCS.esc(s.total || 0) + ' 个候选作业</strong>' +
+      `<span class="qs-stat ok">完整 ${VCS.esc(s.ready || 0)}</span>` +
+      `<span class="qs-stat gen">可生成 ${VCS.esc(s.generatable || 0)}</span>` +
+      `<span class="qs-stat bad">需处理 ${VCS.esc(s.blocked || 0)}</span>` +
+      ((s.duplicates || 0) ? `<span class="qs-stat">已去重 ${VCS.esc(s.duplicates)}</span>` : '') +
+      '</div><div class="qs-preview-list">';
+    if (!items.length) {
+      h += '<div class="empty"><p>没有发现可用输入。请选择包含 POSCAR、CONTCAR 或四件套的目录。</p></div>';
+    } else {
+      items.forEach(item => {
+        const st = qsStatus(item);
+        const missing = item.missing || [];
+        h += '<div class="qs-preview-row">' +
+          `<div class="qs-preview-name"><b>${VCS.esc(item.name || '未命名')}</b>` +
+          `<span title="${VCS.esc(item.path || '')}">${VCS.esc(item.path || '')}</span></div>` +
+          `<div><span class="qs-status ${st[0]}">${st[1]}</span>` +
+          (missing.length
+            ? `<span class="qs-missing${item.can_build ? '' : ' bad'}">缺：${VCS.esc(missing.join('、'))}</span>`
+            : '<span class="qs-missing">文件完整</span>') + '</div>' +
+          `<div class="qs-preview-msg">${VCS.esc(item.message || '')}</div></div>`;
+      });
+    }
+    h += '</div>';
+    box.innerHTML = h;
+    qsUpdateBuildButton();
+  }
+  async function qsScan() {
+    const seq = ++QS.scanSeq;
+    if (!QS.files.length) {
+      QS.scan = null; QS.scanning = false; renderQsPreview(null); return null;
+    }
+    QS.scanning = true;
+    const box = $('#qs-preview');
+    if (box) {
+      box.hidden = false;
+      box.innerHTML = '<div class="qs-preview-head"><strong>正在递归扫描目录并检查四件套…</strong></div>';
+    }
+    qsUpdateBuildButton();
+    let r;
+    try {
+      r = await VCS.call('quick_submit_scan', QS.files, qsSharedIncar());
+    } catch (e) {
+      r = { ok: false, error: String(e), items: [], summary: {} };
+    }
+    if (seq !== QS.scanSeq) return null;
+    QS.scanning = false;
+    QS.scan = r;
+    renderQsPreview(r);
+    return r;
+  }
+  function qsSuggestOut(path, isDir) {
+    const out = $('#qs-out');
+    if (!out || out.value.trim() || !path) return;
+    const clean = String(path).replace(/[\\/]+$/, '');
+    if (isDir) out.value = clean + '_vcstudio_jobs';
+    else {
+      const m = clean.match(/^(.*)[\\/][^\\/]+$/);
+      out.value = (m ? m[1] + clean.slice(m[1].length, m[1].length + 1) : '') + 'vcstudio_jobs';
+    }
+  }
+  async function qsAdd() {
+    const r = await VCS.call('pick_file', 'input');
+    if (r && r.error) { VCS.log('选择文件失败:' + r.error, 'failc'); return; }
+    if (r && r.path && QS.files.indexOf(r.path) < 0) {
+      QS.files.push(r.path); renderQsFiles(); qsSuggestOut(r.path, false); await qsScan();
+    }
+  }
+  async function qsAddVaspDir() {
+    const r = await VCS.call('pick_dir');
+    if (r && r.error) { VCS.log('选择目录失败:' + r.error, 'failc'); return; }
+    if (r && r.path && QS.files.indexOf(r.path) < 0) {
+      QS.files.push(r.path);
+      renderQsFiles();
+      qsSuggestOut(r.path, true);
+      VCS.log('正在扫描父目录:' + r.path);
+      const scan = await qsScan();
+      if (scan && scan.ok) {
+        const s = scan.summary || {};
+        VCS.log(`已发现 ${s.total || 0} 个候选作业：完整 ${s.ready || 0}，` +
+          `可自动补齐 ${s.generatable || 0}，需处理 ${s.blocked || 0}`, 'okc');
+      }
+    }
+  }
+  async function qsBuild() {
+    if (!QS.files.length) { VCS.log('快速提交:请先添加 VASP 目录或输入文件', 'failc'); return; }
+    if (!QS.scan || QS.scanning) await qsScan();
+    if (!qsBuildable()) {
+      VCS.log('没有可建作业。若只有 POSCAR/CONTCAR，请先选择共享 INCAR；并检查预检中的缺项。', 'failc');
+      return;
+    }
+    const out = ($('#qs-out') && $('#qs-out').value.trim()) || '';
+    if (!out) { VCS.log('快速提交:请选择输出根目录', 'failc'); return; }
+    const shared = qsSharedIncar();
+    const lib = ($('#qs-lib') && $('#qs-lib').value.trim()) || '';
+    const calcType = ($('#qs-calc-type') && $('#qs-calc-type').value) || 'slab';
+    VCS.log('正在生成 / 导入 ' + qsBuildable() + ' 个作业；源文件保持不变…');
+    const r = await VCS.call(
+      'quick_submit_build', QS.files, out, '', shared, lib, calcType);
+    if (!r || r.ok === false || r.error) {
+      VCS.log('快速提交失败:' + ((r && r.error) || '未知错误'), 'failc'); return;
+    }
+    (r.jobs || []).forEach(j => {
+      VCS.log('已建作业:' + j.name + '(' + j.engine + ')→ ' + j.dir, 'okc');
+      if (j.hint) VCS.log('  提交命令模板:' + j.hint);
+    });
+    (r.skipped || []).forEach(s => VCS.log('跳过 ' + s.file + ':' + s.reason, 'warnc'));
+    const made = r.jobs || [];
+    VCS.log('已建 ' + made.length + ' 个作业并入台账', 'okc');
+    VCS.toast('已准备 ' + made.length + ' 个作业');
+    await reload();
+    // 新作业自动勾选；用户仍能在真正远程提交的确认框前增删选择。
+    const present = new Set(State.rows.map(row => row.dir));
+    let selected = 0;
+    made.forEach(job => {
+      if (present.has(job.dir)) { State.selected.add(job.dir); selected += 1; }
+    });
+    renderTable();
+    const next = $('#qs-next');
+    if (next && made.length) {
+      next.hidden = false;
+      if ($('#qs-next-title')) $('#qs-next-title').textContent = `已准备 ${made.length} 个作业`;
+      if ($('#qs-next-note')) $('#qs-next-note').textContent =
+        `其中 ${selected} 个已在下方自动勾选；提交前仍会显示集群与远程目录确认。`;
+      next.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+
+  // ── 文件管理:列远端目录 + 下载选中 ──
+  const FM = { entries: [], checked: new Set() };
+  function fmClusters() {
+    const sel = $('#fm-cluster');
+    if (!sel) return;
+    const names = Object.keys(State.profiles);
+    sel.innerHTML = names.length
+      ? names.map(n => `<option value="${VCS.esc(n)}">${VCS.esc(n)}</option>`).join('')
+      : '<option value="">(未配置集群)</option>';
+  }
+  async function fmList() {
+    const name = $('#fm-cluster') ? $('#fm-cluster').value : '';
+    if (!name || !State.profiles[name]) { VCS.log('文件管理:请先选集群', 'failc'); return; }
+    const path = ($('#fm-path') && $('#fm-path').value.trim()) || '.';
+    VCS.log('列远端目录:' + name + ':' + path + ' …');
+    const res = await remote(name, (pw, trust) => VCS.call('remote_ls', name, pw, path, trust));
+    if (!res) return;
+    if (res.error) { VCS.log('列目录失败:' + res.error, 'failc'); return; }
+    FM.entries = res.entries || [];
+    FM.checked = new Set();
+    renderFmTable(res.path || path);
+    VCS.log('已列出 ' + FM.entries.length + ' 项', 'okc');
+  }
+  function renderFmTable(path) {
+    const box = $('#fm-table');
+    if (!box) return;
+    if (!FM.entries.length) { box.innerHTML = '<span class="sub">目录为空:' + VCS.esc(path) + '</span>'; return; }
+    let h = '<table class="fm-tbl"><thead><tr><th></th><th>名称</th><th class="num">大小</th>' +
+      '<th>修改时间</th></tr></thead><tbody>';
+    FM.entries.forEach((e, i) => {
+      const dt = e.mtime ? new Date(e.mtime * 1000).toLocaleString() : '';
+      const icon = e.is_dir ? '📁 ' : '';
+      h += `<tr data-fi="${i}"><td>${e.is_dir ? '' : `<input type="checkbox" class="fm-chk" data-i="${i}">`}</td>` +
+        `<td>${icon}${VCS.esc(e.name)}</td><td class="num">${e.is_dir ? '—' : fmSize(e.size)}</td>` +
+        `<td class="mono">${VCS.esc(dt)}</td></tr>`;
+    });
+    box.innerHTML = h + '</tbody></table>';
+  }
+  function fmSize(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+  async function fmFetch() {
+    const name = $('#fm-cluster') ? $('#fm-cluster').value : '';
+    if (!name) { VCS.log('文件管理:请先选集群', 'failc'); return; }
+    const localDir = ($('#fm-localdir') && $('#fm-localdir').value.trim()) || '';
+    if (!localDir) { VCS.log('文件管理:请选择本地保存目录', 'failc'); return; }
+    const picks = Array.from(FM.checked);
+    if (!picks.length) { VCS.log('文件管理:请勾选要下载的文件', 'failc'); return; }
+    const base0 = ($('#fm-path') && $('#fm-path').value.trim()) || '.';
+    for (const i of picks) {
+      const e = FM.entries[i];
+      if (!e) continue;
+      const rpath = base0.replace(/\/+$/, '') + '/' + e.name;
+      const res = await remote(name, (pw, trust) =>
+        VCS.call('remote_fetch_file', name, pw, rpath, localDir, trust));
+      if (!res) return;
+      if (res.error) VCS.log('下载失败 ' + e.name + ':' + res.error, 'failc');
+      else VCS.log('已下载:' + res.local_path, 'okc');
+    }
+    VCS.toast('下载完成');
+    VCS.call('open_dir', localDir);
+  }
+
   // ── 初始化 ─────────────────────────────────────────────────────────────────
+  // ── v3.3.0 实时能量曲线:本地 OSZICAR 优先,远端 SSH 轮询(对齐 starpivot 任务监控) ──
+  const Live = { dir: null, name: '', cluster: '', pw: null, timer: null, chart: null, busy: false };
+  function liveStop(hide) {
+    if (Live.timer) { clearInterval(Live.timer); Live.timer = null; }
+    if (hide) { const p = $('#jobs-live'); if (p) p.hidden = true; Live.dir = null; }
+  }
+  function liveSchedule() {
+    if (Live.timer) { clearInterval(Live.timer); Live.timer = null; }
+    const sec = parseInt(($('#jl-interval') && $('#jl-interval').value) || '30', 10);
+    if (sec > 0 && Live.dir) Live.timer = setInterval(() => livePoll(), sec * 1000);
+  }
+  async function liveOpen(dir, jobName, cluster) {
+    liveStop(false);
+    Live.dir = dir; Live.name = jobName || base(dir); Live.cluster = cluster || ''; Live.pw = null;
+    const p = $('#jobs-live'); if (p) p.hidden = false;
+    const t = $('#jl-title');
+    if (t) t.textContent = Live.name + (cluster ? '(' + cluster + ')' : '');
+    const note = $('#jl-note'); if (note) note.textContent = '读取中…';
+    let res;
+    if (cluster && State.profiles[cluster]) {
+      // 首次经 remote 壳走密码/信任流;捕获实际使用的密码供后续静默轮询
+      res = await remote(cluster, (pw, trust) => {
+        Live.pw = pw;
+        return VCS.call('job_live_energy', dir, cluster, pw, trust);
+      });
+      if (res === null) { liveStop(true); return; }
+    } else {
+      res = await VCS.call('job_live_energy', dir, null, null, false);
+    }
+    liveRender(res);
+    liveSchedule();
+  }
+  async function livePoll() {
+    if (!Live.dir || Live.busy) return;                  // 上一轮未返回则跳过本轮
+    Live.busy = true;
+    try {
+      const res = await VCS.call('job_live_energy', Live.dir, Live.cluster || null, Live.pw, false);
+      liveRender(res);
+    } finally { Live.busy = false; }
+  }
+  function liveRender(res) {
+    const note = $('#jl-note');
+    if (!res || res.ok === false || res.error) {
+      if (note) note.textContent = '⚠ ' + ((res && res.error) || '读取失败');
+      return;
+    }
+    const steps = res.steps || [];
+    if (!steps.length) {
+      if (note) note.textContent = '尚无离子步(SCF 进行中或刚启动),轮询将自动更新';
+      return;
+    }
+    const last = steps[steps.length - 1];
+    if (note) {
+      note.textContent = (res.source === 'remote' ? '远端 OSZICAR' : '本地 OSZICAR') +
+        ' · ' + steps.length + ' 离子步 · 末步 E0=' + last.e0 + ' eV' +
+        (last.de != null ? ' · |ΔE|=' + last.de + ' eV' : '') +
+        (res.state ? ' · 状态 ' + res.state : '') +
+        (Live.timer ? '' : '(手动刷新模式)');
+    }
+    const box = document.getElementById('jl-chart');
+    if (!box) return;
+    if (typeof echarts === 'undefined') { box.textContent = '(echarts 未加载,无法画曲线)'; return; }
+    if (!Live.chart) Live.chart = echarts.init(box);
+    Live.chart.setOption({
+      grid: { left: 74, right: 20, top: 24, bottom: 40 },
+      xAxis: { type: 'category', name: '离子步', data: steps.map(s => s.n) },
+      yAxis: { type: 'value', name: 'E0 (eV)', scale: true },
+      tooltip: { trigger: 'axis' },
+      series: [{ type: 'line', symbolSize: 5, data: steps.map(s => s.e0) }],
+    }, true);
+  }
+
   function wire(id, fn) { const el = $('#' + id); if (el) el.addEventListener('click', fn); }
 
   function init() {
     wire('jb-submit', doSubmit);
     wire('jb-status', () => runStatus(false));
+    wire('jb-status-all', () => runAllStatus(false));
     wire('jb-fetch', doFetch);
     wire('jb-continue', doContinue);
+    wire('jb-spin', doSpinCompare);
     wire('jb-queue', doQueue);
     wire('jb-open', doOpen);
+    wire('jb-report', doReport);
     wire('jb-remove', doRemove);
     wire('jb-clean', doClean);
+    wire('jb-checkall', checkAll);
+    wire('jb-cancelchecked', batchCancel);
+    // 实时能量曲线面板(v3.3.0)
+    wire('jl-refresh', () => livePoll());
+    wire('jl-close', () => liveStop(true));
+    { const el = $('#jl-interval'); if (el) el.addEventListener('change', liveSchedule); }
+    // 筛选行:变更即重渲
+    ['jf-cluster', 'jf-status', 'jf-sort'].forEach(id => {
+      const el = $('#' + id);
+      if (el) el.addEventListener('change', renderTable);
+    });
+    // 快速批量提交
+    wire('qs-add', qsAdd);
+    wire('qs-add-dir', qsAddVaspDir);
+    wire('qs-clearfiles', () => {
+      QS.files = []; QS.scan = null; QS.scanSeq += 1; QS.scanning = false;
+      renderQsFiles(); renderQsPreview(null);
+      const next = $('#qs-next'); if (next) next.hidden = true;
+    });
+    wire('qs-incar-btn', async () => {
+      const r = await VCS.call('pick_file', 'incar');
+      if (r && r.error) { VCS.log('选择 INCAR 失败:' + r.error, 'failc'); return; }
+      if (r && r.path && $('#qs-incar')) {
+        $('#qs-incar').value = r.path;
+        VCS.log('已选择共享 INCAR，重新检查可自动补齐的结构…');
+        await qsScan();
+      }
+    });
+    wire('qs-lib-btn', async () => {
+      const r = await VCS.call('pick_dir');
+      if (r && r.error) { VCS.log('选择赝势库失败:' + r.error, 'failc'); return; }
+      if (r && r.path && $('#qs-lib')) $('#qs-lib').value = r.path;
+    });
+    wire('qs-out-btn', async () => {
+      const r = await VCS.call('pick_dir');
+      if (r && r.path && $('#qs-out')) $('#qs-out').value = r.path;
+    });
+    wire('qs-build', qsBuild);
+    wire('qs-go-submit', doSubmit);
+    const qsi = $('#qs-incar');
+    if (qsi) qsi.addEventListener('change', qsScan);
+    const qsl = $('#qs-filelist');
+    if (qsl) qsl.addEventListener('click', e => {
+      const rm = e.target.closest('[data-rm]');
+      if (rm) {
+        QS.files.splice(parseInt(rm.dataset.rm, 10), 1);
+        renderQsFiles(); qsScan();
+      }
+    });
+    renderQsFiles();
+    qsUpdateBuildButton();
+    // 文件管理
+    wire('fm-ls', fmList);
+    wire('fm-fetch', fmFetch);
+    wire('fm-localbtn', async () => {
+      const r = await VCS.call('pick_dir');
+      if (r && r.path && $('#fm-localdir')) $('#fm-localdir').value = r.path;
+    });
+    const fmt = $('#fm-table');
+    if (fmt) fmt.addEventListener('change', e => {
+      const cb = e.target.closest('.fm-chk');
+      if (!cb) return;
+      const i = parseInt(cb.dataset.i, 10);
+      if (cb.checked) FM.checked.add(i); else FM.checked.delete(i);
+    });
     const cb = $('#jb-auto');
     const iv = $('#jb-interval');
-    if (cb) cb.addEventListener('change', applyAuto);
-    if (iv) iv.addEventListener('change', () => { if (cb && cb.checked) applyAuto(); });
+    // 自动刷新默认开 + 状态持久化(localStorage);启动即按持久化状态装载定时器
+    if (iv) {
+      const savedInt = localStorage.getItem(INT_KEY);
+      if (savedInt) iv.value = savedInt;
+      iv.addEventListener('change', () => {
+        localStorage.setItem(INT_KEY, iv.value);
+        if (cb && cb.checked) applyAuto();
+      });
+    }
+    if (cb) {
+      const savedAuto = localStorage.getItem(AUTO_KEY);
+      cb.checked = savedAuto === null ? true : savedAuto === '1';   // 默认开
+      cb.addEventListener('change', () => {
+        localStorage.setItem(AUTO_KEY, cb.checked ? '1' : '0');
+        applyAuto();
+      });
+      applyAuto(true);                               // 启动静默装载定时器(不写日志)
+    }
     const psel = $('#jobs-profile');
-    if (psel) psel.addEventListener('change', () =>
-      localStorage.setItem(PROFILE_KEY, currentProfile()));
+    if (psel) psel.addEventListener('change', () => {
+      const name = currentProfile();
+      localStorage.setItem(PROFILE_KEY, name);
+      let removed = 0;
+      State.selected.forEach(d => {
+        const row = State.rows.find(r => r.dir === d);
+        if (row && row.cluster && row.cluster !== name) {
+          State.selected.delete(d); removed++;
+        }
+      });
+      if (removed) VCS.log(`切换服务器后已取消 ${removed} 个其它服务器作业的勾选`, 'warnc');
+      renderTable();
+    });
     bindTable();
     reload();
   }
 
-  // 切回任务页时刷新台账
+  // 切回作业页时刷新台账
   document.addEventListener('vcs:page', e => { if (e.detail && e.detail.page === 'jobs') reload(); });
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 
-  // 供集群页(Task 6)保存后调用,刷新下拉/台账
-  window.Jobs = { reload };
+  // 结果导入可能带来只有完整四件套、尚未运行的 CREATED 成员。
+  // 进入任务页时按 project_path 精确展开并勾选，用户仍需亲自确认服务器与远程目录。
+  async function selectCreatedProject(projectPath) {
+    await reload();
+    const wanted = String(projectPath || '');
+    const rows = State.rows.filter(row => row.state === 'CREATED' && !row.cluster &&
+      (!wanted || String(row.project_path || '') === wanted));
+    rows.forEach(row => State.selected.add(row.dir));
+    if (wanted) State.expanded.add('path:' + wanted);
+    ['jf-cluster', 'jf-status'].forEach(id => {
+      const filter = $('#' + id);
+      if (filter && filter.value) filter.value = '';
+    });
+    renderTable();
+    if (rows.length) VCS.toast(`已勾选 ${rows.length} 个待提交作业；请选择服务器后提交`);
+    return rows.length;
+  }
+
+  // 供集群页保存与项目导入流程调用。
+  window.Jobs = { reload, selectCreatedProject };
 })();

@@ -6,8 +6,25 @@ tag 只读首 token,故此类文件在 VASP 畅通;解析器必须兼容(验收�
 """
 import pytest
 
-from vcstudio.generate.incar_builder import parse_incar
+from vcstudio.generate.incar_builder import (
+    parse_incar, build_magmom, has_magnetic, MAGNETIC_ELEMENTS, DEFAULT_MAGMOM,
+)
 from vcstudio.generate.job_builder import build_job_dir
+
+
+def test_build_magmom_per_element_moments():
+    # 每元素按比矩初猜,非磁性 0;顺序对齐 elements(= POTCAR/POSCAR 顺序)
+    assert build_magmom(['Fe', 'O'], [2, 3]) == '2*4 3*0'      # Fe 比矩 4,O 非磁 0
+    assert build_magmom(['Co', 'Ni', 'C'], [1, 1, 4]) == '1*3 1*2 4*0'
+    assert build_magmom(['Gd'], [1]) == '1*7'                  # 4f 高矩
+    # overrides 优先于比矩表
+    assert build_magmom(['Fe'], [1], {'Fe': 1.5}) == '1*1.5'
+    # counts 缺失/不等长 → None(降级)
+    assert build_magmom(['Fe', 'O'], []) is None
+    assert build_magmom(['Fe', 'O'], [1]) is None
+    # has_magnetic 仍按元素键判定;DEFAULT_MAGMOM 兜底常量保留
+    assert has_magnetic(['Fe', 'O']) and not has_magnetic(['C', 'O'])
+    assert 'Fe' in MAGNETIC_ELEMENTS and DEFAULT_MAGMOM == 5
 
 
 def test_scalar_with_trailing_prose_takes_first_token():

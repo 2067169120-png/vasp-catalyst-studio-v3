@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VASP Catalyst Studio — 软件流程图</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<style>
+  :root{
+    --bg:#0f1216; --card:#171b21; --ink:#e8ecf1; --muted:#9aa7b4;
+    --rule:#252b33; --accent:#5aa9ff; --ok:#39c07a; --warn:#e0a93a; --fail:#e5675f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    line-height:1.6;padding:32px 20px 64px}
+  .wrap{max-width:1180px;margin:0 auto}
+  h1{font-size:24px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 28px}
+  h2{font-size:17px;margin:36px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+  .card{background:var(--card);border:1px solid var(--rule);border-radius:12px;
+    padding:18px;margin-bottom:18px;overflow-x:auto}
+  .legend{display:flex;flex-wrap:wrap;gap:16px;font-size:13px;color:var(--muted);margin:10px 2px 0}
+  .legend b{color:var(--ink);font-weight:600}
+  .note{font-size:13px;color:var(--muted);margin:8px 2px 0}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;
+    border:1px solid var(--rule);color:var(--muted);margin-right:6px}
+  .mermaid{background:transparent}
+  code{background:#0b0e12;border:1px solid var(--rule);border-radius:5px;padding:1px 5px;font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>VASP Catalyst Studio · 软件流程图</h1>
+  <p class="sub">桌面端点击式 VASP 催化计算自动化 · 确定性核心(零 token)· LLM 仅在可选分析层 · 生成 2026-07-16</p>
+
+  <h2>一、端到端主流程</h2>
+  <div class="card">
+    <pre class="mermaid">
+flowchart TD
+  U(["用户 · 点击操作<br/>无需记 Linux/调度器命令"]):::user
+
+  subgraph G["① 生成 Generate"]
+    direction TB
+    G1["POSCAR + 用户 INCAR<br/>(计算类型: slab/bulk/molecule)"] --> G2["校验并补全四件套<br/>INCAR · KPOINTS(倒格矢) · POTCAR · POSCAR<br/>缺项才补, 绝不改用户键"]
+    G2 --> G3["写 job.yaml 清单<br/>sha256 溯源 · 赝势身份"]
+  end
+
+  subgraph S["② 提交 Submit"]
+    direction TB
+    S1["PBS / Slurm 方言 + preflight 闸"] --> S2["生成作业脚本<br/>(自动 / 用户模板透传)"]
+    S2 --> S3["SSH 上传 + qsub/sbatch<br/>→ 记录作业号"]
+  end
+
+  subgraph M["③ 监控 + 诊断 Monitor"]
+    direction TB
+    M1{"查 qstat/squeue<br/>作业号在队列里?"}
+    M1 -->|"排队 Q/H/PD…"| MQ["QUEUED 排队"]:::q
+    M1 -->|"运行 R/CG"| MR["RUNNING 运行<br/>+ SCF 活体健康检查"]:::run
+    M1 -->|"不在 = GONE"| GATE{"续算沉降护栏<br/>本轮真的产出了吗?"}
+    GATE -->|"续算后新作业还没启动<br/>OUTCAR 未刷新"| MQ2["保持 SUBMITTED<br/>(疑仍在排队, 不误判)"]:::q
+    GATE -->|"确有本轮产出 / 已现身"| MG["取证: OUTCAR/OSZICAR/日志/退出码"]
+    MG --> MD["diagnose.classify<br/>12+ 失败类 → 4 终态"]
+  end
+
+  MD --> DONE{"结果?"}
+  DONE -->|"收敛 + 能量合理"| OK["DONE 完成"]:::ok
+  DONE -->|"可续算<br/>(未收敛/墙钟/ZBRENT)"| REC
+  DONE -->|"硬崩/缺输出/能量异常"| HUM["NEEDS_HUMAN 交人工"]:::fail
+
+  subgraph REC["④ 有界恢复 Recovery"]
+    direction TB
+    R2["CONTCAR 续算 / 白名单改参续算<br/>≤ 3 轮 · INCAR 冻结 · 清混合历史"]
+  end
+  R2 -.重投同一脚本.-> S3
+
+  subgraph A["⑤ 分析 + 报告 Analyze"]
+    direction TB
+    A1["ΔE 门控: 一组作业全 DONE 才出数"] --> A2["吸附能 ΔE / Li-S 放电自由能 ΔG · U_L"]
+    A2 --> A3["图表 (Origin/SVG) + POV-Ray 结构图<br/>+ 可选 LLM 双语分析报告"]
+  end
+
+  U --> G --> S --> M
+  MQ --> M1
+  MR --> M1
+  MQ2 --> M1
+  OK --> A
+
+  classDef user fill:#1c2530,stroke:#5aa9ff,color:#e8ecf1;
+  classDef q fill:#2a2410,stroke:#e0a93a,color:#f0e2c0;
+  classDef run fill:#10241a,stroke:#39c07a,color:#cfeede;
+  classDef ok fill:#0f2a1c,stroke:#39c07a,color:#cfeede;
+  classDef fail fill:#2a1414,stroke:#e5675f,color:#f2cfcc;
+  style G fill:#141a20,stroke:#2b3540,color:#cfe0ee
+  style S fill:#141a20,stroke:#2b3540,color:#cfe0ee
+  style M fill:#141a20,stroke:#2b3540,color:#cfe0ee
+  style REC fill:#1a1712,stroke:#403828,color:#e6dcc6
+  style A fill:#131f18,stroke:#274535,color:#cfe6d8
+    </pre>
+    <div class="legend">
+      <span><b class="pill" style="border-color:#5aa9ff">用户</b>点击式入口</span>
+      <span><b class="pill" style="border-color:#e0a93a">QUEUED</b>排队</span>
+      <span><b class="pill" style="border-color:#39c07a">RUNNING/DONE</b>运行/完成</span>
+      <span><b class="pill" style="border-color:#e5675f">NEEDS_HUMAN</b>交人工</span>
+    </div>
+    <p class="note">★ 高亮的「续算沉降护栏」是本次修复:续算后新作业还没进调度器队列时,不再拿上一轮旧 OUTCAR 误判为"已完成/需续算/SCF 震荡",而是保持 SUBMITTED 视作仍在排队。</p>
+  </div>
+
+  <h2>二、作业状态机(job.yaml)</h2>
+  <div class="card">
+    <pre class="mermaid">
+stateDiagram-v2
+  [*] --> CREATED: 生成四件套
+  CREATED --> UPLOADED: SSH 上传
+  UPLOADED --> SUBMITTED: qsub/sbatch
+  SUBMITTED --> QUEUED: 调度器现身(排队)
+  SUBMITTED --> RUNNING: 调度器现身(运行)
+  SUBMITTED --> SUBMITTED: 续算沉降(疑在排队)
+  QUEUED --> RUNNING
+  RUNNING --> DONE: 收敛+能量合理
+  RUNNING --> UNCONVERGED: 未收敛(可续算)
+  RUNNING --> FAILED: 硬崩/缺输出
+  RUNNING --> NEEDS_HUMAN: 规则未命中
+  UNCONVERGED --> SUBMITTED: 有界恢复重投(≤3轮)
+  DONE --> [*]
+  FAILED --> [*]
+  NEEDS_HUMAN --> [*]
+    </pre>
+    <p class="note">三不变式:① 方法学主权(用户 INCAR/模板逐字透传)② 确定性核心零 token ③ 显式状态、永不静默(每次变更追加可审计历史)。</p>
+  </div>
+
+  <h2>三、数据/工件流</h2>
+  <div class="card">
+    <pre class="mermaid">
+flowchart LR
+  P["POSCAR<br/>用户 INCAR"] --> B["build_job_dir"]
+  B --> Q4["四件套<br/>INCAR/KPOINTS/POTCAR/POSCAR"]
+  B --> JY["job.yaml<br/>(状态·溯源·诊断)"]
+  Q4 --> RUN["集群运行 VASP"]
+  RUN --> OUT["OUTCAR / OSZICAR<br/>CONTCAR / vasprun.xml"]
+  OUT --> PARSE["解析: 能量·力·收敛·DOS"]
+  PARSE --> JY
+  JY --> RPT["ΔE/ΔG · 图表 · 报告"]
+  classDef f fill:#141a20,stroke:#2b3540,color:#cfe0ee;
+  class P,B,Q4,JY,RUN,OUT,PARSE,RPT f
+    </pre>
+  </div>
+
+  <p class="note" style="margin-top:24px">说明:本图基于当前代码库(vcstudio 2.0.0)绘制。⑤ 分析层的图表引擎、结果按组归并、一键报告与 LLM 设置项正在规划升级(见随附路线图)。</p>
+</div>
+<script>
+  mermaid.initialize({ startOnLoad:true, theme:'dark',
+    themeVariables:{ fontFamily:'"Noto Sans SC","PingFang SC",sans-serif', fontSize:'14px' },
+    flowchart:{ curve:'basis', nodeSpacing:45, rankSpacing:55 } });
+</script>
+</body>
+</html>

@@ -78,6 +78,7 @@ def test_profile_from_form_maps_resources():
         'jump_port': '22', 'remote_root': '/w', 'scheduler': 'PBS',
         'scheduler_bin': ' /opt/t/bin ', 'queue': ' batch ', 'nodes': '2',
         'ppn': '12', 'walltime': '', 'vasp_cmd': ' mpirun vasp ',
+        'engine_commands': {' CP2K ': ' cp2k.psmp -i {input} '},
         'script_mode': 'auto', 'template_path': '',
         'env_lines': 'source a\n\n  module load b  \n',
     }
@@ -87,3 +88,4 @@ def test_profile_from_form_maps_resources():
     assert prof.walltime == '24:00:00'                 # 空 → 默认
     assert prof.env_lines == ['source a', 'module load b']
     assert prof.vasp_cmd == 'mpirun vasp'
+    assert prof.engine_commands == {'cp2k': 'cp2k.psmp -i {input}'}

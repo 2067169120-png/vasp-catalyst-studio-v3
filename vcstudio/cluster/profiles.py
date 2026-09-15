@@ -29,7 +29,7 @@ class ClusterProfile:
     jump_user: str = ''
     jump_port: int = 22
     remote_root: str = ''
-    scheduler: str = 'Slurm'     # Slurm | PBS | LSF | Shell
+    scheduler: str = 'Slurm'     # 完整支持 Slurm | PBS；探测层可识别 LSF/Shell 但不可提交
     scheduler_bin: str = ''      # 调度器命令目录(如 1w 的 /opt/torque-6.1.2/bin;空=走 PATH)
     # ── S2 资源参数(自动脚本轨) ──
     queue: str = ''              # 队列/分区
@@ -37,7 +37,11 @@ class ClusterProfile:
     ppn: int = 0                 # 每节点核数(0=未设置)
     walltime: str = '24:00:00'
     env_lines: list = field(default_factory=list)   # module load / source …(逐行)
-    vasp_cmd: str = ''           # 完整执行行(mpirun -np … vasp_std > log 2>&1)
+    # 旧版 VASP 字段保留为兼容入口。其它引擎不得回退使用它，
+    # 否则 CP2K/Gaussian/CASTEP 作业会在集群上误跑 vasp_std。
+    vasp_cmd: str = ''           # 完整 VASP 执行行(mpirun/srun …)
+    engine_commands: dict = field(default_factory=dict)
+    # 按引擎分开的运行命令，如 {'cp2k': 'cp2k.psmp -i {input} -o {stem}.out'}
     # ── S2 提交脚本双轨 ──
     script_mode: str = 'auto'    # 'auto'(参数生成) | 'template'(用户模板透传)
     template_path: str = ''      # 用户模板本地路径(仅路径;内容逐字复用,只填占位符)

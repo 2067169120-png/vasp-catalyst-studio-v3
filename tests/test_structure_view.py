@@ -4,6 +4,7 @@ import math
 import pytest
 
 from vcstudio.generate import structure_view as sv
+from vcstudio.generate.poscar import read_cell_vectors, read_scale_factors
 
 
 def _poscar(coords_block: str, *, elems='C S', counts='4 2', mode='Direct',
@@ -43,6 +44,44 @@ def test_parse_positions_cartesian_with_scale():
     assert p['coords'][1] == pytest.approx([0.5, 0.5, 13.0])
     # 晶格也 ×2(read_cell_vectors 既有语义)
     assert p['cell'][0][0] == pytest.approx(20.0)
+
+
+def test_parse_positions_negative_scale_uses_target_volume():
+    # 原始体积 10*10*30=3000 Å³；目标体积 24000 Å³ → 统一尺度 2。
+    text = _poscar('0.25 0.5 1.0\n', elems='C', counts='1',
+                   mode='Cartesian', scale='-24000')
+    p = sv.parse_positions(text)
+    assert read_scale_factors(text) == pytest.approx((2.0, 2.0, 2.0))
+    expected_cell = [[20.0, 0.0, 0.0], [0.0, 20.0, 0.0], [0.0, 0.0, 60.0]]
+    for actual, expected in zip(p['cell'], expected_cell):
+        assert actual == pytest.approx(expected)
+    assert p['coords'][0] == pytest.approx([0.5, 1.0, 2.0])
+
+
+def test_parse_positions_three_component_scales():
+    text = _poscar('0.25 0.5 1.0\n', elems='C', counts='1',
+                   mode='Cartesian', scale='2 3 4')
+    p = sv.parse_positions(text)
+    assert read_scale_factors(text) == pytest.approx((2.0, 3.0, 4.0))
+    expected_cell = [[20.0, 0.0, 0.0], [0.0, 30.0, 0.0], [0.0, 0.0, 120.0]]
+    for actual, expected in zip(p['cell'], expected_cell):
+        assert actual == pytest.approx(expected)
+    assert p['coords'][0] == pytest.approx([0.5, 1.5, 4.0])
+
+
+@pytest.mark.parametrize('scale', ['1 2', '1 -2 3', '0', 'nan'])
+def test_poscar_invalid_scaling_fails_closed(scale):
+    text = _poscar('0.1 0.1 0.1\n', elems='C', counts='1', scale=scale)
+    with pytest.raises(ValueError, match='缩放因子'):
+        read_cell_vectors(text)
+
+
+def test_negative_scale_rejects_degenerate_raw_cell():
+    text = _poscar(
+        '0.1 0.1 0.1\n', elems='C', counts='1', scale='-10',
+        cell='1 0 0\n2 0 0\n0 0 1')
+    with pytest.raises(ValueError, match='晶格退化'):
+        read_cell_vectors(text)
 
 
 def test_parse_positions_insufficient_coord_lines():

@@ -29,25 +29,78 @@ def test_parse_no_frequencies_returns_empty():
 
 
 def test_harmonic_thermo_zpe_is_half_sum():
+    # 理由:harmonic_thermo 新增低频地板后多返回一个 meta(第4项);测试频率均 >50cm⁻¹
+    # (333/1618/3279 cm⁻¹)不触发地板,数值基线不变,仅解包多一项。
     real = [406.564208, 200.6, 41.36]
-    zpe, ts = thermo.harmonic_thermo(real, 298.15)
+    zpe, u_th, ts, meta = thermo.harmonic_thermo(real, 298.15)
     assert zpe == pytest.approx(sum(real) / 2000.0, rel=1e-9)   # Σ hν/2 (meV→eV)
-    assert ts > 0
-    # 高频模在室温几乎不贡献熵;41 meV(x≈1.6)是主要贡献者
-    _, ts_high_only = thermo.harmonic_thermo([406.564208], 298.15)
-    assert ts_high_only < 1e-6
+    assert ts > 0 and u_th > 0
+    assert meta['n_floored'] == 0 and meta['floored_cm1'] == []  # 无低频 → 不抬频
+    # 高频模在室温几乎不贡献熵/热占据;41 meV(x≈1.6)是主要贡献者
+    _, u_high_only, ts_high_only, _m = thermo.harmonic_thermo([406.564208], 298.15)
+    assert ts_high_only < 1e-6 and u_high_only < 1e-6
 
 
 def test_harmonic_thermo_entropy_formula_single_mode():
-    """单模数值口径核对:x = hv/kT;S/kB = x/(e^x−1) − ln(1−e^−x)。"""
-    mev = 25.0
+    """单模数值口径核对:x = hv/kT;U = hv/(e^x−1);S/kB = x/(e^x−1) − ln(1−e^−x)。"""
+    mev = 25.0                                           # ≈201.6 cm⁻¹,不触发 50cm⁻¹ 地板
     T = 300.0
-    zpe, ts = thermo.harmonic_thermo([mev], T)
+    zpe, u_th, ts, _meta = thermo.harmonic_thermo([mev], T)
     hv = mev / 1000.0
     x = hv / (thermo.KB_EV * T)
     s_kb = x / math.expm1(x) - math.log1p(-math.exp(-x))
     assert ts == pytest.approx(thermo.KB_EV * T * s_kb, rel=1e-9)
+    assert u_th == pytest.approx(hv / math.expm1(x), rel=1e-9)   # U_vib 热占据项
     assert zpe == pytest.approx(hv / 2)
+
+
+def test_harmonic_thermo_low_freq_floor():
+    """低频实模:熵/热能项按地板(50cm⁻¹)计,ZPE 用原频;meta 记被抬频。"""
+    low_cm1 = 20.0
+    low_mev = low_cm1 * thermo.CM1_TO_EV * 1000.0        # 20 cm⁻¹ 对应 meV
+    zpe0, u0, ts0, m0 = thermo.harmonic_thermo([low_mev], 298.15, freq_floor_cm1=0.0)
+    zpe1, u1, ts1, m1 = thermo.harmonic_thermo([low_mev], 298.15, freq_floor_cm1=50.0)
+    assert m0['n_floored'] == 0                          # 关地板 → 不抬
+    assert m1['n_floored'] == 1 and m1['floored_cm1'] == [pytest.approx(20.0, abs=0.05)]
+    assert zpe1 == pytest.approx(zpe0)                   # ZPE 用原频,地板不改
+    assert zpe1 == pytest.approx(low_mev / 2000.0)
+    assert ts1 < ts0 and u1 < u0                         # 抬频 → 熵/热占据更小
+    # 抬到 50cm⁻¹ 等价于直接用 50cm⁻¹ 算熵/热能
+    floor_mev = 50.0 * thermo.CM1_TO_EV * 1000.0
+    _z, u_ref, ts_ref, _m = thermo.harmonic_thermo([floor_mev], 298.15, freq_floor_cm1=0.0)
+    assert ts1 == pytest.approx(ts_ref) and u1 == pytest.approx(u_ref)
+
+
+def test_low_freq_floor_boundary_and_load_corrections(tmp_path):
+    """高于地板者不动;analyze_outcar/load_corrections 透传 n_floored/被抬频。"""
+    hi_mev = 100.0 * thermo.CM1_TO_EV * 1000.0           # 100 cm⁻¹ > 50 → 不抬
+    _z, _u, _t, meta = thermo.harmonic_thermo([hi_mev], 298.15, freq_floor_cm1=50.0)
+    assert meta['n_floored'] == 0
+    d = tmp_path / 'freq_low'
+    d.mkdir()
+    (d / 'OUTCAR').write_text(
+        ' Eigenvectors and eigenvalues of the dynamical matrix\n'
+        '   1 f  =   10.0 THz   62.8 2PI*THz  333.560000 cm-1   41.360000 meV\n'
+        '   2 f  =    0.5 THz    3.4 2PI*THz   18.079172 cm-1    2.241701 meV\n',
+        encoding='utf-8')
+    corr = thermo.load_corrections({'X': str(d)}, freq_floor_cm1=50.0)
+    assert corr['X']['n_floored'] == 1                   # 18 cm⁻¹ 被抬,333 cm⁻¹ 不抬
+    assert corr['X']['floored_cm1'] == [18.1]
+
+
+def test_g_corr_two_modes_same_frequencies():
+    """同一组频率:'zpe_ts' 与 'ase' 给不同 g_corr;默认 = ZPE−TS(论文口径)。"""
+    real = [406.564208, 200.6, 41.36]
+    zpe, u_th, ts, _meta = thermo.harmonic_thermo(real, 298.15)
+    r = thermo.VibResult(real_mev=real, zpe_ev=zpe, u_thermal_ev=u_th, ts_ev=ts)
+    assert r.g_corr('zpe_ts') == pytest.approx(zpe - ts)
+    assert r.g_corr('ase') == pytest.approx(zpe + u_th - ts)
+    assert r.g_corr('ase') - r.g_corr('zpe_ts') == pytest.approx(u_th)
+    assert u_th > 0                                   # 室温下两口径确实不同
+    assert r.g_corr() == r.g_corr('zpe_ts')           # 不带参默认论文口径
+    assert r.g_corr_ev == pytest.approx(zpe - ts)     # property = 默认口径,复现基准
+    with pytest.raises(ValueError, match='zpe_ts'):
+        r.g_corr('nonsense')
 
 
 def test_analyze_outcar_and_load_corrections(tmp_path):
@@ -63,6 +116,13 @@ def test_analyze_outcar_and_load_corrections(tmp_path):
     assert 'Li2S' in corr and 'missing' not in corr
     assert corr['Li2S']['n_imag'] == 1
     assert corr['Li2S']['imag_cm1'] == [18.1]
+    assert corr['Li2S']['g_corr'] == pytest.approx(
+        corr['Li2S']['zpe'] - corr['Li2S']['ts'], abs=2e-6)      # 默认 zpe_ts 口径
+    # mode='ase':同一批 OUTCAR,g_corr 多出 u_thermal 项
+    corr_ase = thermo.load_corrections({'Li2S': str(d)}, mode='ase')
+    assert corr_ase['Li2S']['g_corr'] == pytest.approx(
+        corr['Li2S']['g_corr'] + corr['Li2S']['u_thermal'], abs=2e-6)
+    assert corr_ase['Li2S']['u_thermal'] > 0
 
 
 def test_analyze_outcar_none_for_relax(tmp_path):
@@ -90,3 +150,94 @@ def test_discharge_path_g_corr_shifts_steps():
     shifted2 = discharge_path(_SYS_E, _MOL_E, g_corr=corr2)
     assert shifted2['steps'][-1]['G'] == pytest.approx(base['steps'][-1]['G'] + 0.2)
     assert shifted2['steps'][0]['G'] == pytest.approx(0.0)
+
+
+# ── 虚频质量闸 classify_imaginary(F15)四象限 ────────────────────────────────────
+def test_classify_minimum_clean_no_imag():
+    r = thermo.classify_imaginary([], context='minimum')
+    assert r['verdict'] == 'clean' and r['n_imag'] == 0
+    assert r['usable_for_thermo'] is True and r['max_imag_cm1'] == 0.0
+
+
+def test_classify_minimum_noise_small_imag_usable():
+    r = thermo.classify_imaginary([18.0, 30.0], context='minimum')   # 全 <50 → 噪声
+    assert r['verdict'] == 'noise' and r['n_imag'] == 2 and r['n_imag_large'] == 0
+    assert r['usable_for_thermo'] is True
+    assert '按实模地板计入熵' in r['advice']
+
+
+def test_classify_minimum_bad_large_imag_not_usable():
+    r = thermo.classify_imaginary([120.0, 20.0], context='minimum')  # 一个大虚频
+    assert r['verdict'] == 'bad_minimum' and r['n_imag_large'] == 1
+    assert r['usable_for_thermo'] is False
+    assert r['max_imag_cm1'] == pytest.approx(120.0)
+    assert '重弛豫' in r['advice']
+
+
+def test_classify_ts_exactly_one_large_is_valid():
+    r = thermo.classify_imaginary([350.0, 15.0], context='ts')       # 恰一个大虚频
+    assert r['verdict'] == 'valid_ts' and r['usable_for_thermo'] is True
+
+
+def test_classify_ts_zero_large_invalid():
+    r = thermo.classify_imaginary([12.0], context='ts')              # 无大虚频
+    assert r['verdict'] == 'invalid_ts' and r['usable_for_thermo'] is False
+
+
+def test_classify_ts_multiple_large_invalid():
+    r = thermo.classify_imaginary([300.0, 250.0], context='ts')      # 二阶鞍点
+    assert r['verdict'] == 'invalid_ts' and r['n_imag_large'] == 2
+    assert '高阶鞍点' in r['advice']
+
+
+def test_classify_custom_noise_threshold():
+    # 阈值降到 10 → 18 cm⁻¹ 变"大虚频",极小点判 bad
+    r = thermo.classify_imaginary([18.0], noise_threshold=10.0, context='minimum')
+    assert r['verdict'] == 'bad_minimum' and r['usable_for_thermo'] is False
+
+
+def test_classify_unknown_context_raises():
+    with pytest.raises(ValueError, match='context'):
+        thermo.classify_imaginary([10.0], context='saddle')
+
+
+def test_load_corrections_attaches_classify_noise(tmp_path):
+    # _OUTCAR_FREQ 含 18 cm⁻¹ 单虚频(<50)→ noise,usable,不排除
+    d = tmp_path / 'freq_Li2S'
+    d.mkdir()
+    (d / 'OUTCAR').write_text(_OUTCAR_FREQ, encoding='utf-8')
+    corr = thermo.load_corrections({'Li2S': str(d)})
+    assert corr['Li2S']['classify']['verdict'] == 'noise'
+    assert corr['Li2S']['usable_for_thermo'] is True
+    assert 'excluded' not in corr['Li2S']
+
+
+def test_load_corrections_marks_bad_minimum_excluded(tmp_path):
+    # 构造含 200 cm⁻¹ 大虚频的 OUTCAR → bad_minimum,标 excluded(不静默入 ΔG)
+    d = tmp_path / 'freq_bad'
+    d.mkdir()
+    (d / 'OUTCAR').write_text(
+        ' Eigenvectors and eigenvalues of the dynamical matrix\n'
+        '   1 f  =   10.0 THz   62.8 2PI*THz  333.560000 cm-1   41.360000 meV\n'
+        '   2 f/i=    5.0 THz   30.0 2PI*THz  200.000000 cm-1   24.800000 meV\n',
+        encoding='utf-8')
+    corr = thermo.load_corrections({'X': str(d)})
+    assert corr['X']['classify']['verdict'] == 'bad_minimum'
+    assert corr['X']['usable_for_thermo'] is False
+    assert corr['X']['excluded'] is True
+    assert corr['X']['exclude_reason']
+
+
+def test_load_corrections_ts_context_per_species(tmp_path):
+    # contexts 指定某物种按过渡态口径:单大虚频 → valid_ts,usable
+    d = tmp_path / 'freq_ts'
+    d.mkdir()
+    (d / 'OUTCAR').write_text(
+        ' Eigenvectors and eigenvalues of the dynamical matrix\n'
+        '   1 f  =   10.0 THz   62.8 2PI*THz  333.560000 cm-1   41.360000 meV\n'
+        '   2 f/i=    5.0 THz   30.0 2PI*THz  200.000000 cm-1   24.800000 meV\n',
+        encoding='utf-8')
+    corr = thermo.load_corrections({'TS': str(d)}, contexts={'TS': 'ts'})
+    assert corr['TS']['classify']['verdict'] == 'valid_ts'
+    assert corr['TS']['usable_for_thermo'] is True
+    assert 'excluded' not in corr['TS']

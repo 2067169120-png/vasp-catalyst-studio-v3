@@ -1,0 +1,23 @@
+# VASP Catalyst Studio 配置模板
+# 用法:复制本文件为 config.yaml(已 gitignore,不会入库),按你的环境填写。
+# 敏感凭据(集群密码 / LLM key)不放这里,走 Windows 凭据管理器(keyring)。
+# 定位优先级:env VCSTUDIO_CONFIG > cwd/config.yaml > 包根旁 config.yaml > %APPDATA%/vcstudio/config.yaml
+
+# 本地 PAW_PBE 赝势库根目录(真实赝势为受版权材料,请指向你自己的库)
+potcar_lib_root: <path-to-potcar-lib>/potpaw_PBE/paw_pbe
+
+# 可选:报告分析层的 LLM 端点(留空或删除 llm 小节则不启用 LLM 分析)
+llm:
+  base_url: http://localhost:8000/v1/chat/completions
+  model: <your-model-name>
+
+# 可选:ssh 相关默认(通常留空,凭据走 keyring)
+ssh: {}
+
+# 可选:Li-S 分子参考库目录
+lis_molecules_dir: <path-to-lis-molecules>
+
+# 可选:理想吸附能窗口(eV)
+ideal_window:
+- -2.9
+- -1.65

@@ -1,4 +1,6 @@
 """batch_ops 后台批量函数测试(不建 Tk 窗口,只测线程体):连接关闭责任与单作业失败隔离。"""
+import types
+
 from vcstudio.cluster import batch_ops
 from vcstudio.shared import manifest as mm
 
@@ -27,6 +29,14 @@ def test_filter_continuable_partitions_selection(tmp_path):
     nodiag = _mk_job(tmp_path, 'done', 'DONE')                           # 无诊断 → 跳过
     eligible, skipped = batch_ops.filter_continuable([ok, running, hardfail, capped, nodiag])
     assert eligible == [ok] and skipped == 4
+
+
+def test_filter_continuable_excludes_neb_from_generic_restart(tmp_path):
+    d = _mk_job(tmp_path, 'neb', 'UNCONVERGED', restartable=True)
+    data = mm.load_manifest(d)
+    data['task_type'] = 'neb'
+    mm.save_manifest(d, data)
+    assert batch_ops.filter_continuable([d]) == ([], 1)
 
 
 class FakeSFTP:
@@ -65,9 +75,44 @@ def test_submit_batch_closes_client_and_jump(monkeypatch):
     assert client.closed and jump.closed          # 跳板连接同样必须关
 
 
+def test_submit_batch_duplicate_selection_fails_whole_batch_before_network(tmp_path, monkeypatch):
+    a = tmp_path / 'calc'
+    a.mkdir()
+    monkeypatch.setattr(
+        batch_ops, 'open_client',
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('冲突批次不得联网')))
+    profile = types.SimpleNamespace(name='c1', remote_root='/remote/jobs')
+
+    out = batch_ops.submit_batch(profile, None, [str(a), str(a)], False)
+
+    assert [row[1] for row in out['results']] == [False, False]
+    assert all('同一远程目录' in row[2] for row in out['results'])
+
+
+def test_submit_batch_same_basename_uses_hashed_remote_dirs(tmp_path, monkeypatch):
+    a = tmp_path / 'left' / 'calc'
+    b = tmp_path / 'right' / 'calc'
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    client, jump = _patch_open(monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        batch_ops.submitter, 'submit_job',
+        lambda _c, _s, _p, d: seen.append(d) or {'scheduler_job_id': str(len(seen))})
+
+    out = batch_ops.submit_batch(
+        types.SimpleNamespace(name='c1', remote_root='/remote/jobs'),
+        None, [str(a), str(b)], False)
+
+    assert [row[1] for row in out['results']] == [True, True]
+    assert seen == [str(a), str(b)]
+    assert client.closed and jump.closed
+
+
 def test_refresh_batch_closes_client_and_jump(monkeypatch):
     client, jump = _patch_open(monkeypatch)
     monkeypatch.setattr(batch_ops.submitter, 'query_scheduler', lambda c, p: ({}, {}))
+    monkeypatch.setattr(batch_ops.submitter, 'assert_profile_binding', lambda *a, **k: {})
     monkeypatch.setattr(batch_ops.submitter, 'refresh_job',
                         lambda c, p, d, live_states, terminal_reasons=None: {'state': 'DONE', 'results': {}})
     payload = batch_ops.refresh_batch(object(), None, ['d1'], False)
@@ -75,12 +120,60 @@ def test_refresh_batch_closes_client_and_jump(monkeypatch):
     assert client.closed and jump.closed
 
 
+def test_refresh_batch_preserves_scheduler_map_for_every_job(monkeypatch):
+    client, jump = _patch_open(monkeypatch)
+    scheduler_states = {'101': 'RUNNING', '102': 'QUEUED'}
+    seen = []
+    monkeypatch.setattr(
+        batch_ops.submitter, 'query_scheduler', lambda _c, _p: (scheduler_states, {}))
+    monkeypatch.setattr(batch_ops.submitter, 'assert_profile_binding', lambda *a, **k: {})
+
+    def _refresh(_client, _profile, job_dir, live_states, terminal_reasons=None):
+        seen.append((job_dir, live_states))
+        return {'state': 'RUNNING',
+                'results': {'live': {'ionic_steps': 1, 'warning': ''}}}
+
+    monkeypatch.setattr(batch_ops.submitter, 'refresh_job', _refresh)
+
+    payload = batch_ops.refresh_batch(object(), None, ['first', 'second'], False)
+
+    assert [row[0] for row in payload['results']] == ['first', 'second']
+    assert seen == [('first', scheduler_states), ('second', scheduler_states)]
+    assert client.closed and jump.closed
+
+
 def test_fetch_batch_closes_client_and_jump(monkeypatch):
     client, jump = _patch_open(monkeypatch)
+    seen = []
+    monkeypatch.setattr(batch_ops.submitter, 'assert_profile_binding',
+                        lambda *args, **kwargs: {})
     monkeypatch.setattr(batch_ops.submitter, 'fetch_results',
-                        lambda c, s, d, files=None: (['CONTCAR'], []))
-    payload = batch_ops.fetch_batch(object(), None, ['d1'], False)
+                        lambda c, s, d, files=None, profile=None:
+                        seen.append((d, files, profile)) or
+                        (['CONTCAR'], []))
+    profile = object()
+    payload = batch_ops.fetch_batch(profile, None, ['d1', 'd2'], False)
     assert payload['results'][0][1] is True
+    assert seen == [('d1', None, profile), ('d2', None, profile)]
+    # 每个 manifest 自己决定默认结果包，并将已校验 profile 透传到下载层复核。
+    assert client.closed and jump.closed
+
+
+def test_fetch_batch_rejects_job_bound_to_another_cluster(tmp_path, monkeypatch):
+    d = _mk_job(tmp_path, 'foreign', 'DONE')
+    data = mm.load_manifest(d)
+    data.update({'cluster': 'server-a', 'remote_dir': '/remote/foreign',
+                 'scheduler_job_id': '42'})
+    mm.save_manifest(d, data)
+    client, jump = _patch_open(monkeypatch)
+    monkeypatch.setattr(
+        batch_ops.submitter, 'fetch_results',
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('不得从错误服务器下载')))
+
+    out = batch_ops.fetch_batch(types.SimpleNamespace(name='server-b'), None, [d], False)
+
+    assert out['results'][0][1] is False
+    assert '属于服务器「server-a」' in out['results'][0][2]
     assert client.closed and jump.closed
 
 
@@ -105,6 +198,7 @@ def test_refresh_batch_survives_ssh_exception(monkeypatch):
     from paramiko.ssh_exception import SSHException
     client, jump = _patch_open(monkeypatch)
     monkeypatch.setattr(batch_ops.submitter, 'query_scheduler', lambda c, p: ({}, {}))
+    monkeypatch.setattr(batch_ops.submitter, 'assert_profile_binding', lambda *a, **k: {})
 
     def flaky(c, p, d, live_states, terminal_reasons=None):
         if d == 'bad':
@@ -121,8 +215,10 @@ def test_refresh_batch_survives_ssh_exception(monkeypatch):
 def test_fetch_batch_survives_ssh_exception(monkeypatch):
     from paramiko.ssh_exception import SSHException
     client, jump = _patch_open(monkeypatch)
+    monkeypatch.setattr(batch_ops.submitter, 'assert_profile_binding',
+                        lambda *args, **kwargs: {})
 
-    def flaky(c, s, d, files=None):
+    def flaky(c, s, d, files=None, profile=None):
         if d == 'bad':
             raise SSHException('boom')
         return (['CONTCAR'], [])

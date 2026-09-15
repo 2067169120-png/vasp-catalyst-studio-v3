@@ -1,0 +1,1972 @@
+"""Render one portable, paper-style report bundle from a shared data model.
+
+The renderer deliberately has no dependency on project calculation code.  Callers
+prepare a JSON-like ``model`` once, and the HTML, DOCX, and PDF renderers consume
+that same normalized snapshot.  Figure files are copied by content hash into the
+destination bundle before rendering, so reports never need a relative path between
+different Windows drives.
+"""
+from __future__ import annotations
+
+import hashlib
+import html
+import importlib
+import json
+import math
+import mimetypes
+import os
+import re
+import shutil
+import sys
+import tempfile
+import threading
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+from xml.sax.saxutils import escape as xml_escape
+
+
+BUNDLE_SCHEMA = "vcstudio.paper-report.bundle/v1"
+MODEL_SCHEMA = "vcstudio.paper-report.model/v1"
+_ALLOWED_FORMATS = ("html", "docx", "pdf")
+_RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}
+_FIGURE_PATH_KEYS = ("path", "src", "image", "file")
+_A4_CONTENT_WIDTH_DXA = 9298  # 210 mm page - 23 mm left/right margins.
+_PDF_FONT_LOCK = threading.Lock()
+_REPORT_PUBLISH_LOCK = threading.RLock()
+_PDF_CJK_REGULAR = "PaperCJK"
+_PDF_CJK_BOLD = "PaperCJKBold"
+_SECTION_LABELS = {
+    "en-US": {
+        "executive_summary": "Executive Summary",
+        "key_findings": "Key Findings",
+        "candidate_evaluations": "Candidate Evaluation",
+        "adsorption_table": "Adsorption-Energy Results",
+        "comparison_table": "Cross-Project Comparison",
+        "figures": "Figures",
+        "methods": "Methods",
+        "limitations": "Limitations",
+        "recommendations": "Recommendations",
+    },
+    "zh-CN": {
+        "executive_summary": "执行摘要",
+        "key_findings": "核心结论",
+        "candidate_evaluations": "候选评价",
+        "adsorption_table": "吸附能结果",
+        "comparison_table": "多项目比较",
+        "figures": "图表",
+        "methods": "计算方法",
+        "limitations": "局限性",
+        "recommendations": "后续建议",
+    },
+}
+
+
+class ReportDependencyError(RuntimeError):
+    """Raised when an explicitly requested report format is unavailable."""
+
+
+def render_report_bundle(
+    model: dict,
+    out_dir,
+    stem: str = "report",
+    formats: Sequence[str] = ("html", "docx", "pdf"),
+) -> dict:
+    """Render a portable HTML/DOCX/PDF bundle from one semantic report model.
+
+    Parameters
+    ----------
+    model:
+        JSON-like mapping.  Supported top-level fields include ``title``,
+        ``subtitle``, ``kicker``, ``metadata``, ``executive_summary``,
+        ``key_findings``, ``candidate_evaluations``, ``adsorption_table``,
+        ``comparison_table``, ``figures``, ``methods``, ``limitations``, and
+        ``recommendations``.
+    out_dir:
+        Destination directory.  All figures are copied into ``out_dir/assets``.
+    stem:
+        Safe basename used for report files and the manifest.
+    formats:
+        Any non-empty subset of ``html``, ``docx``, and ``pdf``.
+
+    Returns
+    -------
+    dict
+        ``files`` maps each requested format plus ``manifest`` to a :class:`Path`;
+        ``assets`` is a list of staged :class:`Path` objects.  The model hash and
+        schema are also returned for downstream completion markers.
+    """
+    if not isinstance(model, dict):
+        raise TypeError("model must be a dict")
+    safe_stem = _validate_stem(stem)
+    requested = _normalize_formats(formats)
+    _check_dependencies(requested)
+
+    destination = Path(out_dir).expanduser()
+    destination.mkdir(parents=True, exist_ok=True)
+    if not destination.is_dir():
+        raise NotADirectoryError(f"report output is not a directory: {destination}")
+
+    normalized = _normalize_model(model)
+    temp_root = Path(tempfile.mkdtemp(prefix=f".{safe_stem}.tmp-", dir=destination))
+    try:
+        staged_model, asset_records = _stage_figures(
+            normalized,
+            temp_root / "assets",
+            requested,
+        )
+        fingerprint_model = _fingerprint_model(staged_model)
+        model_sha256 = _sha256_json(fingerprint_model)
+
+        temp_outputs: dict[str, Path] = {}
+        if "html" in requested:
+            path = temp_root / f"{safe_stem}.html"
+            _render_html(staged_model, path)
+            temp_outputs["html"] = path
+        if "docx" in requested:
+            path = temp_root / f"{safe_stem}.docx"
+            _render_docx(staged_model, path)
+            temp_outputs["docx"] = path
+        if "pdf" in requested:
+            path = temp_root / f"{safe_stem}.pdf"
+            _render_pdf(staged_model, path)
+            temp_outputs["pdf"] = path
+
+        file_records = {
+            fmt: _file_record(path, relative_path=path.name)
+            for fmt, path in temp_outputs.items()
+        }
+        manifest = {
+            "schema": BUNDLE_SCHEMA,
+            "model_schema": MODEL_SCHEMA,
+            "model_sha256": model_sha256,
+            "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "formats": list(requested),
+            "files": file_records,
+            "assets": asset_records,
+        }
+        temp_manifest = temp_root / f"{safe_stem}.manifest.json"
+        temp_manifest.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        # Publishing is deliberately serialized inside one process.  Manual export
+        # and the background report worker can otherwise interleave replacements
+        # for the same stem and leave a manifest referring to another writer's
+        # files.  Assets are content-addressed and can safely be committed first.
+        with _REPORT_PUBLISH_LOCK:
+            asset_paths = _commit_assets(
+                temp_root / "assets",
+                destination / "assets",
+                asset_records,
+            )
+            output_paths, final_manifest = _commit_report_files(
+                temp_outputs,
+                temp_manifest,
+                destination,
+                temp_root / "rollback",
+            )
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+    return {
+        "schema": BUNDLE_SCHEMA,
+        "model_sha256": model_sha256,
+        "files": output_paths,
+        "assets": asset_paths,
+        "manifest": final_manifest,
+    }
+
+
+def _validate_stem(stem: str) -> str:
+    value = str(stem).strip()
+    if (
+        not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or ":" in value
+        or Path(value).name != value
+    ):
+        raise ValueError("stem must be a safe filename without directory components")
+    return value
+
+
+def _normalize_formats(formats: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(formats, str):
+        formats = (formats,)
+    result: list[str] = []
+    for item in formats:
+        fmt = str(item).strip().lower()
+        if fmt not in _ALLOWED_FORMATS:
+            raise ValueError(
+                f"unsupported report format {item!r}; expected one of {_ALLOWED_FORMATS}"
+            )
+        if fmt not in result:
+            result.append(fmt)
+    if not result:
+        raise ValueError("at least one report format is required")
+    return tuple(result)
+
+
+def _check_dependencies(formats: Sequence[str]) -> None:
+    if "docx" in formats:
+        try:
+            importlib.import_module("docx")
+        except ImportError as exc:
+            raise ReportDependencyError(
+                "DOCX generation requires python-docx; install vcstudio[docs]"
+            ) from exc
+    if "pdf" in formats:
+        try:
+            importlib.import_module("reportlab")
+        except ImportError as exc:
+            raise ReportDependencyError(
+                "PDF generation requires reportlab; install the reportlab package"
+            ) from exc
+
+
+def _normalize_model(model: Mapping[str, Any]) -> dict:
+    figures = model.get("figures") or []
+    if isinstance(figures, (str, os.PathLike, Mapping)):
+        figures = [figures]
+    if not isinstance(figures, Sequence):
+        raise TypeError("model['figures'] must be a sequence")
+
+    return {
+        "locale": _normalize_locale(model.get("locale")),
+        "title": _text(model.get("title")) or "Scientific Report",
+        "subtitle": _text(model.get("subtitle")),
+        "kicker": _text(model.get("kicker")) or "Research Report",
+        "metadata": _normalize_metadata(model.get("metadata")),
+        "executive_summary": _normalize_blocks(model.get("executive_summary")),
+        "key_findings": _normalize_blocks(model.get("key_findings")),
+        "candidate_evaluations": _normalize_table(
+            model.get("candidate_evaluations"),
+            "Candidate evaluation",
+        ),
+        "adsorption_table": _normalize_table(
+            model.get("adsorption_table"),
+            "Adsorption-energy results",
+        ),
+        "comparison_table": _normalize_table(
+            model.get("comparison_table"),
+            "Cross-project comparison",
+        ),
+        "figures": [_normalize_figure(item, index) for index, item in enumerate(figures, 1)],
+        "methods": _normalize_blocks(model.get("methods")),
+        "limitations": _normalize_blocks(model.get("limitations")),
+        "recommendations": _normalize_blocks(model.get("recommendations")),
+    }
+
+
+def _normalize_locale(value: Any) -> str:
+    locale = _text(value) or "en-US"
+    normalized = locale.replace("_", "-").lower()
+    if normalized in {"en", "en-us"}:
+        return "en-US"
+    if normalized in {"zh", "zh-cn", "zh-hans"}:
+        return "zh-CN"
+    raise ValueError("model['locale'] must be 'en-US' or 'zh-CN'")
+
+
+def _normalize_metadata(value: Any) -> list[dict]:
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        return [{"label": _text(key), "value": _display(val)} for key, val in value.items()]
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        return [{"label": "Metadata", "value": _display(value)}]
+
+    rows = []
+    for item in value:
+        if isinstance(item, Mapping):
+            label = item.get("label", item.get("name", item.get("key", "")))
+            val = item.get("value", item.get("text", item.get("detail", "")))
+            if not label and len(item) == 1:
+                label, val = next(iter(item.items()))
+            rows.append({"label": _text(label), "value": _display(val)})
+        elif isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) >= 2:
+            rows.append({"label": _text(item[0]), "value": _display(item[1])})
+        else:
+            rows.append({"label": "Metadata", "value": _display(item)})
+    return rows
+
+
+def _normalize_blocks(value: Any) -> list[dict]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, Mapping):
+        if any(key in value for key in ("title", "label", "name", "text", "summary", "detail")):
+            return [_block_from_mapping(value)]
+        return [
+            {"title": _text(key), "text": _display(val)}
+            for key, val in value.items()
+        ]
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        return [{"title": "", "text": _display(value)}]
+
+    blocks = []
+    for item in value:
+        if isinstance(item, Mapping):
+            blocks.append(_block_from_mapping(item))
+        else:
+            blocks.append({"title": "", "text": _display(item)})
+    return [block for block in blocks if block["title"] or block["text"]]
+
+
+def _block_from_mapping(item: Mapping[str, Any]) -> dict:
+    title = item.get("title", item.get("label", item.get("name", "")))
+    text = item.get(
+        "text",
+        item.get("summary", item.get("detail", item.get("value", item.get("description", "")))),
+    )
+    if not text:
+        remaining = {
+            str(key): value
+            for key, value in item.items()
+            if key not in {"title", "label", "name"}
+        }
+        text = remaining
+    return {"title": _text(title), "text": _display(text)}
+
+
+def _normalize_table(value: Any, default_title: str) -> dict | None:
+    if value is None or value == [] or value == {}:
+        return None
+    title = default_title
+    caption = ""
+    columns = None
+    rows = value
+    if isinstance(value, Mapping):
+        if "rows" in value:
+            title = _text(value.get("title")) or default_title
+            caption = _text(value.get("caption"))
+            columns = value.get("columns")
+            rows = value.get("rows") or []
+        else:
+            rows = [{"field": key, "value": val} for key, val in value.items()]
+            columns = [
+                {"key": "field", "label": "Field"},
+                {"key": "value", "label": "Value"},
+            ]
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence):
+        rows = [{"value": rows}]
+    rows = list(rows)
+    if not rows:
+        return None
+
+    definitions = _column_definitions(columns, rows)
+    normalized_rows = []
+    for row in rows:
+        if isinstance(row, Mapping):
+            normalized_rows.append([_display(row.get(col["key"], "")) for col in definitions])
+        elif isinstance(row, Sequence) and not isinstance(row, (str, bytes)):
+            normalized_rows.append(
+                [_display(row[index]) if index < len(row) else "" for index in range(len(definitions))]
+            )
+        else:
+            normalized_rows.append([_display(row)] + [""] * (len(definitions) - 1))
+    return {
+        "title": title,
+        "caption": caption,
+        "columns": definitions,
+        "rows": normalized_rows,
+    }
+
+
+def _column_definitions(columns: Any, rows: Sequence[Any]) -> list[dict]:
+    if columns:
+        result = []
+        for index, column in enumerate(columns):
+            if isinstance(column, Mapping):
+                key = _text(column.get("key", column.get("field", index)))
+                label = _text(column.get("label", column.get("title", key))) or f"Column {index + 1}"
+                align = _text(column.get("align")).lower()
+            else:
+                key = _text(column)
+                label = key or f"Column {index + 1}"
+                align = ""
+            result.append({"key": key, "label": label, "align": _valid_align(align)})
+        return result
+
+    first_mapping = next((row for row in rows if isinstance(row, Mapping)), None)
+    if first_mapping is not None:
+        keys: list[str] = []
+        for row in rows:
+            if isinstance(row, Mapping):
+                for key in row:
+                    text_key = _text(key)
+                    if text_key not in keys:
+                        keys.append(text_key)
+        return [{"key": key, "label": _human_label(key), "align": "auto"} for key in keys]
+    first_sequence = next(
+        (
+            row
+            for row in rows
+            if isinstance(row, Sequence) and not isinstance(row, (str, bytes))
+        ),
+        None,
+    )
+    count = len(first_sequence) if first_sequence is not None else 1
+    return [
+        {"key": str(index), "label": f"Column {index + 1}", "align": "auto"}
+        for index in range(count)
+    ]
+
+
+def _normalize_figure(item: Any, index: int) -> dict:
+    if isinstance(item, (str, os.PathLike)):
+        source = Path(item).expanduser()
+        return {
+            "title": f"Figure {index}",
+            "caption": "",
+            "alt": f"Figure {index}",
+            "_source_path": source,
+        }
+    if not isinstance(item, Mapping):
+        raise TypeError(f"figure {index} must be a path or mapping")
+    raw_path = next((item.get(key) for key in _FIGURE_PATH_KEYS if item.get(key)), None)
+    if raw_path is None:
+        raise ValueError(f"figure {index} has no path")
+    title = _text(item.get("title", item.get("name"))) or f"Figure {index}"
+    return {
+        "title": title,
+        "caption": _text(item.get("caption")),
+        "alt": _text(item.get("alt")) or title,
+        "_source_path": Path(raw_path).expanduser(),
+    }
+
+
+def _stage_figures(model: dict, assets_dir: Path, formats: Sequence[str]) -> tuple[dict, list[dict]]:
+    result = dict(model)
+    result["figures"] = []
+    records_by_digest: dict[str, dict] = {}
+    require_raster = "docx" in formats or "pdf" in formats
+
+    for index, figure in enumerate(model["figures"], 1):
+        source = figure["_source_path"]
+        if not source.is_file():
+            raise FileNotFoundError(f"figure {index} does not exist or is not a file: {source}")
+        suffix = source.suffix.lower()
+        if require_raster and suffix not in _RASTER_SUFFIXES:
+            raise ValueError(
+                f"figure {index} uses {suffix or 'an unknown format'}; "
+                "DOCX/PDF reports require a raster image"
+            )
+        digest = _sha256_file(source)
+        record = records_by_digest.get(digest)
+        if record is None:
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = _safe_asset_stem(source.stem)
+            asset_name = f"{safe_name}-{digest[:20]}{suffix or '.img'}"
+            target = assets_dir / asset_name
+            shutil.copyfile(source, target)
+            if _sha256_file(target) != digest:
+                raise OSError(f"figure copy verification failed: {source}")
+            record = {
+                "path": f"assets/{asset_name}",
+                "sha256": digest,
+                "size": target.stat().st_size,
+                "media_type": mimetypes.guess_type(asset_name)[0] or "application/octet-stream",
+            }
+            records_by_digest[digest] = record
+
+        staged = {key: value for key, value in figure.items() if not key.startswith("_")}
+        staged.update(
+            {
+                "asset_path": record["path"],
+                "asset_name": Path(record["path"]).name,
+                "asset_sha256": digest,
+                "_render_path": assets_dir / Path(record["path"]).name,
+            }
+        )
+        result["figures"].append(staged)
+    return result, list(records_by_digest.values())
+
+
+def _commit_assets(source_dir: Path, destination_dir: Path, records: Sequence[dict]) -> list[Path]:
+    if not records:
+        return []
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for record in records:
+        name = Path(record["path"]).name
+        source = source_dir / name
+        destination = destination_dir / name
+        if destination.exists():
+            if not destination.is_file() or _sha256_file(destination) != record["sha256"]:
+                raise OSError(f"asset hash collision at destination: {destination}")
+            source.unlink()
+        else:
+            os.replace(source, destination)
+        paths.append(destination)
+    return paths
+
+
+def _commit_report_files(
+    temp_outputs: Mapping[str, Path],
+    temp_manifest: Path,
+    destination: Path,
+    rollback_dir: Path,
+) -> tuple[dict[str, Path], Path]:
+    """Publish a report set with best-effort transactional rollback.
+
+    Windows refuses to replace a DOCX/PDF while Word or a PDF viewer holds a
+    restrictive file lock.  Back up every existing destination *before* the first
+    replacement so a later failure cannot leave a new HTML file beside an old
+    DOCX/PDF and stale manifest.  The manifest is always the final commit marker.
+    """
+    entries = [
+        (fmt, source, destination / source.name)
+        for fmt, source in temp_outputs.items()
+    ]
+    final_manifest = destination / temp_manifest.name
+    entries.append(("manifest", temp_manifest, final_manifest))
+
+    rollback_dir.mkdir(parents=True, exist_ok=True)
+    backups: dict[Path, Path] = {}
+    for _kind, _source, target in entries:
+        if not target.exists():
+            continue
+        if not target.is_file():
+            raise OSError(f"report destination is not a file: {target}")
+        backup = rollback_dir / target.name
+        shutil.copyfile(target, backup)
+        if _sha256_file(backup) != _sha256_file(target):
+            raise OSError(f"report rollback copy verification failed: {target}")
+        backups[target] = backup
+
+    published: list[Path] = []
+    try:
+        for _kind, source, target in entries:
+            os.replace(source, target)
+            published.append(target)
+    except Exception as publish_error:
+        rollback_errors = []
+        for target in reversed(published):
+            try:
+                backup = backups.get(target)
+                if backup is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    os.replace(backup, target)
+            except Exception as rollback_error:  # noqa: BLE001
+                rollback_errors.append(f"{target}: {rollback_error}")
+        if rollback_errors:
+            detail = "; ".join(rollback_errors)
+            raise OSError(
+                "report publication failed and rollback was incomplete: "
+                f"{detail}"
+            ) from publish_error
+        raise
+
+    output_paths = {
+        fmt: destination / source.name
+        for fmt, source in temp_outputs.items()
+    }
+    output_paths["manifest"] = final_manifest
+    return output_paths, final_manifest
+
+
+def _fingerprint_model(model: dict) -> dict:
+    payload = {}
+    for key, value in model.items():
+        if key != "figures":
+            payload[key] = value
+            continue
+        payload["figures"] = [
+            {
+                "title": figure["title"],
+                "caption": figure["caption"],
+                "alt": figure["alt"],
+                "asset_sha256": figure["asset_sha256"],
+            }
+            for figure in value
+        ]
+    return _json_safe(payload)
+
+
+def _render_html(model: dict, output: Path) -> None:
+    sections = _section_plan(model)
+    metadata = "".join(
+        "<div class='meta-row'><dt>{}</dt><dd>{}</dd></div>".format(
+            html.escape(row["label"]),
+            html.escape(row["value"]),
+        )
+        for row in model["metadata"]
+    )
+    body = []
+    table_number = 0
+    figure_number = 0
+    for section_number, (key, heading) in enumerate(sections, 1):
+        body.append(f"<section><h2><span>{section_number:02d}</span>{html.escape(heading)}</h2>")
+        if key == "executive_summary":
+            body.append(_html_blocks(model[key], ordered=False))
+        elif key == "key_findings":
+            body.append(_html_blocks(model[key], ordered=True))
+        elif key in {"candidate_evaluations", "adsorption_table", "comparison_table"}:
+            table_number += 1
+            body.append(_html_table(model[key], table_number, model["locale"]))
+        elif key == "figures":
+            for figure in model["figures"]:
+                figure_number += 1
+                caption = _caption_text(figure["title"], figure["caption"])
+                body.append(
+                    "<figure>"
+                    f"<img src='{html.escape(figure['asset_path'], quote=True)}' "
+                    f"alt='{html.escape(figure['alt'], quote=True)}'>"
+                    f"<figcaption>{html.escape(_figure_caption(model['locale'], figure_number, caption))}"
+                    "</figcaption>"
+                    "</figure>"
+                )
+        else:
+            body.append(_html_blocks(model[key], ordered=key == "recommendations"))
+        body.append("</section>")
+
+    title = html.escape(model["title"])
+    subtitle = html.escape(model["subtitle"])
+    kicker = html.escape(model["kicker"])
+    document = f"""<!doctype html>
+<html lang="{model['locale']}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+@page {{
+  size: A4 portrait;
+  margin: 22mm 23mm 20mm;
+  @top-left {{ content: "{_css_string(model['kicker'])}"; color: #6b7280; font-size: 8pt; }}
+  @bottom-right {{ content: {_page_counter_css(model['locale'])}; color: #6b7280; font-size: 8pt; }}
+}}
+:root {{ --ink:#17212b; --muted:#66717c; --accent:#1f4f64; --rule:#23313a; }}
+* {{ box-sizing:border-box; }}
+body {{
+  margin:0; color:var(--ink); background:#e9ecef;
+  font-family:"Noto Serif CJK SC","Songti SC",SimSun,"Times New Roman",serif;
+  font-size:10.5pt; line-height:1.68;
+}}
+.paper {{ width:210mm; min-height:297mm; margin:18px auto; background:#fff;
+  padding:22mm 23mm 20mm; box-shadow:0 8px 30px rgba(30,41,59,.12); }}
+.cover {{ min-height:248mm; display:flex; flex-direction:column; justify-content:center;
+  text-align:center; page-break-after:always; }}
+.kicker {{ margin:0 0 16mm; color:#8a6a2e; font:700 9pt/1.2 Arial,sans-serif;
+  letter-spacing:.18em; text-transform:uppercase; }}
+h1 {{ margin:0; color:#203846; font-size:29pt; line-height:1.22; font-weight:600; }}
+.subtitle {{ margin:5mm auto 0; max-width:135mm; color:#435866; font-size:14pt; line-height:1.5; }}
+.metadata {{ width:min(125mm,100%); margin:25mm auto 0; padding-top:6mm;
+  border-top:.8pt solid #b7c0c7; }}
+.meta-row {{ display:grid; grid-template-columns:35mm 1fr; gap:5mm; text-align:left;
+  padding:1.2mm 0; }}
+.meta-row dt {{ color:var(--muted); font:700 8.5pt/1.5 Arial,sans-serif;
+  text-transform:uppercase; letter-spacing:.05em; }}
+.meta-row dd {{ margin:0; }}
+section {{ margin:0 0 10mm; break-inside:auto; }}
+h2 {{ display:flex; align-items:baseline; gap:4mm; margin:12mm 0 4mm;
+  color:#203846; font-size:16pt; line-height:1.25; font-weight:600;
+  border-bottom:.6pt solid #c4ccd1; padding-bottom:2mm; }}
+h2 span {{ color:#8a6a2e; font:700 8.5pt/1 Arial,sans-serif; letter-spacing:.08em; }}
+h3 {{ margin:5mm 0 1.5mm; color:#2f5365; font-size:11.5pt; }}
+p {{ margin:0 0 3.2mm; text-align:justify; }}
+ol.findings {{ margin:0; padding-left:7mm; }}
+ol.findings li {{ margin:0 0 3mm; padding-left:2mm; }}
+ol.findings li strong {{ color:#2f5365; }}
+table.three-line {{ width:100%; border-collapse:collapse; table-layout:auto;
+  margin:1mm 0 2mm; border-top:1.4pt solid var(--rule); border-bottom:1.4pt solid var(--rule);
+  font-size:9.2pt; }}
+table.three-line caption {{ caption-side:top; text-align:left; margin:0 0 2mm;
+  font-size:9pt; font-weight:600; color:#303c44; }}
+table.three-line thead {{ border-bottom:.8pt solid var(--rule); }}
+table.three-line th, table.three-line td {{ border:0; padding:2mm 2.2mm;
+  vertical-align:middle; overflow-wrap:anywhere; }}
+table.three-line th {{ font-family:Arial,sans-serif; font-size:8.5pt; text-align:left; }}
+table.three-line td.numeric, table.three-line th.numeric {{ text-align:right; }}
+.table-note {{ margin:1mm 0 0; color:var(--muted); font-size:8.5pt; text-align:left; }}
+figure {{ margin:6mm auto 9mm; break-inside:avoid; text-align:center; }}
+figure img {{ display:block; max-width:100%; max-height:150mm; margin:0 auto; object-fit:contain; }}
+figcaption {{ margin-top:2.5mm; color:#39464e; font-size:9pt; line-height:1.45; text-align:center; }}
+.screen-running {{ display:none; }}
+@media print {{
+  body {{ background:#fff; }}
+  .paper {{ width:auto; min-height:auto; margin:0; padding:0; box-shadow:none; }}
+}}
+@media screen and (max-width:800px) {{
+  .paper {{ width:100%; min-height:0; margin:0; padding:18mm 8vw; box-shadow:none; }}
+  .cover {{ min-height:80vh; }}
+}}
+</style>
+</head>
+<body>
+<main class="paper">
+<header class="cover">
+  <p class="kicker">{kicker}</p>
+  <h1>{title}</h1>
+  {f'<p class="subtitle">{subtitle}</p>' if subtitle else ''}
+  {f'<dl class="metadata">{metadata}</dl>' if metadata else ''}
+</header>
+{''.join(body)}
+</main>
+</body>
+</html>
+"""
+    output.write_text(document, encoding="utf-8")
+
+
+def _html_blocks(blocks: Sequence[dict], *, ordered: bool) -> str:
+    if ordered:
+        items = []
+        for block in blocks:
+            title = f"<strong>{html.escape(block['title'])}.</strong> " if block["title"] else ""
+            items.append(f"<li>{title}{html.escape(block['text'])}</li>")
+        return f"<ol class='findings'>{''.join(items)}</ol>"
+    result = []
+    for block in blocks:
+        if block["title"]:
+            result.append(f"<h3>{html.escape(block['title'])}</h3>")
+        result.extend(f"<p>{html.escape(part)}</p>" for part in _paragraphs(block["text"]))
+    return "".join(result)
+
+
+def _html_table(table: dict, number: int, locale: str = "en-US") -> str:
+    headers = "".join(
+        f"<th class='{_html_align_class(column, table['rows'], index)}'>"
+        f"{html.escape(column['label'])}</th>"
+        for index, column in enumerate(table["columns"])
+    )
+    rows = []
+    for row in table["rows"]:
+        cells = "".join(
+            f"<td class='{_html_align_class(table['columns'][index], table['rows'], index)}'>"
+            f"{html.escape(value)}</td>"
+            for index, value in enumerate(row)
+        )
+        rows.append(f"<tr>{cells}</tr>")
+    caption = html.escape(_table_caption(locale, number, table["title"]))
+    note = (
+        f"<p class='table-note'>{html.escape(table['caption'])}</p>"
+        if table["caption"]
+        else ""
+    )
+    return (
+        f"<table class='three-line'><caption>{caption}</caption>"
+        f"<thead><tr>{headers}</tr></thead><tbody>{''.join(rows)}</tbody></table>{note}"
+    )
+
+
+def _render_docx(model: dict, output: Path) -> None:
+    from docx import Document
+    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.image.image import Image as DocxImage
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Mm, Pt, RGBColor
+
+    doc = Document()
+    section = doc.sections[0]
+    section.page_width = Mm(210)
+    section.page_height = Mm(297)
+    section.top_margin = Mm(22)
+    section.bottom_margin = Mm(20)
+    section.left_margin = Mm(23)
+    section.right_margin = Mm(23)
+    section.header_distance = Mm(10)
+    section.footer_distance = Mm(10)
+
+    def set_font(run, *, name="Times New Roman", east_asia="SimSun", size=None,
+                 bold=None, italic=None, color=None):
+        run.font.name = name
+        run._element.get_or_add_rPr().rFonts.set(qn("w:ascii"), name)
+        run._element.get_or_add_rPr().rFonts.set(qn("w:hAnsi"), name)
+        run._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), east_asia)
+        if size is not None:
+            run.font.size = Pt(size)
+        if bold is not None:
+            run.bold = bold
+        if italic is not None:
+            run.italic = italic
+        if color is not None:
+            run.font.color.rgb = RGBColor(*color)
+
+    styles = doc.styles
+    normal = styles["Normal"]
+    normal.font.name = "Times New Roman"
+    normal.font.size = Pt(10.5)
+    normal._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), "SimSun")
+    normal.paragraph_format.space_after = Pt(6)
+    normal.paragraph_format.line_spacing = 1.25
+    for name, size, before, after, color in (
+        ("Heading 1", 16, 18, 8, (32, 56, 70)),
+        ("Heading 2", 13, 12, 6, (47, 83, 101)),
+        ("Heading 3", 11.5, 8, 4, (47, 83, 101)),
+    ):
+        style = styles[name]
+        style.font.name = "Times New Roman"
+        style.font.size = Pt(size)
+        style.font.bold = True
+        style.font.color.rgb = RGBColor(*color)
+        style._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), "SimSun")
+        style.paragraph_format.space_before = Pt(before)
+        style.paragraph_format.space_after = Pt(after)
+        style.paragraph_format.keep_with_next = True
+    caption_style = styles["Caption"]
+    caption_style.font.name = "Times New Roman"
+    caption_style.font.size = Pt(9)
+    caption_style.font.italic = False
+    caption_style.font.color.rgb = RGBColor(57, 70, 78)
+    caption_style._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), "SimSun")
+    caption_style.paragraph_format.space_before = Pt(4)
+    caption_style.paragraph_format.space_after = Pt(5)
+    caption_style.paragraph_format.keep_with_next = True
+
+    header = section.header.paragraphs[0]
+    header.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    header.paragraph_format.space_after = Pt(0)
+    run = header.add_run(f"{model['kicker'].upper()}  ·  {model['title']}")
+    set_font(run, name="Arial", east_asia="Microsoft YaHei", size=8, color=(103, 113, 121))
+
+    footer = section.footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    footer.paragraph_format.space_before = Pt(0)
+    page_prefix = "第 " if model["locale"] == "zh-CN" else "Page "
+    run = footer.add_run(page_prefix)
+    set_font(run, name="Arial", east_asia="Microsoft YaHei", size=8, color=(103, 113, 121))
+    _append_word_field(run, "PAGE", OxmlElement)
+    if model["locale"] == "zh-CN":
+        suffix = footer.add_run(" 页")
+        set_font(
+            suffix,
+            name="Arial",
+            east_asia="Microsoft YaHei",
+            size=8,
+            color=(103, 113, 121),
+        )
+
+    doc.core_properties.title = model["title"]
+    doc.core_properties.subject = model["subtitle"]
+    doc.core_properties.author = "VASP Catalyst Studio"
+    doc.core_properties.keywords = "scientific report; adsorption energy; catalysis"
+
+    spacer = doc.add_paragraph()
+    spacer.paragraph_format.space_after = Pt(76)
+    kicker = doc.add_paragraph()
+    kicker.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    kicker.paragraph_format.space_after = Pt(20)
+    set_font(
+        kicker.add_run(model["kicker"].upper()),
+        name="Arial",
+        east_asia="Microsoft YaHei",
+        size=9,
+        bold=True,
+        color=(138, 106, 46),
+    )
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.paragraph_format.space_after = Pt(10)
+    set_font(title.add_run(model["title"]), size=29, bold=True, color=(32, 56, 70))
+    if model["subtitle"]:
+        subtitle = doc.add_paragraph()
+        subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        subtitle.paragraph_format.space_after = Pt(28)
+        set_font(subtitle.add_run(model["subtitle"]), size=14, color=(67, 88, 102))
+    for item in model["metadata"]:
+        paragraph = doc.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.space_after = Pt(2)
+        set_font(
+            paragraph.add_run(f"{item['label'].upper()}  "),
+            name="Arial",
+            east_asia="Microsoft YaHei",
+            size=8,
+            bold=True,
+            color=(103, 113, 121),
+        )
+        set_font(paragraph.add_run(item["value"]), size=9.5, color=(32, 45, 54))
+    doc.add_page_break()
+
+    sections = _section_plan(model)
+    table_number = 0
+    figure_number = 0
+    for section_number, (key, heading) in enumerate(sections, 1):
+        doc.add_heading(f"{section_number}. {heading}", level=1)
+        if key == "executive_summary":
+            _docx_add_blocks(doc, model[key], set_font, ordered=False)
+        elif key == "key_findings":
+            _docx_add_blocks(doc, model[key], set_font, ordered=True)
+        elif key in {"candidate_evaluations", "adsorption_table", "comparison_table"}:
+            table_number += 1
+            _docx_add_table(
+                doc,
+                model[key],
+                table_number,
+                model["locale"],
+                set_font,
+                qn,
+                OxmlElement,
+                WD_ALIGN_PARAGRAPH,
+                WD_CELL_VERTICAL_ALIGNMENT,
+            )
+        elif key == "figures":
+            for figure in model["figures"]:
+                figure_number += 1
+                paragraph = doc.add_paragraph()
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                paragraph.paragraph_format.space_before = Pt(5)
+                paragraph.paragraph_format.space_after = Pt(3)
+                paragraph.paragraph_format.keep_with_next = True
+                image = DocxImage.from_file(str(figure["_render_path"]))
+                max_width = Inches(6.25)
+                max_height = Inches(7.4)
+                width, height = image.scaled_dimensions(width=max_width)
+                if height > max_height:
+                    width, height = image.scaled_dimensions(height=max_height)
+                paragraph.add_run().add_picture(
+                    str(figure["_render_path"]),
+                    width=width,
+                    height=height,
+                )
+                caption = doc.add_paragraph(style="Caption")
+                caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                caption.paragraph_format.keep_with_next = False
+                caption.add_run(
+                    _figure_caption(
+                        model["locale"],
+                        figure_number,
+                        _caption_text(figure["title"], figure["caption"]),
+                    )
+                )
+        else:
+            _docx_add_blocks(
+                doc,
+                model[key],
+                set_font,
+                ordered=key == "recommendations",
+            )
+
+    # Save from the temporary directory; the caller commits only complete files.
+    doc.save(output)
+
+
+def _append_word_field(run, instruction: str, element_factory) -> None:
+    from docx.oxml.ns import qn
+
+    begin = element_factory("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instr = element_factory("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = f" {instruction} "
+    separate = element_factory("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    text = element_factory("w:t")
+    text.text = "1"
+    end = element_factory("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    run._r.extend((begin, instr, separate, text, end))
+
+
+def _docx_add_blocks(doc, blocks, set_font, *, ordered: bool) -> None:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt
+
+    numbering_id = _new_decimal_numbering(doc) if ordered else None
+    for block in blocks:
+        if ordered:
+            paragraph = doc.add_paragraph()
+            paragraph.paragraph_format.space_after = Pt(7)
+            _apply_numbering(paragraph, numbering_id)
+            if block["title"]:
+                set_font(paragraph.add_run(f"{block['title']}. "), size=10.5, bold=True)
+            set_font(paragraph.add_run(block["text"]), size=10.5)
+        else:
+            if block["title"]:
+                doc.add_heading(block["title"], level=2)
+            for text in _paragraphs(block["text"]):
+                paragraph = doc.add_paragraph(text)
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+
+def _new_decimal_numbering(doc) -> int:
+    """Create one real, restartable Word decimal-list definition."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    root = doc.part.numbering_part.element
+    abstract_ids = [
+        int(node.get(qn("w:abstractNumId")))
+        for node in root.findall(qn("w:abstractNum"))
+    ]
+    num_ids = [int(node.get(qn("w:numId"))) for node in root.findall(qn("w:num"))]
+    abstract_id = max(abstract_ids, default=-1) + 1
+    num_id = max(num_ids, default=0) + 1
+
+    abstract = OxmlElement("w:abstractNum")
+    abstract.set(qn("w:abstractNumId"), str(abstract_id))
+    multi = OxmlElement("w:multiLevelType")
+    multi.set(qn("w:val"), "singleLevel")
+    abstract.append(multi)
+    level = OxmlElement("w:lvl")
+    level.set(qn("w:ilvl"), "0")
+    for tag, value in (("w:start", "1"), ("w:numFmt", "decimal"), ("w:lvlText", "%1.")):
+        node = OxmlElement(tag)
+        node.set(qn("w:val"), value)
+        level.append(node)
+    justification = OxmlElement("w:lvlJc")
+    justification.set(qn("w:val"), "left")
+    level.append(justification)
+    paragraph_properties = OxmlElement("w:pPr")
+    tabs = OxmlElement("w:tabs")
+    tab = OxmlElement("w:tab")
+    tab.set(qn("w:val"), "num")
+    tab.set(qn("w:pos"), "540")
+    tabs.append(tab)
+    paragraph_properties.append(tabs)
+    indentation = OxmlElement("w:ind")
+    indentation.set(qn("w:left"), "540")
+    indentation.set(qn("w:hanging"), "270")
+    paragraph_properties.append(indentation)
+    level.append(paragraph_properties)
+    abstract.append(level)
+    root.append(abstract)
+
+    number = OxmlElement("w:num")
+    number.set(qn("w:numId"), str(num_id))
+    reference = OxmlElement("w:abstractNumId")
+    reference.set(qn("w:val"), str(abstract_id))
+    number.append(reference)
+    root.append(number)
+    return num_id
+
+
+def _apply_numbering(paragraph, num_id: int) -> None:
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    properties = paragraph._p.get_or_add_pPr()
+    numbering = OxmlElement("w:numPr")
+    level = OxmlElement("w:ilvl")
+    level.set(qn("w:val"), "0")
+    reference = OxmlElement("w:numId")
+    reference.set(qn("w:val"), str(num_id))
+    numbering.extend((level, reference))
+    properties.append(numbering)
+
+
+def _docx_add_table(
+    doc,
+    table_model,
+    number,
+    locale,
+    set_font,
+    qn,
+    element_factory,
+    paragraph_alignment,
+    vertical_alignment,
+) -> None:
+    from docx.shared import Pt
+
+    caption = doc.add_paragraph(style="Caption")
+    caption.alignment = paragraph_alignment.LEFT
+    caption.add_run(_table_caption(locale, number, table_model["title"]))
+    columns = table_model["columns"]
+    widths = _column_widths_dxa(table_model)
+    table = doc.add_table(rows=1, cols=len(columns))
+    table.autofit = False
+    _set_table_geometry(table, widths, qn, element_factory)
+    _set_three_line_table(table, qn, element_factory)
+    _repeat_table_header(table.rows[0], qn, element_factory)
+    for index, column in enumerate(columns):
+        cell = table.rows[0].cells[index]
+        cell.vertical_alignment = vertical_alignment.CENTER
+        _set_cell_width(cell, widths[index], qn, element_factory)
+        _set_cell_margins(cell, qn, element_factory)
+        _set_cell_border(cell, "bottom", 8, "23313A", qn, element_factory)
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = _docx_alignment(column, table_model["rows"], index, paragraph_alignment)
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(0)
+        set_font(
+            paragraph.add_run(column["label"]),
+            name="Arial",
+            east_asia="Microsoft YaHei",
+            size=8.5,
+            bold=True,
+            color=(35, 49, 58),
+        )
+    for row_values in table_model["rows"]:
+        cells = table.add_row().cells
+        for index, value in enumerate(row_values):
+            cell = cells[index]
+            cell.vertical_alignment = vertical_alignment.CENTER
+            _set_cell_width(cell, widths[index], qn, element_factory)
+            _set_cell_margins(cell, qn, element_factory)
+            paragraph = cell.paragraphs[0]
+            paragraph.alignment = _docx_alignment(
+                columns[index], table_model["rows"], index, paragraph_alignment
+            )
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+            paragraph.paragraph_format.line_spacing = 1.1
+            set_font(paragraph.add_run(value), size=8.8)
+    if table_model["caption"]:
+        note = doc.add_paragraph(style="Caption")
+        note.alignment = paragraph_alignment.LEFT
+        note.paragraph_format.keep_with_next = False
+        set_font(note.add_run(table_model["caption"]), size=8.5, color=(103, 113, 121))
+    else:
+        spacer = doc.add_paragraph()
+        spacer.paragraph_format.space_after = Pt(1)
+
+
+def _set_table_geometry(table, widths, qn, element_factory) -> None:
+    table_xml = table._tbl
+    properties = table_xml.tblPr
+    width = properties.find(qn("w:tblW"))
+    if width is None:
+        width = element_factory("w:tblW")
+        properties.append(width)
+    width.set(qn("w:type"), "dxa")
+    width.set(qn("w:w"), str(sum(widths)))
+    indent = properties.find(qn("w:tblInd"))
+    if indent is None:
+        indent = element_factory("w:tblInd")
+        properties.append(indent)
+    indent.set(qn("w:type"), "dxa")
+    indent.set(qn("w:w"), "120")
+    layout = properties.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = element_factory("w:tblLayout")
+        properties.append(layout)
+    layout.set(qn("w:type"), "fixed")
+    grid = table_xml.tblGrid
+    for child in list(grid):
+        grid.remove(child)
+    for value in widths:
+        col = element_factory("w:gridCol")
+        col.set(qn("w:w"), str(value))
+        grid.append(col)
+
+
+def _set_three_line_table(table, qn, element_factory) -> None:
+    properties = table._tbl.tblPr
+    borders = properties.find(qn("w:tblBorders"))
+    if borders is None:
+        borders = element_factory("w:tblBorders")
+        properties.append(borders)
+    for edge in ("top", "bottom", "left", "right", "insideH", "insideV"):
+        node = borders.find(qn(f"w:{edge}"))
+        if node is None:
+            node = element_factory(f"w:{edge}")
+            borders.append(node)
+        if edge in {"top", "bottom"}:
+            node.set(qn("w:val"), "single")
+            node.set(qn("w:sz"), "12")
+            node.set(qn("w:color"), "23313A")
+        else:
+            node.set(qn("w:val"), "nil")
+
+
+def _set_cell_border(cell, edge, size, color, qn, element_factory) -> None:
+    properties = cell._tc.get_or_add_tcPr()
+    borders = properties.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = element_factory("w:tcBorders")
+        properties.append(borders)
+    node = borders.find(qn(f"w:{edge}"))
+    if node is None:
+        node = element_factory(f"w:{edge}")
+        borders.append(node)
+    node.set(qn("w:val"), "single")
+    node.set(qn("w:sz"), str(size))
+    node.set(qn("w:color"), color)
+
+
+def _set_cell_width(cell, width, qn, element_factory) -> None:
+    properties = cell._tc.get_or_add_tcPr()
+    node = properties.find(qn("w:tcW"))
+    if node is None:
+        node = element_factory("w:tcW")
+        properties.append(node)
+    node.set(qn("w:type"), "dxa")
+    node.set(qn("w:w"), str(width))
+
+
+def _set_cell_margins(cell, qn, element_factory) -> None:
+    properties = cell._tc.get_or_add_tcPr()
+    margins = properties.find(qn("w:tcMar"))
+    if margins is None:
+        margins = element_factory("w:tcMar")
+        properties.append(margins)
+    for edge, value in (("top", 80), ("bottom", 80), ("start", 120), ("end", 120)):
+        node = margins.find(qn(f"w:{edge}"))
+        if node is None:
+            node = element_factory(f"w:{edge}")
+            margins.append(node)
+        node.set(qn("w:w"), str(value))
+        node.set(qn("w:type"), "dxa")
+
+
+def _repeat_table_header(row, qn, element_factory) -> None:
+    properties = row._tr.get_or_add_trPr()
+    repeat = element_factory("w:tblHeader")
+    repeat.set(qn("w:val"), "true")
+    properties.append(repeat)
+
+
+def _register_pdf_fonts(reportlab_package, pdfmetrics, reportlab_ttfont, model) -> None:
+    """Register embedded fonts with full scientific and Simplified-Chinese coverage."""
+    with _PDF_FONT_LOCK:
+        registered = set(pdfmetrics.getRegisteredFontNames())
+        if "PaperSans" not in registered:
+            font_files = _latin_pdf_font_files(reportlab_package)
+            for font_name, path in font_files.items():
+                pdfmetrics.registerFont(reportlab_ttfont(font_name, str(path)))
+            pdfmetrics.registerFontFamily(
+                "PaperSans",
+                normal="PaperSans",
+                bold="PaperSansBold",
+                italic="PaperSansItalic",
+                boldItalic="PaperSansBoldItalic",
+            )
+
+        required_text = _pdf_required_text(model)
+        if any(_is_cjk(char) for char in required_text):
+            registered = set(pdfmetrics.getRegisteredFontNames())
+            if _PDF_CJK_REGULAR not in registered:
+                font_root = _pdf_font_root()
+                sources = {
+                    _PDF_CJK_REGULAR: font_root / "noto-sans-sc-400.ttf",
+                    _PDF_CJK_BOLD: font_root / "noto-sans-sc-700.ttf",
+                }
+                for font_name, source in sources.items():
+                    pdfmetrics.registerFont(reportlab_ttfont(font_name, str(source)))
+                pdfmetrics.registerFontFamily(
+                    "PaperCJK",
+                    normal=_PDF_CJK_REGULAR,
+                    bold=_PDF_CJK_BOLD,
+                    italic=_PDF_CJK_REGULAR,
+                    boldItalic=_PDF_CJK_BOLD,
+                )
+        _validate_pdf_glyph_coverage(pdfmetrics, model)
+
+
+def _pdf_font_root() -> Path:
+    """Resolve bundled fonts in source installs and one-file PyInstaller builds."""
+    roots = []
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    if frozen_root:
+        roots.extend(
+            (
+                Path(frozen_root) / "vcstudio_assets" / "fonts",
+                Path(frozen_root) / "vcstudio" / "gui_web" / "assets" / "fonts",
+                Path(frozen_root) / "gui_web" / "assets" / "fonts",
+            )
+        )
+    roots.append(Path(__file__).resolve().parents[1] / "gui_web" / "assets" / "fonts")
+    required = ("noto-sans-sc-400.ttf", "noto-sans-sc-700.ttf")
+    for root in roots:
+        if all((root / name).is_file() for name in required):
+            return root
+    raise ReportDependencyError(
+        "CJK PDF generation requires bundled noto-sans-sc-400.ttf and "
+        "noto-sans-sc-700.ttf"
+    )
+
+
+def _latin_pdf_font_files(reportlab_package) -> dict[str, Path]:
+    """Use bundled DejaVu for scientific symbols without a matplotlib dependency."""
+    try:
+        root = _pdf_font_root()
+        candidates = {
+            "PaperSans": root / "dejavu-sans-400.ttf",
+            "PaperSansBold": root / "dejavu-sans-700.ttf",
+            "PaperSansItalic": root / "dejavu-sans-400-italic.ttf",
+            "PaperSansBoldItalic": root / "dejavu-sans-700-italic.ttf",
+        }
+        if all(path.is_file() for path in candidates.values()):
+            return candidates
+    except ReportDependencyError:
+        pass
+
+    # Backward compatibility for source checkouts made before the standalone
+    # scientific fonts were bundled.
+    try:
+        matplotlib = importlib.import_module("matplotlib")
+        root = Path(matplotlib.get_data_path()) / "fonts" / "ttf"
+        candidates = {
+            "PaperSans": root / "DejaVuSans.ttf",
+            "PaperSansBold": root / "DejaVuSans-Bold.ttf",
+            "PaperSansItalic": root / "DejaVuSans-Oblique.ttf",
+            "PaperSansBoldItalic": root / "DejaVuSans-BoldOblique.ttf",
+        }
+        if all(path.is_file() for path in candidates.values()):
+            return candidates
+    except (ImportError, AttributeError):
+        pass
+    root = Path(reportlab_package.__file__).resolve().parent / "fonts"
+    candidates = {
+        "PaperSans": root / "Vera.ttf",
+        "PaperSansBold": root / "VeraBd.ttf",
+        "PaperSansItalic": root / "VeraIt.ttf",
+        "PaperSansBoldItalic": root / "VeraBI.ttf",
+    }
+    if not all(path.is_file() for path in candidates.values()):
+        raise ReportDependencyError("ReportLab's bundled Vera fonts are missing")
+    return candidates
+
+
+def _pdf_required_text(model: dict) -> str:
+    payload = json.dumps(_fingerprint_model(model), ensure_ascii=False, sort_keys=True)
+    labels = "".join(_SECTION_LABELS[model["locale"]].values())
+    furniture = "Table Figure Page" if model["locale"] == "en-US" else "表图第页"
+    return payload + labels + furniture
+
+
+def _validate_pdf_glyph_coverage(pdfmetrics, model: dict) -> None:
+    text = _pdf_required_text(model)
+    latin = pdfmetrics.getFont("PaperSans").face.charToGlyph
+    cjk = None
+    if any(_is_cjk(char) for char in text):
+        cjk = pdfmetrics.getFont(_PDF_CJK_REGULAR).face.charToGlyph
+    missing = []
+    for char in text:
+        if char.isspace() or ord(char) < 32:
+            continue
+        coverage = cjk if _is_cjk(char) else latin
+        if coverage is None or ord(char) not in coverage:
+            if char not in missing:
+                missing.append(char)
+    if missing:
+        preview = " ".join(repr(char) for char in missing[:10])
+        raise ReportDependencyError(
+            "PDF fonts cannot render all report characters "
+            f"({preview}); install matplotlib for scientific glyph coverage"
+        )
+
+
+def _render_pdf(model: dict, output: Path) -> None:
+    import reportlab as reportlab_package
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import (
+        BaseDocTemplate,
+        CondPageBreak,
+        Frame,
+        Image,
+        KeepTogether,
+        PageBreak,
+        PageTemplate,
+        Paragraph,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    _register_pdf_fonts(reportlab_package, pdfmetrics, TTFont, model)
+    font = "PaperSans"
+    bold_font = "PaperSansBold"
+    palette = {
+        "ink": colors.HexColor("#17212B"),
+        "muted": colors.HexColor("#66717C"),
+        "accent": colors.HexColor("#1F4F64"),
+        "gold": colors.HexColor("#8A6A2E"),
+        "rule": colors.HexColor("#23313A"),
+    }
+    base = getSampleStyleSheet()
+    styles = {
+        "body": ParagraphStyle(
+            "PaperBody",
+            parent=base["BodyText"],
+            fontName=font,
+            fontSize=10,
+            leading=14.2,
+            textColor=palette["ink"],
+            alignment=TA_JUSTIFY,
+            spaceAfter=6,
+        ),
+        "cover_kicker": ParagraphStyle(
+            "CoverKicker",
+            fontName=font,
+            fontSize=9,
+            leading=12,
+            textColor=palette["gold"],
+            alignment=TA_CENTER,
+            spaceAfter=18 * mm,
+        ),
+        "cover_title": ParagraphStyle(
+            "CoverTitle",
+            fontName=bold_font,
+            fontSize=28,
+            leading=35,
+            textColor=colors.HexColor("#203846"),
+            alignment=TA_CENTER,
+            spaceAfter=5 * mm,
+        ),
+        "cover_subtitle": ParagraphStyle(
+            "CoverSubtitle",
+            fontName=font,
+            fontSize=14,
+            leading=21,
+            textColor=colors.HexColor("#435866"),
+            alignment=TA_CENTER,
+            spaceAfter=20 * mm,
+        ),
+        "metadata": ParagraphStyle(
+            "Metadata",
+            fontName=font,
+            fontSize=9,
+            leading=13,
+            textColor=palette["muted"],
+            alignment=TA_CENTER,
+            spaceAfter=2,
+        ),
+        "h1": ParagraphStyle(
+            "SectionHeading",
+            fontName=bold_font,
+            fontSize=15.5,
+            leading=20,
+            textColor=colors.HexColor("#203846"),
+            spaceBefore=11 * mm,
+            spaceAfter=4 * mm,
+            keepWithNext=True,
+        ),
+        "h2": ParagraphStyle(
+            "Subheading",
+            fontName=bold_font,
+            fontSize=11.5,
+            leading=15,
+            textColor=palette["accent"],
+            spaceBefore=4 * mm,
+            spaceAfter=1.5 * mm,
+            keepWithNext=True,
+        ),
+        "number": ParagraphStyle(
+            "NumberedPoint",
+            parent=base["BodyText"],
+            fontName=font,
+            fontSize=10,
+            leading=14,
+            textColor=palette["ink"],
+            leftIndent=7 * mm,
+            firstLineIndent=-7 * mm,
+            spaceAfter=7,
+        ),
+        "table_caption": ParagraphStyle(
+            "TableCaption",
+            fontName=bold_font,
+            fontSize=8.8,
+            leading=12,
+            textColor=colors.HexColor("#303C44"),
+            spaceBefore=2 * mm,
+            spaceAfter=2 * mm,
+            keepWithNext=True,
+        ),
+        "table_head": ParagraphStyle(
+            "TableHead",
+            fontName=bold_font,
+            fontSize=8,
+            leading=10,
+            textColor=colors.HexColor("#23313A"),
+        ),
+        "table_cell": ParagraphStyle(
+            "TableCell",
+            fontName=font,
+            fontSize=8.3,
+            leading=10.5,
+            textColor=palette["ink"],
+        ),
+        "table_note": ParagraphStyle(
+            "TableNote",
+            fontName=font,
+            fontSize=8.2,
+            leading=11,
+            textColor=palette["muted"],
+            spaceAfter=3 * mm,
+        ),
+        "figure_caption": ParagraphStyle(
+            "FigureCaption",
+            fontName=font,
+            fontSize=8.8,
+            leading=12,
+            textColor=colors.HexColor("#39464E"),
+            alignment=TA_CENTER,
+            spaceBefore=2.5 * mm,
+            spaceAfter=5 * mm,
+        ),
+    }
+
+    document = BaseDocTemplate(
+        str(output),
+        pagesize=A4,
+        rightMargin=23 * mm,
+        leftMargin=23 * mm,
+        topMargin=22 * mm,
+        bottomMargin=24 * mm,
+        title=model["title"],
+        author="VASP Catalyst Studio",
+        subject=model["subtitle"],
+        creator="VASP Catalyst Studio paper_report",
+    )
+
+    story = [Spacer(1, 43 * mm)]
+    story.append(
+        Paragraph(_pdf_markup(model["kicker"].upper(), _PDF_CJK_BOLD), styles["cover_kicker"])
+    )
+    story.append(Paragraph(_pdf_markup(model["title"], _PDF_CJK_BOLD), styles["cover_title"]))
+    if model["subtitle"]:
+        story.append(Paragraph(_pdf_markup(model["subtitle"]), styles["cover_subtitle"]))
+    else:
+        story.append(Spacer(1, 13 * mm))
+    for item in model["metadata"]:
+        text = _pdf_markup(f"{item['label'].upper()}  ·  {item['value']}")
+        story.append(Paragraph(text, styles["metadata"]))
+    story.append(PageBreak())
+
+    sections = _section_plan(model)
+    table_number = 0
+    figure_number = 0
+    for section_number, (key, heading) in enumerate(sections, 1):
+        minimum_space = 165 * mm if key == "figures" else 35 * mm
+        story.append(CondPageBreak(minimum_space))
+        story.append(
+            Paragraph(
+                _pdf_markup(f"{section_number:02d}  {heading}", _PDF_CJK_BOLD),
+                styles["h1"],
+            )
+        )
+        if key == "executive_summary":
+            _pdf_add_blocks(story, model[key], styles, ordered=False)
+        elif key == "key_findings":
+            _pdf_add_blocks(story, model[key], styles, ordered=True)
+        elif key in {"candidate_evaluations", "adsorption_table", "comparison_table"}:
+            table_number += 1
+            story.extend(
+                _pdf_table(
+                    model[key],
+                    table_number,
+                    model["locale"],
+                    styles,
+                    document.width,
+                    colors,
+                    Table,
+                    TableStyle,
+                    Paragraph,
+                    TA_LEFT,
+                    TA_RIGHT,
+                    TA_CENTER,
+                )
+            )
+        elif key == "figures":
+            for figure in model["figures"]:
+                figure_number += 1
+                image = Image(str(figure["_render_path"]))
+                scale = min(
+                    document.width / image.drawWidth,
+                    (132 * mm) / image.drawHeight,
+                    1.0,
+                )
+                image.drawWidth *= scale
+                image.drawHeight *= scale
+                caption = Paragraph(
+                    _pdf_markup(
+                        _figure_caption(
+                            model["locale"],
+                            figure_number,
+                            _caption_text(figure["title"], figure["caption"]),
+                        )
+                    ),
+                    styles["figure_caption"],
+                )
+                story.append(KeepTogether([image, caption]))
+        else:
+            _pdf_add_blocks(
+                story,
+                model[key],
+                styles,
+                ordered=key == "recommendations",
+            )
+
+    def draw_page(canvas, doc):
+        canvas.saveState()
+        canvas.setTitle(model["title"])
+        canvas.setAuthor("VASP Catalyst Studio")
+        canvas.setFont(font, 7.8)
+        canvas.setFillColor(palette["muted"])
+        if doc.page > 1:
+            _draw_pdf_mixed_text(
+                canvas,
+                model["kicker"].upper(),
+                23 * mm,
+                A4[1] - 11 * mm,
+                font,
+                _PDF_CJK_REGULAR,
+                7.8,
+                align="left",
+            )
+            title_text = model["title"]
+            if len(title_text) > 42:
+                title_text = title_text[:39] + "..."
+            _draw_pdf_mixed_text(
+                canvas,
+                title_text,
+                A4[0] - 23 * mm,
+                A4[1] - 11 * mm,
+                font,
+                _PDF_CJK_REGULAR,
+                7.8,
+                align="right",
+            )
+        page_label = (
+            f"第 {doc.page} 页" if model["locale"] == "zh-CN" else f"Page {doc.page}"
+        )
+        _draw_pdf_mixed_text(
+            canvas,
+            page_label,
+            A4[0] / 2,
+            10 * mm,
+            font,
+                _PDF_CJK_REGULAR,
+            7.8,
+            align="center",
+        )
+        canvas.restoreState()
+
+    frame = Frame(
+        document.leftMargin,
+        document.bottomMargin,
+        document.width,
+        document.height,
+        id="report-body",
+        leftPadding=0,
+        rightPadding=0,
+        topPadding=0,
+        bottomPadding=0,
+    )
+    # ``onPage`` runs before story flowables; an opaque plot that ever reaches
+    # a margin can then cover the running header.  Draw furniture in
+    # ``onPageEnd`` so page number and provenance remain visible on top.
+    document.addPageTemplates(
+        PageTemplate(id="report", frames=[frame], onPageEnd=draw_page)
+    )
+    document.build(story)
+
+
+def _pdf_add_blocks(story, blocks, styles, *, ordered: bool) -> None:
+    from reportlab.platypus import Paragraph
+
+    for index, block in enumerate(blocks, 1):
+        if ordered:
+            label = f"{index}. "
+            if block["title"]:
+                label += f"{block['title']}. "
+            story.append(Paragraph(_pdf_markup(label + block["text"]), styles["number"]))
+        else:
+            if block["title"]:
+                story.append(
+                    Paragraph(_pdf_markup(block["title"], _PDF_CJK_BOLD), styles["h2"])
+                )
+            for text in _paragraphs(block["text"]):
+                story.append(Paragraph(_pdf_markup(text), styles["body"]))
+
+
+def _pdf_table(
+    table_model,
+    number,
+    locale,
+    styles,
+    content_width,
+    colors,
+    table_class,
+    table_style_class,
+    paragraph_class,
+    align_left,
+    align_right,
+    align_center,
+):
+    caption = paragraph_class(
+        _pdf_markup(_table_caption(locale, number, table_model["title"]), _PDF_CJK_BOLD),
+        styles["table_caption"],
+    )
+    data = [
+        [
+            paragraph_class(
+                _pdf_markup(column["label"], _PDF_CJK_BOLD),
+                styles["table_head"],
+            )
+            for column in table_model["columns"]
+        ]
+    ]
+    for row in table_model["rows"]:
+        data.append(
+            [paragraph_class(_pdf_markup(value), styles["table_cell"]) for value in row]
+        )
+    dxa_widths = _column_widths_dxa(table_model)
+    widths = [content_width * value / sum(dxa_widths) for value in dxa_widths]
+    table = table_class(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+    commands = [
+        ("LINEABOVE", (0, 0), (-1, 0), 1.1, colors.HexColor("#23313A")),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.7, colors.HexColor("#23313A")),
+        ("LINEBELOW", (0, -1), (-1, -1), 1.1, colors.HexColor("#23313A")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]
+    for index, column in enumerate(table_model["columns"]):
+        align = _resolved_align(column, table_model["rows"], index)
+        pdf_align = {"left": align_left, "right": align_right, "center": align_center}[align]
+        commands.append(("ALIGN", (index, 0), (index, -1), {
+            align_left: "LEFT", align_right: "RIGHT", align_center: "CENTER"
+        }[pdf_align]))
+    table.setStyle(table_style_class(commands))
+    result = [caption, table]
+    if table_model["caption"]:
+        result.append(
+            paragraph_class(_pdf_markup(table_model["caption"]), styles["table_note"])
+        )
+    return result
+
+
+def _section_plan(model: dict) -> list[tuple[str, str]]:
+    labels = _SECTION_LABELS[model["locale"]]
+    return [(key, heading) for key, heading in labels.items() if model.get(key)]
+
+
+def _column_widths_dxa(table: dict) -> list[int]:
+    weights = []
+    for index, column in enumerate(table["columns"]):
+        lengths = [_visual_length(column["label"])]
+        lengths.extend(_visual_length(row[index]) for row in table["rows"])
+        weight = max(5.0, min(36.0, max(lengths, default=5)))
+        if _resolved_align(column, table["rows"], index) == "right":
+            weight = min(weight, 14.0)
+        weights.append(weight)
+    minimum = min(900, _A4_CONTENT_WIDTH_DXA // max(len(weights), 1))
+    remaining = _A4_CONTENT_WIDTH_DXA - minimum * len(weights)
+    total_weight = sum(weights) or 1
+    result = [minimum + round(remaining * weight / total_weight) for weight in weights]
+    result[-1] += _A4_CONTENT_WIDTH_DXA - sum(result)
+    return result
+
+
+def _docx_alignment(column, rows, index, alignment):
+    resolved = _resolved_align(column, rows, index)
+    return {
+        "left": alignment.LEFT,
+        "right": alignment.RIGHT,
+        "center": alignment.CENTER,
+    }[resolved]
+
+
+def _html_align_class(column, rows, index) -> str:
+    return "numeric" if _resolved_align(column, rows, index) == "right" else ""
+
+
+def _resolved_align(column: dict, rows: Sequence[Sequence[str]], index: int) -> str:
+    if column["align"] in {"left", "right", "center"}:
+        return column["align"]
+    values = [row[index].strip() for row in rows if index < len(row) and row[index].strip()]
+    if values and all(_looks_numeric(value) for value in values):
+        return "right"
+    return "left"
+
+
+def _valid_align(value: str) -> str:
+    return value if value in {"left", "right", "center"} else "auto"
+
+
+def _looks_numeric(value: str) -> bool:
+    compact = value.replace(",", "").replace("−", "-").strip()
+    return bool(re.fullmatch(r"[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?(?:\s*\S+)?", compact))
+
+
+def _visual_length(value: str) -> float:
+    return sum(2 if ord(char) > 127 else 1 for char in value)
+
+
+def _caption_text(title: str, caption: str) -> str:
+    if caption and caption != title:
+        return f"{title}. {caption}"
+    return title or caption
+
+
+def _table_caption(locale: str, number: int, title: str) -> str:
+    if locale == "zh-CN":
+        return f"表 {number}  {title}"
+    return f"Table {number}. {title}"
+
+
+def _figure_caption(locale: str, number: int, caption: str) -> str:
+    if locale == "zh-CN":
+        return f"图 {number}  {caption}"
+    return f"Figure {number}. {caption}"
+
+
+def _page_counter_css(locale: str) -> str:
+    return '"第 " counter(page) " 页"' if locale == "zh-CN" else '"Page " counter(page)'
+
+
+def _paragraphs(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()] or [""]
+
+
+def _human_label(value: str) -> str:
+    return value.replace("_", " ").strip().title()
+
+
+def _safe_asset_stem(value: str) -> str:
+    sanitized = re.sub(r"[^\w.-]+", "-", value, flags=re.UNICODE).strip("-.")
+    return (sanitized or "figure")[:48]
+
+
+def _display(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("report model contains a non-finite number")
+        return f"{value:g}"
+    if isinstance(value, (str, int)):
+        return str(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return "; ".join(f"{_text(key)}: {_display(val)}" for key, val in value.items())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return "; ".join(_display(item) for item in value)
+    if isinstance(value, os.PathLike):
+        return str(value)
+    return str(value)
+
+
+def _text(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("report model contains a non-finite number")
+        return value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, os.PathLike):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def _sha256_json(value: Any) -> str:
+    payload = json.dumps(
+        _json_safe(value),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_record(path: Path, *, relative_path: str) -> dict:
+    return {
+        "path": relative_path,
+        "sha256": _sha256_file(path),
+        "size": path.stat().st_size,
+    }
+
+
+def _css_string(value: str) -> str:
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("<", "\\3C ")
+        .replace(">", "\\3E ")
+        .replace("&", "\\26 ")
+        .replace("\n", " ")
+    )
+
+
+def _pdf_markup(value: str, cjk_font: str = _PDF_CJK_REGULAR) -> str:
+    """Escape Paragraph markup and select a CJK fallback without harming Latin spacing."""
+    pieces = []
+    for is_cjk, text in _pdf_text_runs(str(value)):
+        escaped = xml_escape(text)
+        if is_cjk:
+            pieces.append(f'<font name="{cjk_font}">{escaped}</font>')
+        else:
+            pieces.append(escaped)
+    return "".join(pieces)
+
+
+def _pdf_text_runs(value: str) -> list[tuple[bool, str]]:
+    runs: list[tuple[bool, str]] = []
+    for char in value:
+        is_cjk = _is_cjk(char)
+        if runs and runs[-1][0] == is_cjk:
+            runs[-1] = (is_cjk, runs[-1][1] + char)
+        else:
+            runs.append((is_cjk, char))
+    return runs
+
+
+def _is_cjk(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        0x2E80 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x3040 <= codepoint <= 0x30FF
+        or 0xAC00 <= codepoint <= 0xD7AF
+        or 0xFF00 <= codepoint <= 0xFFEF
+    )
+
+
+def _draw_pdf_mixed_text(
+    canvas,
+    value: str,
+    x: float,
+    y: float,
+    latin_font: str,
+    cjk_font: str,
+    size: float,
+    *,
+    align: str,
+) -> None:
+    runs = _pdf_text_runs(str(value))
+    widths = [
+        canvas.stringWidth(text, cjk_font if is_cjk else latin_font, size)
+        for is_cjk, text in runs
+    ]
+    total_width = sum(widths)
+    if align == "right":
+        cursor = x - total_width
+    elif align == "center":
+        cursor = x - total_width / 2
+    else:
+        cursor = x
+    for (is_cjk, text), width in zip(runs, widths):
+        canvas.setFont(cjk_font if is_cjk else latin_font, size)
+        canvas.drawString(cursor, y, text)
+        cursor += width
